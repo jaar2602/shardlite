@@ -513,3 +513,185 @@ fn the_frozen_file_does_not_change_while_a_snapshot_is_held() {
         .unwrap();
     assert_eq!(n, 600);
 }
+
+// ---------------------------------------------------------------- resumable bootstrap
+
+#[test]
+fn a_snapshot_transfer_resumes_where_it_stopped() {
+    // A failure at 99% must not start again from zero. At a few hundred GB that is not a
+    // retry, it is a second outage.
+    use meshdb::replication::bootstrap::{SnapshotSource, SnapshotTransfer, pump};
+
+    let pdir = TempDir::new().unwrap();
+    let fdir = TempDir::new().unwrap();
+    let stage = TempDir::new().unwrap();
+
+    let primary = ShardManager::open_with_sink(pdir.path(), cfg(1), None).unwrap();
+    primary
+        .execute_one(
+            S0,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, pad BLOB) STRICT",
+        )
+        .unwrap();
+    let pad = vec![0u8; 4096];
+    for chunk in 0..40 {
+        let stmts: Vec<Statement> = (0..64)
+            .map(|i| {
+                Statement::with_params(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    vec![Value::Integer(chunk * 64 + i), Value::Blob(pad.clone())],
+                )
+            })
+            .collect();
+        primary.execute(S0, stmts).unwrap();
+    }
+
+    let (epoch, lsn, source_path) = primary.begin_snapshot(S0).unwrap();
+    let mut source = SnapshotSource::open(S0, epoch, lsn, &source_path).unwrap();
+    let id = source.id();
+    assert!(
+        id.total_bytes > 4 * 1024 * 1024,
+        "too small to be meaningful"
+    );
+
+    // Transfer part of it, then drop everything as if the process died.
+    {
+        let mut t = SnapshotTransfer::begin(stage.path(), id).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..8 {
+            let n = source.read_chunk(&mut buf).unwrap();
+            t.write_chunk(&buf[..n]).unwrap();
+        }
+        assert!(!t.is_complete());
+        assert!(t.offset() > 0);
+    }
+
+    // Resume: a fresh transfer must pick up the existing partial rather than restart.
+    let mut t = SnapshotTransfer::begin(stage.path(), id).unwrap();
+    let resumed_at = t.offset();
+    assert!(
+        resumed_at > 0,
+        "the transfer restarted from zero instead of resuming"
+    );
+    assert!(resumed_at < id.total_bytes);
+
+    let mut source = SnapshotSource::open(S0, epoch, lsn, &source_path).unwrap();
+    pump(&mut source, &mut t, 64 * 1024).unwrap();
+    assert!(t.is_complete());
+
+    let follower = Follower::open(fdir.path()).unwrap();
+    t.finish(&follower).unwrap();
+    assert!(primary.end_snapshot(S0).unwrap());
+
+    println!("resumed at {resumed_at} of {} bytes", id.total_bytes);
+
+    // The installed copy must be identical to the source, not merely present.
+    let a = std::fs::read(&source_path).unwrap();
+    let b = std::fs::read(S0.path(follower.dir())).unwrap();
+    assert_eq!(a.len(), b.len(), "sizes differ after a resumed transfer");
+    assert!(a == b, "the resumed transfer produced a different file");
+
+    let conn = meshdb::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 40 * 64);
+
+    assert_eq!(
+        follower.position(S0),
+        meshdb::replication::Position {
+            epoch,
+            applied_lsn: lsn
+        }
+    );
+}
+
+#[test]
+fn a_partial_transfer_of_a_different_snapshot_is_discarded() {
+    // The reason a transfer carries an identity. The primary's freeze is not unconditional
+    // — if the WAL outgrows its limit the hold breaks and the file changes. Splicing new
+    // bytes onto a prefix of the old one gives a database that is corrupt in a way nothing
+    // detects, because every page in it is individually valid. Restarting a large copy is
+    // expensive; that is not.
+    use meshdb::replication::bootstrap::{SnapshotId, SnapshotTransfer};
+
+    let stage = TempDir::new().unwrap();
+    let first = SnapshotId {
+        shard: S0,
+        epoch: 1,
+        lsn: 100,
+        total_bytes: 8192,
+    };
+    {
+        let mut t = SnapshotTransfer::begin(stage.path(), first).unwrap();
+        t.write_chunk(&[0xAA; 4096]).unwrap();
+        assert_eq!(t.offset(), 4096);
+    }
+
+    // Same shard, later snapshot: the partial cannot be reused.
+    let second = SnapshotId { lsn: 200, ..first };
+    let t = SnapshotTransfer::begin(stage.path(), second).unwrap();
+    assert_eq!(
+        t.offset(),
+        0,
+        "a partial from a different snapshot must be discarded, not spliced"
+    );
+
+    // The same snapshot still resumes.
+    let again = SnapshotTransfer::begin(stage.path(), second).unwrap();
+    assert_eq!(again.offset(), 0);
+}
+
+#[test]
+fn a_transfer_cannot_be_installed_half_finished() {
+    use meshdb::replication::bootstrap::{SnapshotId, SnapshotTransfer};
+
+    let stage = TempDir::new().unwrap();
+    let fdir = TempDir::new().unwrap();
+    let follower = Follower::open(fdir.path()).unwrap();
+
+    let id = SnapshotId {
+        shard: S0,
+        epoch: 1,
+        lsn: 7,
+        total_bytes: 8192,
+    };
+    let mut t = SnapshotTransfer::begin(stage.path(), id).unwrap();
+    t.write_chunk(&[0u8; 4096]).unwrap();
+    assert!(!t.is_complete());
+    assert!(
+        t.finish(&follower).is_err(),
+        "an incomplete transfer must not be installable"
+    );
+}
+
+#[test]
+fn pump_refuses_a_source_that_is_not_the_snapshot_being_transferred() {
+    use meshdb::replication::bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer, pump};
+
+    let pdir = TempDir::new().unwrap();
+    let stage = TempDir::new().unwrap();
+    let primary = ShardManager::open_with_sink(pdir.path(), cfg(1), None).unwrap();
+    primary
+        .execute_one(S0, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    let (epoch, lsn, path) = primary.begin_snapshot(S0).unwrap();
+    let mut source = SnapshotSource::open(S0, epoch, lsn, &path).unwrap();
+
+    // A transfer expecting a different LSN must not accept these bytes.
+    let mismatched = SnapshotId {
+        lsn: lsn + 999,
+        ..source.id()
+    };
+    let mut t = SnapshotTransfer::begin(stage.path(), mismatched).unwrap();
+    assert!(
+        pump(&mut source, &mut t, 4096).is_err(),
+        "pump must refuse a source whose identity does not match the transfer"
+    );
+    assert!(primary.end_snapshot(S0).unwrap());
+}

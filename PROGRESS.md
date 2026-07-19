@@ -97,6 +97,14 @@ Follower crash safety rests on idempotence: pages are fsynced, *then* the positi
 recorded. A crash between them replays transactions, which is harmless because writing the
 same page twice gives the same page. The reverse order would silently skip them.
 
+Bootstrap transfers are **chunked and resumable** (`src/replication/bootstrap.rs`): progress
+is persisted per chunk, so an interruption continues rather than restarting — at a few
+hundred GB, restarting is not a retry but a second outage. Each transfer carries a
+`SnapshotId` (shard, epoch, LSN, size), and a partial whose identity does not match is
+discarded rather than spliced: the primary's freeze can break, and grafting new bytes onto a
+prefix of the old file gives a database corrupt in a way nothing detects, because every page
+in it is individually valid.
+
 Bootstrap splits into a fast writer-thread part and a slow caller-thread part. The writer
 ships pending frames, checkpoints, records the position, and **freezes** the shard —
 suspending checkpointing, which in WAL mode means committed pages stay in the WAL and the
@@ -211,6 +219,9 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | The frozen file does not change while held | `the_frozen_file_does_not_change_while_a_snapshot_is_held` |
 | **A gap is refused, not applied across** | `a_gap_is_refused_rather_than_applied_across` |
 | Bootstrap then stream, resuming at exactly `lsn+1` | `a_follower_bootstraps_from_a_snapshot_and_then_streams` |
+| **A transfer resumes where it stopped** | `a_snapshot_transfer_resumes_where_it_stopped` |
+| A partial from another snapshot is discarded | `a_partial_transfer_of_a_different_snapshot_is_discarded` |
+| An incomplete transfer cannot be installed | `a_transfer_cannot_be_installed_half_finished` |
 | A clean restart continues the stream | `a_clean_restart_continues_the_stream_without_rebootstrap` |
 | An unclean restart bumps the epoch | `an_unclean_shutdown_bumps_the_epoch_and_forces_rebootstrap` |
 | An empty follower may join at LSN 1, but not mid-stream | `an_empty_follower_may_join_a_stream_at_its_beginning`, `an_empty_follower_cannot_join_mid_stream` |
@@ -345,7 +356,6 @@ the trace comparison (`take_trace()`) before trusting capture.
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
 | **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
 | No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
-| Bootstrap copies the whole shard file | No incremental or resumable copy; a failed copy restarts from zero |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 
@@ -355,7 +365,6 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Item | State |
 |---|---|
-| Bootstrap resumability | starting — a failed copy currently restarts from zero |
 | Cross-shard query planner | starting — `execute_all_shards` is the only helper and it is not atomic |
 
 **Not started**

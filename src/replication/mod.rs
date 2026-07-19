@@ -14,12 +14,14 @@
 //! back to clients through the mechanism that already exists, rather than through a second
 //! one invented for replication.
 
+pub mod bootstrap;
 pub mod follower;
 pub mod stream;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer};
 pub use follower::{Follower, Need, Position};
 pub use stream::{Lsn, StreamPositions, StreamTxn};
 
