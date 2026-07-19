@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**92 Rust tests + 36 CLI assertions. Clippy clean, fmt clean.**
+**93 Rust tests + 36 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -200,7 +200,8 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **Retention bounded by one batch** | `retention_stays_bounded_because_the_writer_drains_every_batch` |
 | Overflow fails writes, never drops frames | `overflow_fails_writes_rather_than_dropping_frames` |
 | Capture does not change the on-disk file | `captured_and_uncaptured_databases_are_identical_on_disk` |
-| **A refused batch is requeued, not lost** | `overflow_fails_writes_while_the_backlog_cannot_be_shifted` |
+| **A refused batch is requeued, not lost** | `frames_refused_by_a_sink_are_not_lost` (verified by removing the fix: sink saw `[1, 27]` instead of `[1..=27]`) |
+| Overflow is reported when the backlog cannot shift | `overflow_fails_writes_while_the_backlog_cannot_be_shifted` |
 | **Overflow clears once the backlog drains** | `overflow_clears_once_the_backlog_is_consumed` |
 | Rolled-back stream positions are reused | `rolling_back_returns_positions_for_reuse` |
 | VACUUM reclaims space and keeps the data | `vacuum_reclaims_space_and_keeps_the_data` |
@@ -347,6 +348,37 @@ the trace comparison (`take_trace()`) before trusting capture.
 | Bootstrap copies the whole shard file | No incremental or resumable copy; a failed copy restarts from zero |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
+
+### Remaining work, in one place
+
+**In progress**
+
+| Item | State |
+|---|---|
+| Bootstrap resumability | starting — a failed copy currently restarts from zero |
+| Cross-shard query planner | starting — `execute_all_shards` is the only helper and it is not atomic |
+
+**Not started**
+
+| Item | Why it matters |
+|---|---|
+| **Network transport** | The largest remaining piece. Replication is proven in-process only; there is no server, no protocol, no client. It is also what would make the write backpressure real. |
+| Follower-driven catch-up | The primary pushes; a follower that falls behind cannot request a range. Needs the transport. |
+| Read consistency levels | `Stale` / `AtLeastLsn` / `Linearizable` — step 12. |
+| Cluster election, fencing, failover | Step 10. |
+| Shard placement and movement | Step 11. Also the unresolved rebalancing policy. |
+| Per-shard merkle verification | Step 9. Divergence detection is currently a whole-database hash. |
+| authn/authz | Nothing at all. |
+
+**Known gaps that are accepted, not planned**
+
+| Gap | Note |
+|---|---|
+| `busy_timeout` ordering fix unproven | Correct on its own merits, but neither test discriminates it and the 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
+| `capture_for` must precede open | Registering later silently misses frames; enforced by convention, not types. |
+| No cross-shard atomicity, ever | WAL gives no atomic commit across ATTACHed databases. Permanent, and it shapes the user-facing API. |
+| Client-held transactions unsupported | A held `BEGIN` would pin the writer and defeat batching. Permanent. |
+| Multi-statement client transactions | Same cause. |
 
 ### Debt deliberately deferred
 

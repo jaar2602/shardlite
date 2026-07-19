@@ -498,3 +498,84 @@ fn vacuum_is_refused_while_a_snapshot_is_held() {
     assert!(w.end_snapshot(S0).unwrap());
     w.vacuum(S0).unwrap();
 }
+
+/// Records every LSN it is handed, so loss and gaps are both visible.
+#[derive(Default)]
+struct RecordingSink {
+    down: std::sync::atomic::AtomicBool,
+    seen: std::sync::Mutex<Vec<u64>>,
+}
+
+impl FrameSink for RecordingSink {
+    fn accept(
+        &self,
+        _shard: ShardId,
+        _epoch: u64,
+        txns: Vec<meshdb::replication::StreamTxn>,
+    ) -> meshdb::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Unsupported("sink is down".into()));
+        }
+        self.seen.lock().unwrap().extend(txns.iter().map(|t| t.lsn));
+        Ok(())
+    }
+}
+
+#[test]
+fn frames_refused_by_a_sink_are_not_lost() {
+    // The regression that matters. `drain_committed` hands ownership to the caller, so a
+    // sink that then refuses a batch would leave those frames delivered nowhere and
+    // retained nowhere, with their stream positions already spent — silent truncation.
+    //
+    // Checked by content, not by "the sink got something": every committed transaction must
+    // eventually arrive, and the LSNs must be dense. A gap is just as fatal as a loss,
+    // because the follower refuses everything after it.
+    let dir = TempDir::new().unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let w = fleet(&dir, cfg(1, true), Some(sink.clone()));
+
+    w.execute_one(S0, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    // Everything written while the sink is down commits locally but cannot ship.
+    sink.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut refused = 0;
+    for i in 0..25 {
+        if w.execute_one(S0, format!("INSERT INTO t VALUES ({i})"))
+            .is_err()
+        {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 25, "every write should have been refused");
+
+    // Bring it back; the backlog must flush.
+    sink.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    w.execute_one(S0, "INSERT INTO t VALUES (9999)").unwrap();
+
+    let seen = sink.seen.lock().unwrap().clone();
+    println!("sink saw {} LSNs: {:?}", seen.len(), seen);
+
+    // Every row that is in the database must be in the stream.
+    let rows = match w.execute_one(S0, "SELECT count(*) FROM t").unwrap() {
+        Outcome::Ok(Executed::Rows(r)) => match r.rows[0][0] {
+            Value::Integer(n) => n,
+            ref v => panic!("expected an integer, got {v:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(rows, 26, "all writes committed locally");
+
+    // 1 DDL + 25 inserts + 1 final insert = 27 transactions, positions 1..=27, no gaps.
+    assert_eq!(
+        seen.len(),
+        27,
+        "the sink received {} transactions but 27 were committed — frames were dropped",
+        seen.len()
+    );
+    let expected: Vec<u64> = (1..=27).collect();
+    assert_eq!(
+        seen, expected,
+        "stream positions must be dense; a gap makes the follower refuse everything after it"
+    );
+}
