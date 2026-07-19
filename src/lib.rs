@@ -8,6 +8,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod shard;
 pub mod storage;
 pub mod vfs;
 

@@ -1,0 +1,275 @@
+//! Virtual shards: routing, sizing, and bounded connection management.
+//!
+//! # Why sharding exists here
+//!
+//! Its headline job is multi-write — many shards, each single-writer, so a cluster accepts
+//! concurrent writes on several nodes. But the job that matters more at scale is **bounding
+//! the size of every operational unit**. A follower joining with a 300 GB database needs a
+//! streaming copy taking hours, during which the primary must retain every WAL frame since
+//! the copy began. Per-shard, bootstrap, checkpointing, verification, and backup all stay
+//! minutes-scale no matter how large the total.
+//!
+//! # Virtual shards, fixed at creation
+//!
+//! Shards are over-provisioned up front and never split. Rebalancing moves whole shards
+//! between nodes, so data is never rehashed — that is what lets a deployment start at
+//! 100 MB and grow to a few hundred GB without a resharding event.
+//!
+//! **The shard count is immutable.** Changing it re-routes every key. It is stored in the
+//! cluster manifest at creation and refused if it disagrees later.
+//!
+//! # Memory: an LRU multiplies caches
+//!
+//! Only recently-used shards hold open connections. The consequence is easy to miss:
+//! resident page cache is `per_connection_cache × lru_capacity × threads`, not
+//! `per_connection_cache`. At the single-database profile's 8 MiB writer cache, 16 open
+//! connections would be 128 MB — the whole container budget. Sharded profiles therefore use
+//! much smaller per-connection caches; see [`crate::config::PragmaProfile::writer_shard`].
+
+pub mod lru;
+pub mod reader_fleet;
+pub mod writer_fleet;
+
+use std::path::{Path, PathBuf};
+
+pub use reader_fleet::ReaderFleet;
+pub use writer_fleet::{WriterFleet, WriterFleetStats};
+
+/// Identifies one shard — one SQLite file, with one writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardId(pub u32);
+
+impl ShardId {
+    pub const FIRST: ShardId = ShardId(0);
+
+    /// `shard_<n>.db` under the data directory.
+    pub fn path(self, dir: &Path) -> PathBuf {
+        dir.join(format!("shard_{}.db", self.0))
+    }
+}
+
+impl std::fmt::Display for ShardId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shard_{}", self.0)
+    }
+}
+
+/// Map a routing key to a shard.
+///
+/// FNV-1a, implemented here rather than taken from `DefaultHasher`, because
+/// `DefaultHasher` is explicitly **not** stable across Rust releases. A hash change would
+/// silently re-route every key to a different shard, which for a database is
+/// indistinguishable from losing the data.
+///
+/// This function must never change. If it must, that is a migration, not an edit.
+pub fn shard_of(key: &[u8], shard_count: u32) -> ShardId {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut h = OFFSET;
+    for b in key {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    ShardId((h % shard_count as u64) as u32)
+}
+
+/// Sizing for a sharded database.
+#[derive(Debug, Clone)]
+pub struct ShardConfig {
+    /// Immutable after creation; caps ultimate scale. 64 covers roughly 100 MB to 1 TB.
+    pub shard_count: u32,
+
+    /// Writer threads. Shards are assigned to threads by `id % writer_threads`, so each
+    /// shard still has exactly one writer and single-writer-per-file is preserved while the
+    /// thread count stays bounded independent of shard count.
+    pub writer_threads: usize,
+
+    /// Open writer connections **per thread**. Multiply by `writer_threads` when budgeting.
+    pub open_writers_per_thread: usize,
+
+    pub reader_threads: usize,
+
+    /// Open reader connections **per thread**. Multiply by `reader_threads`.
+    pub open_readers_per_thread: usize,
+}
+
+impl ShardConfig {
+    pub const MIN_SHARDS: u32 = 1;
+    pub const MAX_SHARDS: u32 = 256;
+
+    /// Sizing for the floor deployment: ~150 MB container sharing one CPU.
+    ///
+    /// 2 writer + 2 reader threads: with a third of a CPU there is no parallelism to win,
+    /// and more threads would only add context switching.
+    pub fn floor() -> Self {
+        Self {
+            shard_count: 64,
+            writer_threads: 2,
+            open_writers_per_thread: 8,
+            reader_threads: 2,
+            open_readers_per_thread: 8,
+        }
+    }
+
+    /// Which writer thread owns a shard.
+    pub fn thread_of(&self, shard: ShardId) -> usize {
+        shard.0 as usize % self.writer_threads
+    }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if !(Self::MIN_SHARDS..=Self::MAX_SHARDS).contains(&self.shard_count) {
+            return Err(crate::Error::ShardConfig(format!(
+                "shard_count {} is outside {}..={}",
+                self.shard_count,
+                Self::MIN_SHARDS,
+                Self::MAX_SHARDS
+            )));
+        }
+        if self.writer_threads == 0 || self.reader_threads == 0 {
+            return Err(crate::Error::ShardConfig(
+                "writer_threads and reader_threads must be at least 1".into(),
+            ));
+        }
+        if self.open_writers_per_thread == 0 || self.open_readers_per_thread == 0 {
+            return Err(crate::Error::ShardConfig(
+                "per-thread open-connection limits must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A sharded database: routing, writers, and readers over a directory of shard files.
+pub struct ShardManager {
+    writers: std::sync::Arc<WriterFleet>,
+    readers: ReaderFleet,
+    cfg: ShardConfig,
+    dir: PathBuf,
+}
+
+impl ShardManager {
+    pub fn open(dir: &Path, cfg: ShardConfig) -> crate::Result<Self> {
+        cfg.validate()?;
+        let writers = std::sync::Arc::new(WriterFleet::spawn(
+            dir,
+            cfg.clone(),
+            crate::config::PragmaProfile::writer_shard(),
+            crate::config::CheckpointConfig::floor(),
+        )?);
+        let readers = ReaderFleet::spawn(
+            dir,
+            &cfg,
+            &crate::config::ReaderPoolConfig::floor(),
+            crate::config::PragmaProfile::reader_shard(),
+            std::sync::Arc::downgrade(&writers),
+        )?;
+        Ok(Self {
+            writers,
+            readers,
+            cfg,
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    pub fn config(&self) -> &ShardConfig {
+        &self.cfg
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Route a key to its shard.
+    pub fn route(&self, key: &[u8]) -> ShardId {
+        shard_of(key, self.cfg.shard_count)
+    }
+
+    pub fn execute(
+        &self,
+        shard: ShardId,
+        sqls: Vec<String>,
+    ) -> crate::Result<Vec<crate::storage::exec::Outcome>> {
+        self.writers.execute(shard, sqls)
+    }
+
+    pub fn execute_one(
+        &self,
+        shard: ShardId,
+        sql: &str,
+    ) -> crate::Result<crate::storage::exec::Outcome> {
+        self.writers.execute_one(shard, sql)
+    }
+
+    pub fn query(&self, shard: ShardId, sql: &str) -> crate::Result<crate::storage::exec::Outcome> {
+        self.readers.query(shard, sql)
+    }
+
+    /// Run a statement against **every** shard.
+    ///
+    /// This is how DDL is applied: a schema change must reach all shards, and there is no
+    /// atomicity across them — a partial failure leaves shards with differing schemas and
+    /// must be reported, not swallowed.
+    pub fn execute_all_shards(
+        &self,
+        sql: &str,
+    ) -> crate::Result<Vec<(ShardId, crate::storage::exec::Outcome)>> {
+        let mut out = Vec::with_capacity(self.cfg.shard_count as usize);
+        for s in 0..self.cfg.shard_count {
+            let id = ShardId(s);
+            out.push((id, self.writers.execute_one(id, sql)?));
+        }
+        Ok(out)
+    }
+
+    pub fn writer_stats(&self) -> WriterFleetStats {
+        self.writers.stats()
+    }
+
+    pub fn reader_stats(&self) -> reader_fleet::ReaderFleetStats {
+        self.readers.stats()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_is_stable_and_spread() {
+        // Golden values recorded from this implementation. They are not an independent
+        // oracle — their job is to fail loudly if the hash ever changes, because that
+        // would silently re-route every key in every existing deployment.
+        assert_eq!(shard_of(b"user:1", 64), ShardId(43));
+        assert_eq!(shard_of(b"user:2", 64), ShardId(30));
+        assert_eq!(shard_of(b"", 64), ShardId(37));
+
+        // Distribution should be broad enough to be useful.
+        let mut hit = std::collections::HashSet::new();
+        for i in 0..5_000 {
+            hit.insert(shard_of(format!("key-{i}").as_bytes(), 64));
+        }
+        assert_eq!(hit.len(), 64, "every shard should receive some keys");
+    }
+
+    #[test]
+    fn every_shard_maps_to_a_thread_and_threads_are_used() {
+        let cfg = ShardConfig::floor();
+        let mut per_thread = vec![0usize; cfg.writer_threads];
+        for s in 0..cfg.shard_count {
+            per_thread[cfg.thread_of(ShardId(s))] += 1;
+        }
+        assert!(per_thread.iter().all(|n| *n > 0));
+        assert_eq!(per_thread.iter().sum::<usize>(), cfg.shard_count as usize);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_shard_count() {
+        let bad = ShardConfig {
+            shard_count: 512,
+            ..ShardConfig::floor()
+        };
+        assert!(bad.validate().is_err());
+        assert!(ShardConfig::floor().validate().is_ok());
+    }
+}

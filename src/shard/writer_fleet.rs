@@ -1,0 +1,360 @@
+//! Writer threads serving many shards through a bounded connection cache.
+//!
+//! A shard is assigned to a thread by `id % writer_threads`, so every shard still has
+//! exactly one writer — single-writer-per-file is preserved — while the thread count stays
+//! bounded no matter how many shards exist. Each thread holds an LRU of open connections,
+//! so 64 shards cost the memory of a handful of connections rather than 64.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Mutex, mpsc};
+use std::thread::JoinHandle;
+
+use rusqlite::Connection;
+
+use super::lru::Lru;
+use super::{ShardConfig, ShardId};
+use crate::config::{CheckpointConfig, PragmaProfile};
+use crate::error::{Error, Result};
+use crate::storage::apply;
+use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
+use crate::storage::exec::Outcome;
+use crate::storage::open::open_writer;
+
+/// Upper bound on statements merged into one shard's transaction.
+const MAX_REQUESTS_PER_TXN: usize = 64;
+
+struct Pending {
+    shard: ShardId,
+    sqls: Vec<String>,
+    reply: SyncSender<Result<Vec<Outcome>>>,
+}
+
+enum Job {
+    Write(Pending),
+    /// Ensure a shard's database file exists, so a reader may open it.
+    ///
+    /// Measured on 3.53.2, and not what was first assumed here:
+    ///
+    /// - A read-only connection **cannot create the database file**. A shard that has never
+    ///   been written to has no file, so a reader alone simply fails. This is the case that
+    ///   makes `EnsureOpen` load-bearing.
+    /// - A *clean* close checkpoints the WAL into the main file and removes the
+    ///   `-wal`/`-shm` sidecars, and a read-only connection opens that file happily. So an
+    ///   ordinary LRU eviction does **not** break readers, contrary to the first guess.
+    /// - An *unclean* close leaves a `-wal` behind, and a read-only connection may then be
+    ///   unable to create the `-shm` it needs. Rarer, but the same fix covers it.
+    EnsureOpen {
+        shard: ShardId,
+        reply: SyncSender<Result<()>>,
+    },
+    Shutdown,
+}
+
+/// One open shard: its writer connection and its checkpointer.
+struct OpenShard {
+    conn: Connection,
+    checkpointer: Checkpointer,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    batches: AtomicU64,
+    requests: AtomicU64,
+    max_batch: AtomicU64,
+    shard_opens: AtomicU64,
+    shard_evictions: AtomicU64,
+    open_now: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterFleetStats {
+    pub batches: u64,
+    pub requests: u64,
+    pub max_batch: u64,
+    pub shard_opens: u64,
+    pub shard_evictions: u64,
+    /// Writer connections currently resident across all threads.
+    pub open_now: u64,
+    pub threads: usize,
+}
+
+pub struct WriterFleet {
+    senders: Vec<mpsc::Sender<Job>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    counters: Arc<Counters>,
+    checkpoint_counters: Arc<CheckpointCounters>,
+    cfg: ShardConfig,
+}
+
+impl WriterFleet {
+    pub fn spawn(
+        dir: &Path,
+        cfg: ShardConfig,
+        profile: PragmaProfile,
+        checkpoint: CheckpointConfig,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            Error::ShardConfig(format!("creating data directory {}: {e}", dir.display()))
+        })?;
+
+        let counters = Arc::new(Counters::default());
+        let checkpoint_counters = Arc::new(CheckpointCounters::default());
+        let mut senders = Vec::with_capacity(cfg.writer_threads);
+        let mut threads = Vec::with_capacity(cfg.writer_threads);
+
+        for i in 0..cfg.writer_threads {
+            let (tx, rx) = mpsc::channel();
+            let ctx = ThreadCtx {
+                dir: dir.to_path_buf(),
+                profile: profile.clone(),
+                checkpoint: checkpoint.clone(),
+                capacity: cfg.open_writers_per_thread,
+                counters: Arc::clone(&counters),
+                checkpoint_counters: Arc::clone(&checkpoint_counters),
+            };
+            let handle = std::thread::Builder::new()
+                .name(format!("meshdb-writer-{i}"))
+                .spawn(move || writer_loop(rx, ctx))
+                .expect("spawning a writer thread");
+            senders.push(tx);
+            threads.push(handle);
+        }
+
+        Ok(Self {
+            senders,
+            threads: Mutex::new(threads),
+            counters,
+            checkpoint_counters,
+            cfg,
+        })
+    }
+
+    fn sender(&self, shard: ShardId) -> Result<&mpsc::Sender<Job>> {
+        if shard.0 >= self.cfg.shard_count {
+            return Err(Error::ShardConfig(format!(
+                "{shard} is outside the configured {} shards",
+                self.cfg.shard_count
+            )));
+        }
+        Ok(&self.senders[self.cfg.thread_of(shard)])
+    }
+
+    /// Submit statements to one shard and block until its batch commits.
+    pub fn execute(&self, shard: ShardId, sqls: Vec<String>) -> Result<Vec<Outcome>> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::Write(Pending {
+                shard,
+                sqls,
+                reply: reply_tx,
+            }))
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
+    pub fn execute_one(&self, shard: ShardId, sql: &str) -> Result<Outcome> {
+        let mut out = self.execute(shard, vec![sql.to_string()])?;
+        Ok(out.pop().expect("one request yields one outcome"))
+    }
+
+    /// Open the shard's writer connection if it is not already open.
+    ///
+    /// Readers call this before opening their own connection for a cold shard.
+    pub fn ensure_open(&self, shard: ShardId) -> Result<()> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::EnsureOpen {
+                shard,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
+    pub fn stats(&self) -> WriterFleetStats {
+        WriterFleetStats {
+            batches: self.counters.batches.load(Ordering::Relaxed),
+            requests: self.counters.requests.load(Ordering::Relaxed),
+            max_batch: self.counters.max_batch.load(Ordering::Relaxed),
+            shard_opens: self.counters.shard_opens.load(Ordering::Relaxed),
+            shard_evictions: self.counters.shard_evictions.load(Ordering::Relaxed),
+            open_now: self.counters.open_now.load(Ordering::Relaxed),
+            threads: self.cfg.writer_threads,
+        }
+    }
+
+    pub fn checkpoint_counters(&self) -> &Arc<CheckpointCounters> {
+        &self.checkpoint_counters
+    }
+}
+
+impl Drop for WriterFleet {
+    fn drop(&mut self) {
+        for tx in self.senders.drain(..) {
+            let _ = tx.send(Job::Shutdown);
+        }
+        if let Ok(mut threads) = self.threads.lock() {
+            for t in threads.drain(..) {
+                let _ = t.join();
+            }
+        }
+    }
+}
+
+struct ThreadCtx {
+    dir: PathBuf,
+    profile: PragmaProfile,
+    checkpoint: CheckpointConfig,
+    capacity: usize,
+    counters: Arc<Counters>,
+    checkpoint_counters: Arc<CheckpointCounters>,
+}
+
+fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
+    let mut open: Lru<OpenShard> = Lru::new(ctx.capacity);
+
+    loop {
+        let first = match rx.recv() {
+            Ok(job) => job,
+            Err(_) => return,
+        };
+
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut stopping = false;
+
+        match first {
+            Job::Write(p) => pending.push(p),
+            Job::EnsureOpen { shard, reply } => {
+                let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
+                continue;
+            }
+            Job::Shutdown => return,
+        }
+
+        // Drain whatever else has already queued. This is what produces group commit:
+        // everything that arrived while the previous COMMIT was fsyncing gets absorbed.
+        let mut requests = pending[0].sqls.len();
+        while requests < MAX_REQUESTS_PER_TXN {
+            match rx.try_recv() {
+                Ok(Job::Write(p)) => {
+                    requests += p.sqls.len();
+                    pending.push(p);
+                }
+                Ok(Job::EnsureOpen { shard, reply }) => {
+                    let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
+                }
+                Ok(Job::Shutdown) => {
+                    // Honour it only after the batch in hand commits — dropping it would
+                    // lose writes callers are still blocked on.
+                    stopping = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    stopping = true;
+                    break;
+                }
+            }
+        }
+
+        ctx.counters.batches.fetch_add(1, Ordering::Relaxed);
+        ctx.counters
+            .requests
+            .fetch_add(requests as u64, Ordering::Relaxed);
+        ctx.counters
+            .max_batch
+            .fetch_max(requests as u64, Ordering::Relaxed);
+
+        // A transaction cannot span files, so the batch is split by shard and each shard
+        // commits its own transaction.
+        let mut by_shard: std::collections::BTreeMap<ShardId, Vec<Pending>> = Default::default();
+        for p in pending {
+            by_shard.entry(p.shard).or_default().push(p);
+        }
+
+        for (shard, group) in by_shard {
+            apply_shard_batch(&mut open, &ctx, shard, group);
+        }
+
+        if stopping {
+            return;
+        }
+    }
+}
+
+fn apply_shard_batch(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    shard: ShardId,
+    group: Vec<Pending>,
+) {
+    let entry = match ensure_shard(open, ctx, shard) {
+        Ok(e) => e,
+        Err(e) => {
+            for p in group {
+                let _ = p.reply.send(Err(Error::BatchAborted {
+                    reason: e.to_string(),
+                }));
+            }
+            return;
+        }
+    };
+
+    let groups: Vec<Vec<String>> = group.iter().map(|p| p.sqls.clone()).collect();
+
+    match apply::batch(&mut entry.conn, &groups) {
+        Ok(results) => {
+            for (p, outcomes) in group.into_iter().zip(results) {
+                let _ = p.reply.send(Ok(outcomes));
+            }
+            // Between transactions, never inside one.
+            entry.checkpointer.after_batch(&entry.conn);
+        }
+        Err(reason) => {
+            for p in group {
+                let _ = p.reply.send(Err(Error::BatchAborted {
+                    reason: reason.clone(),
+                }));
+            }
+        }
+    }
+}
+
+/// Get the shard's connection, opening it (and evicting a colder one) if needed.
+fn ensure_shard<'a>(
+    open: &'a mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    shard: ShardId,
+) -> Result<&'a mut OpenShard> {
+    let path = shard.path(&ctx.dir);
+    let profile = ctx.profile.clone();
+    let checkpoint = ctx.checkpoint.clone();
+    let checkpoint_counters = Arc::clone(&ctx.checkpoint_counters);
+
+    let (entry, event) = open.get_or_open(shard, move || -> Result<OpenShard> {
+        // `open_writer` materializes the -wal/-shm sidecars, which is what re-establishes
+        // the writer-opens-first invariant on every reopen after an eviction.
+        let (conn, _token) = open_writer(&path, &profile)?;
+        let checkpointer = Checkpointer::new(&path, checkpoint, checkpoint_counters);
+        Ok(OpenShard { conn, checkpointer })
+    })?;
+
+    if event.opened {
+        ctx.counters.shard_opens.fetch_add(1, Ordering::Relaxed);
+        ctx.counters.open_now.fetch_add(1, Ordering::Relaxed);
+    }
+    if event.evicted > 0 {
+        ctx.counters
+            .shard_evictions
+            .fetch_add(event.evicted, Ordering::Relaxed);
+        ctx.counters
+            .open_now
+            .fetch_sub(event.evicted, Ordering::Relaxed);
+    }
+
+    Ok(entry)
+}

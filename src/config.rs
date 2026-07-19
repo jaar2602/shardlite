@@ -169,6 +169,27 @@ impl PragmaProfile {
         }
     }
 
+    /// Writer profile for a *sharded* database.
+    ///
+    /// The cache is far smaller than [`Self::writer_floor`] for a reason that is easy to
+    /// miss: with an LRU of open shard connections, resident cache is
+    /// `cache_size x lru_capacity x threads`, not `cache_size`. At the single-database
+    /// 8 MiB, 16 open writer connections would be 128 MB — the entire container budget.
+    pub fn writer_shard() -> Self {
+        Self {
+            cache_size: -1_024, // 1 MiB, x16 open connections = 16 MiB
+            ..Self::writer_floor()
+        }
+    }
+
+    /// Reader profile for a *sharded* database. Same multiplication applies.
+    pub fn reader_shard() -> Self {
+        Self {
+            cache_size: -512, // 512 KiB, x16 = 8 MiB
+            ..Self::reader_floor()
+        }
+    }
+
     /// Profile for the statement-classification connection.
     ///
     /// This connection only ever calls `prepare` to ask SQLite whether a statement is

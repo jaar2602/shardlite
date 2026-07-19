@@ -4,6 +4,7 @@
 //! deliberate — it keeps the writer, batching, and crash-safety work independently
 //! buildable and testable.
 
+pub mod apply;
 pub mod checkpoint;
 pub mod exec;
 pub mod open;

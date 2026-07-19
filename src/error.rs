@@ -64,4 +64,7 @@ pub enum Error {
 
     #[error("registering the capture VFS: {0}")]
     VfsRegistration(String),
+
+    #[error("shard configuration: {0}")]
+    ShardConfig(String),
 }

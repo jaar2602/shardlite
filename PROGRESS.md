@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 5 of 12 · **Status:** single-node engine runs; **VFS spike PASSED**
+**Updated:** 2026-07-19 · **Steps complete:** 6 of 12 · **Status:** sharded single-node engine; **VFS spike PASSED**
 
 ---
 
@@ -26,7 +26,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 2 | Execution + batching writer | **done** | `tests/writer.rs` (6) |
 | 3 | Reader pool | **done** | `tests/reader_pool.rs` (5) |
 | 4 | WAL checkpointing | **done** | `tests/checkpoint.rs` (5) |
-| 5 | Shard manager (LRU, thread affinity) | not started | |
+| 5 | Shard manager (LRU, thread affinity) | **done** | `tests/shard.rs` (9) + `src/shard/` (6) |
 | 6 | Benchmarks + cgroup memory test | not started | |
 | 7 | VFS capture productionized | not started | **unblocked** |
 | 8 | Replication + per-shard bootstrap | not started | **unblocked** |
@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**38 Rust tests + 26 CLI assertions. Clippy clean, fmt clean.**
+**54 Rust tests + 26 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,17 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Shard manager (`src/shard/`)
+Virtual shards fixed at creation (default 64, range 1–256), never split — rebalancing moves
+whole shards, so data is never rehashed. Routing is FNV-1a, implemented here rather than
+taken from `DefaultHasher`, which is explicitly not stable across Rust releases; a hash
+change would silently re-route every key.
+
+Shards map to writer threads by `id % writer_threads`, so every shard keeps exactly one
+writer while the thread count stays bounded. Each thread holds an LRU of open connections,
+decoupling shard count from resident memory. Readers share one queue and keep their own
+per-thread LRU.
 
 ### WAL capture VFS (`src/vfs/passthrough.rs`, `wal.rs`)
 A pass-through SQLite VFS delegating every call to the default VFS, so the database is an
@@ -116,6 +127,13 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | Survives concurrent readers + TRUNCATE | `capture_survives_concurrent_readers_and_truncate` |
 | **In-place header rewrite honoured** | `a_rewritten_header_carrying_the_commit_marker_is_honoured` |
 | Reused WAL slot takes the newer page | `a_reused_slot_takes_the_newer_page` |
+| **64 shards stay within the LRU's connection ceiling** | `sixty_four_shards_are_served_by_a_bounded_number_of_connections` |
+| **A never-written shard is still queryable** | `a_never_written_shard_can_still_be_queried` |
+| Data survives heavy eviction churn | `a_reopened_shard_still_serves_readers` |
+| Keys route to the same shard for read and write | `writes_and_reads_route_to_the_same_shard` |
+| Routing hash is pinned against change | `routing_is_stable_and_spread` |
+| LRU never exceeds capacity; failed opens uncached | `never_exceeds_capacity`, `a_failed_open_is_not_cached` |
+| Untouched shards create no files | `only_touched_shards_create_files` |
 
 ### Measured, not assumed
 
@@ -136,6 +154,14 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
   array of *slots*, not an append log. An append-based parser loses the commit marker and
   strands the transaction — which is exactly what the first implementation did, passing
   every light test and failing only under page-reuse churn.
+- **A read-only connection cannot create a database file**, which is what makes the
+  writer's `ensure_open` load-bearing — a shard never written to has no file for a reader
+  to open. Note the reasoning first written here was **wrong**: a *clean* close checkpoints
+  the WAL into the main file and removes the sidecars, and a read-only connection opens
+  that file happily, so ordinary LRU eviction does not break readers.
+- **An LRU multiplies per-connection cache by its capacity.** 16 open writer connections at
+  the single-database 8 MiB would be 128 MB — the whole container budget. Sharded profiles
+  use 1 MiB writers and 512 KiB readers for this reason alone.
 - **The VFS write pattern itself is clean**: header then page data, no odd-sized writes, in
   the workloads traced. `WalCapture::take_trace()` reproduces this analysis when the bundled
   SQLite version is bumped.
@@ -180,6 +206,9 @@ the trace comparison (`take_trace()`) before trusting capture.
 | Writer has no backpressure | Unbounded `mpsc`; readers shed load but writers do not |
 | Capture holds an uncommitted txn fully in memory | A huge single transaction is unbounded; needs a spill or cap |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
+| CLI and `Db` still use the single-database path | `ShardManager` is not wired into the CLI yet; two code paths until it is |
+| Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
+| Shard count is not persisted in a manifest | Nothing yet refuses a config whose `shard_count` disagrees with existing data |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 
 ### Design decisions not yet made
