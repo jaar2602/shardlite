@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod exec;
 pub mod open;
 pub mod pragma;
+pub mod schema;
 
 pub use checkpoint::{CheckpointOutcome, CheckpointStats};
 pub use exec::{Executed, Outcome, QueryResult, Statement, Value, WriteOutcome};

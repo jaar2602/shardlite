@@ -481,6 +481,11 @@ impl ShardManager {
         use crate::query::{merge_results, plan};
         use crate::storage::exec::{Executed, Outcome};
 
+        // Checked before a single row is read. A schema change lands one shard at a time, so
+        // there is a window where shards disagree — and rows combined across two schemas are
+        // not a slower answer, they are a wrong one. Refusing is the only honest response.
+        self.schema_agreement()?.check()?;
+
         let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
 
         let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
@@ -511,6 +516,79 @@ impl ShardManager {
     /// This is how DDL is applied: a schema change must reach all shards, and there is no
     /// atomicity across them — a partial failure leaves shards with differing schemas and
     /// must be reported, not swallowed.
+    /// What every shard on this node says its schema version is.
+    pub fn schema_agreement(&self) -> crate::Result<crate::storage::schema::Agreement> {
+        let mut versions = Vec::with_capacity(self.cfg.shard_count as usize);
+        for s in 0..self.cfg.shard_count {
+            let id = ShardId(s);
+            // A shard this node does not own cannot be asked, and its version is not this
+            // node's business — the owner enforces its own agreement.
+            if self.modes.mode(id) != mode::ShardMode::Led {
+                continue;
+            }
+            versions.push((id, self.writers.schema(id, None)?));
+        }
+        Ok(crate::storage::schema::Agreement::of(&versions))
+    }
+
+    /// A shard's schema version.
+    pub fn schema_version(&self, shard: ShardId) -> crate::Result<i64> {
+        self.writers.schema(shard, None)
+    }
+
+    /// Apply a schema change to every shard this node leads, one at a time.
+    ///
+    /// **Rolling, not atomic** — there is no cross-shard atomicity and there never will be.
+    /// Each shard's change takes its turn in that shard's write queue, so writes already in
+    /// flight complete before it and later ones queue behind it; no extra pausing is needed
+    /// because a serialized writer already does exactly that.
+    ///
+    /// While the roll is in progress the shards disagree, and
+    /// [`Self::query_all_shards`] refuses for the duration rather than combining rows from
+    /// two schemas. Single-shard reads and writes are unaffected, which is the point of
+    /// rolling rather than pausing the cluster.
+    ///
+    /// Returns each shard's new version. A partial failure is reported as such: the shards
+    /// already changed stay changed, because rolling forward from a known point is
+    /// recoverable and silently rolling back is not.
+    pub fn apply_ddl(
+        &self,
+        ddl: impl Into<crate::storage::exec::Statement>,
+    ) -> crate::Result<Vec<(ShardId, i64)>> {
+        let ddl = ddl.into();
+        let mut applied = Vec::new();
+        for s in 0..self.cfg.shard_count {
+            let id = ShardId(s);
+            if self.modes.mode(id) != mode::ShardMode::Led {
+                continue;
+            }
+            match self.writers.schema(id, Some(ddl.clone())) {
+                Ok(v) => applied.push((id, v)),
+                Err(e) => {
+                    tracing::error!(
+                        shard = %id,
+                        error = %e,
+                        applied = applied.len(),
+                        "schema change failed part way through; earlier shards keep the change"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    /// Apply DDL to a single shard, for tests that need to construct a half-applied roll.
+    ///
+    /// Public because the interesting states are the partial ones, and there is no other way
+    /// to reach them deliberately from outside this crate.
+    #[doc(hidden)]
+    pub fn writer_schema_for_test(&self, shard: ShardId, ddl: &str) {
+        self.writers
+            .schema(shard, Some(crate::storage::exec::Statement::new(ddl)))
+            .expect("applying test DDL");
+    }
+
     pub fn execute_all_shards(
         &self,
         sql: impl Into<crate::storage::exec::Statement>,

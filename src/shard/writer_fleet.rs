@@ -49,6 +49,18 @@ enum Job {
         shard: ShardId,
         reply: SyncSender<Result<()>>,
     },
+    /// Read a shard's schema version, and optionally apply a DDL statement that bumps it.
+    ///
+    /// Runs on the writer thread like any other write, so it takes its turn in the same FIFO:
+    /// everything queued ahead completes first, the change applies, and everything behind
+    /// follows. Draining is not extra machinery here — it is what a serialized writer already
+    /// does.
+    Schema {
+        shard: ShardId,
+        /// `None` reads the version without changing anything.
+        ddl: Option<Statement>,
+        reply: SyncSender<Result<i64>>,
+    },
     /// Close whatever is cached for a shard, so its file can be handed to the replication
     /// path. A connection left open across raw page writes serves stale rows with no error,
     /// so the handover must close it rather than merely stop using it.
@@ -302,6 +314,15 @@ impl WriterFleet {
     /// Expensive in two ways worth knowing before scheduling it: it needs roughly twice the
     /// shard's size in free disk, and it rewrites every page, so with capture on it
     /// produces a replication stream the size of the whole shard.
+    /// Read `shard`'s schema version, or apply `ddl` and bump it.
+    pub fn schema(&self, shard: ShardId, ddl: Option<Statement>) -> Result<i64> {
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        self.sender(shard)?
+            .send(Job::Schema { shard, ddl, reply })
+            .map_err(|_| Error::WriterGone)?;
+        rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
     /// Close any cached connection for `shard` on every writer thread.
     pub fn quiesce(&self, shard: ShardId) -> Result<usize> {
         // Sent to every thread, not just the shard's owner: hash affinity decides which
@@ -483,6 +504,10 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
                 continue;
             }
+            Job::Schema { shard, ddl, reply } => {
+                let _ = reply.send(schema_op(&mut open, &ctx, shard, ddl.as_ref()));
+                continue;
+            }
             Job::Quiesce { shard, reply } => {
                 // Dropping the entry closes the connection. Nothing else is needed: the
                 // point is only that no handle survives into the replication path's writes.
@@ -513,6 +538,9 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 }
                 Ok(Job::Vacuum { shard, reply }) => {
                     let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
+                }
+                Ok(Job::Schema { shard, ddl, reply }) => {
+                    let _ = reply.send(schema_op(&mut open, &ctx, shard, ddl.as_ref()));
                 }
                 Ok(Job::Quiesce { shard, reply }) => {
                     let closed = open.remove(shard).is_some();
@@ -718,6 +746,39 @@ fn end_snapshot(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> R
     let entry = ensure_shard(open, ctx, shard)?;
     entry.snapshot_hold = false;
     Ok(!entry.snapshot_invalidated)
+}
+
+/// Read, or advance, a shard's schema version.
+///
+/// The DDL and the version bump go in **one transaction**. Separately, a crash between them
+/// leaves a shard whose schema and version disagree — and the version is what everything else
+/// trusts to decide whether a cross-shard read is safe, so a wrong one is worse than none.
+fn schema_op(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    shard: ShardId,
+    ddl: Option<&Statement>,
+) -> Result<i64> {
+    let entry = ensure_shard(open, ctx, shard)?;
+    let Some(ddl) = ddl else {
+        return crate::storage::schema::version_of(&entry.conn);
+    };
+
+    let next = crate::storage::schema::version_of(&entry.conn)? + 1;
+    let tx = entry
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(Error::Sqlite)?;
+    tx.execute_batch(&ddl.sql).map_err(Error::Sqlite)?;
+    // Inside the transaction, so schema and version move together or not at all.
+    tx.execute_batch(&format!("PRAGMA user_version = {next}"))
+        .map_err(Error::Sqlite)?;
+    tx.commit().map_err(Error::Sqlite)?;
+
+    // The DDL produced frames like any other write; they must reach the stream.
+    drain_capture(entry, ctx, shard)?;
+    tracing::info!(%shard, version = next, "schema advanced");
+    Ok(next)
 }
 
 /// Hand this shard's committed frames to the sink.

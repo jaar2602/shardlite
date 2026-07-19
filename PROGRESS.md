@@ -36,7 +36,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | **multi-write delivered; DDL routing outstanding** | `tests/cluster.rs` (13) + `src/cluster/placement.rs` (7) |
 | 12 | Read consistency levels | not started | |
 
-**218 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**230 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -625,14 +625,36 @@ than asserting a stability the modulo scheme does not provide.
 The write gate became **per shard**. A node-wide flag cannot express "leads some, follows
 others", and would have let a node that led any shard write every shard.
 
-**What multi-write broke: cross-shard DDL.** `execute_all_shards` is a *local* operation —
+**Schema changes: rolling, with a version guard.** Chosen over pausing the cluster (a write
+outage that grows with shard count) and over plain rolling (which pushes a half-migrated
+schema onto every reader).
+
+Each shard carries a schema version in `PRAGMA user_version`, which lives in the **database
+header page** — so under physical replication it travels with the data automatically and
+cannot drift from the schema it describes. A follower's version is correct the instant the
+frames land, with no bookkeeping of ours to get wrong.
+
+`apply_ddl` rolls shard by shard. No pausing machinery was needed: writes are already
+serialized per shard, so the change simply takes its turn in that shard's queue — everything
+ahead completes, the change applies, everything behind follows. The DDL and the version bump
+share **one transaction**; separately, a crash between them leaves a shard whose version lies
+about what it holds, and the version is what every cross-shard read trusts.
+
+While a roll is in progress `query_all_shards` **refuses**, naming both versions and a shard
+at each end. Single-shard reads and writes continue untouched — that is the point of rolling
+rather than pausing. The guard clears by itself when the roll finishes; a latching guard would
+turn a transient disagreement into a permanent outage.
+
+**Still outstanding: DDL and client routing across nodes.** `execute_all_shards` is a *local* operation —
 it applies a statement to every shard **this node holds**. Once shards are spread, no node
 holds them all, so schema changes have no working path. Measured: all three nodes fail.
 `cross_shard_ddl_is_broken_by_placement_and_this_records_it` asserts the breakage so it
 cannot be forgotten, and is written to fail the moment DDL routing lands.
 
-The fix is fan-out to each shard's owner, which needs the placement map at the routing layer.
-That is the next piece, and it is a prerequisite for calling step 11 done.
+`apply_ddl` rolls only over shards **this node leads**, which is correct but partial: a
+cluster-wide schema change still needs fan-out to each shard's owner. That needs the placement
+map at the routing layer — the same missing piece that stops a client reaching the right node
+for a write. One problem, not two, and the last thing between here and step 11 being done.
 
 **Placement now drives promotion.** `Promotion::apply(lead, term)` moves shards one at a
 time, and `ClusterNode` calls it whenever a map arrives. The ordering is the correctness

@@ -120,6 +120,19 @@ pub enum Error {
     NotLeader { highest_seen: u64 },
 
     #[error(
+        "schema versions disagree across shards: {behind} is on version {lowest} while \
+         {ahead} is on {highest}. A schema change is part-applied, so a cross-shard read \
+         would combine rows from two different schemas — refusing rather than returning a \
+         half-migrated answer. Retry once the change has finished rolling"
+    )]
+    SchemaSkew {
+        lowest: i64,
+        highest: i64,
+        behind: String,
+        ahead: String,
+    },
+
+    #[error(
         "promotion refused: the replication pull loop did not come to rest within {waited}. \
          Opening SQLite on a file the replication path may still be rewriting is silent \
          corruption, so this refuses instead"
