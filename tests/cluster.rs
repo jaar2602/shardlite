@@ -29,6 +29,8 @@ struct Node {
     cluster: Arc<ClusterNode>,
     server: Arc<Server>,
     manager: Arc<ShardManager>,
+    /// Kept so a test can talk to this node directly over the wire.
+    #[allow(dead_code)]
     addr: String,
     _dir: TempDir,
 }
@@ -289,6 +291,20 @@ fn a_deposed_leader_is_fenced_and_stops_writing() {
         .collect();
     let second = await_leader(&survivors, Duration::from_secs(5)).expect("no new leader");
 
+    // Winning the election and raising the fence are two steps, and `is_leader` flips at the
+    // first. The window between them is inherent — a bar cannot rise before the election that
+    // justifies it concludes — so wait for the state this test is actually about rather than
+    // racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while second.cluster.fence().highest_seen() < second.cluster.term() && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        second.cluster.fence().highest_seen() >= second.cluster.term(),
+        "the successor never raised its fence to its own term"
+    );
+
     // The successor, and every node that heard from it, now refuses the old token.
     let err = second
         .cluster
@@ -371,40 +387,53 @@ fn a_leader_keeps_leading_while_the_cluster_is_healthy() {
 fn a_candidate_that_is_behind_cannot_win() {
     // The election restriction over real durability sources, not hand-built structs. A node
     // holding fewer writes must not be able to take leadership and lose them.
+    //
+    // Placement-aware by necessity: no node leads every shard any more, so the writes have
+    // to go to a shard's actual owner. Writing through the coordinator and hoping would race
+    // the first placement round.
     let nodes = cluster(3);
-    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
 
-    // Give the leader real committed positions the others do not have.
-    let mut c = meshdb::net::Client::connect(&leader.addr).unwrap();
-    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+    let shard = ShardId(0);
+    let owner_id = placement.owner(shard).expect("shard 0 has no owner");
+    let owner = nodes.iter().find(|n| n.id == owner_id).expect("owner node");
+    let other = nodes
+        .iter()
+        .find(|n| n.id != owner_id)
+        .expect("another node");
+
+    // DDL goes to the shard's owner, on that shard only.
+    owner
+        .manager
+        .execute_one(
+            shard,
+            meshdb::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+        )
         .unwrap();
     for i in 1..=20 {
-        leader
+        owner
             .manager
             .execute_one(
-                ShardId(0),
+                shard,
                 meshdb::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({i})")),
             )
             .unwrap();
     }
 
-    let ahead = leader.manager.durability();
-    let behind = nodes
-        .iter()
-        .find(|n| n.id != leader.id)
-        .unwrap()
-        .manager
-        .durability();
+    let ahead = owner.manager.durability();
+    let behind = other.manager.durability();
 
     assert!(
-        ahead.lsn(ShardId(0)) > behind.lsn(ShardId(0)),
-        "the leader should be ahead: {ahead:?} vs {behind:?}"
+        ahead.lsn(shard) > behind.lsn(shard),
+        "the owner should be ahead on {shard}: {ahead:?} vs {behind:?}"
     );
     assert!(
         !behind.may_lead(&ahead),
         "a node that is behind must not be electable: {behind:?} cannot lead over {ahead:?}"
     );
-    assert!(ahead.may_lead(&behind), "and the leader must still qualify");
+    assert!(ahead.may_lead(&behind), "and the owner must still qualify");
 
     for n in &nodes {
         n.stop();

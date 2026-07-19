@@ -15,8 +15,9 @@
 //! bootstrapping *repeatedly* — which means retention is too small for the write rate — is
 //! visible rather than merely slow.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -70,6 +71,15 @@ pub struct Replica {
     follower: Arc<Follower>,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
+    /// Shards actually being followed, which changes as placement moves them. Separate from
+    /// `cfg.shards` — that is the set this replica *may* follow; this is the set it currently
+    /// does, with promoted shards removed.
+    following: Arc<Mutex<BTreeSet<ShardId>>>,
+    /// Asks the loop to stand still without ending it. Promotion needs the loop to stop
+    /// touching files for a moment, not to be torn down and rebuilt.
+    paused: Arc<AtomicBool>,
+    /// True when the loop is between passes and holding no file open.
+    idle: Arc<AtomicBool>,
     /// Whether [`Self::run`] is inside the loop. Promotion has to wait for this to clear:
     /// asking the loop to stop is not the same as it having stopped, and a follower still
     /// mid-apply while the manager opens connections is the corruption the mode invariant
@@ -79,13 +89,68 @@ pub struct Replica {
 
 impl Replica {
     pub fn new(cfg: ReplicaConfig, follower: Arc<Follower>) -> Self {
+        let cfg_shards: BTreeSet<ShardId> = cfg.shards.iter().copied().collect();
         Self {
             cfg,
             follower,
             counters: Arc::new(Counters::default()),
+            following: Arc::new(Mutex::new(cfg_shards)),
             stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            idle: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Shards currently being followed.
+    pub fn following(&self) -> BTreeSet<ShardId> {
+        self.following.lock().expect("following mutex").clone()
+    }
+
+    /// Stop following `shard` — this node is taking it over.
+    pub fn unfollow(&self, shard: ShardId) {
+        self.following
+            .lock()
+            .expect("following mutex")
+            .remove(&shard);
+    }
+
+    /// Start following `shard` — another node owns it now.
+    pub fn follow(&self, shard: ShardId) {
+        self.following
+            .lock()
+            .expect("following mutex")
+            .insert(shard);
+    }
+
+    /// Ask the loop to stand still. It keeps running but stops touching files.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the loop is between passes, holding no file open.
+    pub fn is_idle(&self) -> bool {
+        self.idle.load(Ordering::Relaxed) || !self.running.load(Ordering::Relaxed)
+    }
+
+    /// Wait for the loop to come to rest. `false` if it did not within `within`.
+    ///
+    /// Promotion depends on this: a loop still inside `apply` is writing raw pages, and
+    /// opening SQLite on that file is the silent corruption the whole ownership invariant
+    /// exists to prevent.
+    pub fn wait_idle(&self, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while !self.is_idle() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
     }
 
     pub fn stats(&self) -> ReplicaStats {
@@ -111,8 +176,18 @@ impl Replica {
     /// Separate from [`Self::run`] so callers — and tests — can drive replication a step at
     /// a time rather than only as an endless loop.
     pub fn sync_once(&self) -> Result<()> {
+        let shards = self.following();
+        if shards.is_empty() {
+            return Ok(());
+        }
         let mut client = Client::connect(&self.cfg.primary_addr)?;
-        for shard in self.cfg.shards.clone() {
+        for shard in shards {
+            // Re-checked each time round: placement can take a shard away mid-pass, and
+            // applying frames to a file this node has just taken ownership of would be
+            // writing pages underneath its own SQLite connections.
+            if !self.following().contains(&shard) {
+                continue;
+            }
             self.sync_shard(&mut client, shard)?;
         }
         Ok(())
@@ -128,6 +203,12 @@ impl Replica {
         self.running.store(true, Ordering::Relaxed);
         let _idle = IdleOnDrop(Arc::clone(&self.running));
         while !self.stop.load(Ordering::Relaxed) {
+            if self.paused.load(Ordering::Relaxed) {
+                self.idle.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            self.idle.store(false, Ordering::Relaxed);
             match self.sync_once() {
                 Ok(()) => {}
                 Err(e) => {
@@ -137,6 +218,7 @@ impl Replica {
                     tracing::warn!(error = %e, "replication cycle failed; will retry");
                 }
             }
+            self.idle.store(true, Ordering::Relaxed);
             std::thread::sleep(self.cfg.poll_interval);
         }
         Ok(())

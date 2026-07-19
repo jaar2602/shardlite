@@ -50,6 +50,7 @@ struct Counters {
     peer_unreachable: AtomicU64,
     votes_granted: AtomicU64,
     votes_refused: AtomicU64,
+    handover_failed: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,9 @@ pub struct ClusterStats {
     pub peer_unreachable: u64,
     pub votes_granted: u64,
     pub votes_refused: u64,
+    /// Placement changes whose file handover failed. Each one is a shard this node was told
+    /// to lead and could not safely take, so it is still being led by nobody.
+    pub handover_failed: u64,
 }
 
 pub struct ClusterNode {
@@ -80,6 +84,10 @@ pub struct ClusterNode {
     shards: Vec<crate::shard::ShardId>,
     /// The assignment currently in force on this node.
     placement: Mutex<Placement>,
+    /// Drives the file handover when placement moves a shard. `None` on a node with no
+    /// replication configured — there is then no other writer competing for the files, so
+    /// opening and closing gates is the whole of ownership.
+    ownership: Option<Arc<super::promotion::Promotion>>,
     /// Peers that answered the most recent heartbeat round. The coordinator assigns shards
     /// only to members it can currently reach — a shard assigned to a node that is gone has
     /// no leader at all, which is worse than an uneven spread.
@@ -113,11 +121,22 @@ impl ClusterNode {
             durability,
             shards,
             placement: Mutex::new(Placement::default()),
+            ownership: None,
             live: Mutex::new(std::collections::BTreeSet::new()),
             peer_timeout,
             counters: Counters::default(),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the handover that placement changes drive.
+    ///
+    /// Without it a node told to lead a shard opens the gate without first taking the file
+    /// from the replication path — writing SQL into a file still being rewritten as raw
+    /// pages.
+    pub fn with_ownership(mut self, promotion: Arc<super::promotion::Promotion>) -> Self {
+        self.ownership = Some(promotion);
+        self
     }
 
     pub fn id(&self) -> NodeId {
@@ -153,6 +172,7 @@ impl ClusterNode {
             peer_unreachable: self.counters.peer_unreachable.load(Ordering::Relaxed),
             votes_granted: self.counters.votes_granted.load(Ordering::Relaxed),
             votes_refused: self.counters.votes_refused.load(Ordering::Relaxed),
+            handover_failed: self.counters.handover_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -188,7 +208,29 @@ impl ClusterNode {
             of = p.assignments.len(),
             "applying placement"
         );
-        self.fence.open_for(&mine, p.term);
+
+        match &self.ownership {
+            // The handover takes the files before opening their gates, and gives files up
+            // before closing them. Ordering lives in `Promotion`, not here.
+            Some(promotion) => {
+                if let Err(e) = promotion.apply(&mine, p.term) {
+                    // Do not open gates on a failed handover. The next heartbeat republishes
+                    // the same map and this retries; leading a shard whose file is still
+                    // being rewritten would be worse than leading it late.
+                    self.counters
+                        .handover_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        node = self.id,
+                        error = %e,
+                        "placement handover failed; gates left as they were, will retry"
+                    );
+                    // Forget the map so the retry is not skipped as a no-op.
+                    *self.placement.lock().expect("placement mutex") = Placement::default();
+                }
+            }
+            None => self.fence.open_for(&mine, p.term),
+        }
     }
 
     /// Compute the assignment this node would publish as coordinator.

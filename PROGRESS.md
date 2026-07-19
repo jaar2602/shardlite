@@ -36,7 +36,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | **multi-write delivered; DDL routing outstanding** | `tests/cluster.rs` (13) + `src/cluster/placement.rs` (7) |
 | 12 | Read consistency levels | not started | |
 
-**214 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**218 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -634,9 +634,32 @@ cannot be forgotten, and is written to fail the moment DDL routing lands.
 The fix is fan-out to each shard's owner, which needs the placement map at the routing layer.
 That is the next piece, and it is a prerequisite for calling step 11 done.
 
-**Also outstanding for step 11:** placement decides *ownership*, but nothing yet drives
-`Promotion` from it — a node told to lead a shard opens the gate without first checking its
-copy is current. Wiring placement to promotion closes that.
+**Placement now drives promotion.** `Promotion::apply(lead, term)` moves shards one at a
+time, and `ClusterNode` calls it whenever a map arrives. The ordering is the correctness
+argument and it is not the obvious one:
+
+1. Close gates for shards being **taken away**, first — everything after takes time, and for
+   all of it those files are about to belong to another node.
+2. Hand those files over: mark followed, then quiesce.
+3. **Bring the pull loop to rest** before touching anything being gained. A loop inside
+   `apply` is writing raw pages.
+4. Take ownership of gained shards and stop following them.
+5. **Only now** open their gates.
+
+Doing 5 before 3 is the mistake that looks harmless and is not. A failed handover leaves
+gates as they were and is counted as `handover_failed`: leading a shard whose file is still
+being rewritten is worse than leading it late.
+
+`Replica` gained a dynamic follow set and `pause`/`wait_idle`, so a shard can be taken from
+it without tearing the loop down and rebuilding it.
+
+**Two more tests were found to predate placement**, both passing only by racing the first
+placement round: `only_the_leader_can_write` (removed — a non-coordinator now legitimately
+leads shards) and `a_candidate_that_is_behind_cannot_win` (rewritten to write through a
+shard's actual owner). A third, `a_deposed_leader_is_fenced_and_stops_writing`, was racing
+something real: `is_leader()` flips when the election is won, but the fence bar rises when
+placement is applied. That window is inherent — a bar cannot rise before the election that
+justifies it concludes — so the test now waits for the state it asserts about.
 
 ### A correction
 

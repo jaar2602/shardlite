@@ -82,6 +82,75 @@ impl Promotion {
         Ok(())
     }
 
+    /// Move to leading exactly `lead` and following everything else.
+    ///
+    /// The ordering is the correctness argument, and it is not the obvious one:
+    ///
+    /// 1. **Close gates for shards being taken away, first.** Everything after this takes
+    ///    time, and for all of it those files are about to belong to another node.
+    /// 2. Hand those files to the replication path — mark followed, then quiesce. It is the
+    ///    surviving connection, not the mark, that corrupts.
+    /// 3. **Bring the pull loop to rest** before touching anything being gained. A loop
+    ///    inside `apply` is writing raw pages; opening SQLite on that file is exactly the
+    ///    silent corruption the ownership invariant exists to prevent.
+    /// 4. Take ownership of gained shards and stop following them.
+    /// 5. **Only now** open their gates. A gate opened before step 4 would let this node
+    ///    write a file the replication path still owns.
+    ///
+    /// Doing 5 before 3 is the mistake that looks harmless and is not.
+    pub fn apply(&self, lead: &[ShardId], term: Term) -> Result<()> {
+        let want: std::collections::BTreeSet<ShardId> = lead.iter().copied().collect();
+        let held: std::collections::BTreeSet<ShardId> =
+            self.fence.led_shards().into_iter().collect();
+
+        let losing: Vec<ShardId> = held.difference(&want).copied().collect();
+        let gaining: Vec<ShardId> = want.difference(&held).copied().collect();
+        if losing.is_empty() && gaining.is_empty() {
+            return Ok(());
+        }
+
+        // 1 and 2: stop writing what is leaving, then hand the files over.
+        if !losing.is_empty() {
+            let keep: Vec<ShardId> = held.intersection(&want).copied().collect();
+            self.fence.open_for(&keep, term);
+            for &shard in &losing {
+                self.manager.follow(shard)?;
+                self.replica.follow(shard);
+            }
+        }
+
+        if gaining.is_empty() {
+            return Ok(());
+        }
+
+        // 3: the loop must be holding no file before anything is taken over.
+        self.replica.pause();
+        let settled = self.replica.wait_idle(self.settle);
+        if !settled {
+            self.replica.resume();
+            return Err(Error::PromotionBlocked {
+                waited: format!("{:?}", self.settle),
+            });
+        }
+
+        // 4: ownership moves while the loop is standing still.
+        for &shard in &gaining {
+            self.replica.unfollow(shard);
+            self.manager.lead(shard);
+        }
+        self.replica.resume();
+
+        // 5: and only now may this node write them.
+        self.fence.open_for(lead, term);
+        tracing::info!(
+            term,
+            gained = gaining.len(),
+            lost = losing.len(),
+            "placement applied"
+        );
+        Ok(())
+    }
+
     /// Take every shard back from the replication path. The node becomes the leader.
     ///
     /// Blocks until the pull loop has come to rest, because a follower still inside `apply`

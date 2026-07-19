@@ -109,6 +109,10 @@ struct Replicant {
 }
 
 fn replicant(p: &Primary) -> Replicant {
+    replicant_with_shards(p, 1)
+}
+
+fn replicant_with_shards(p: &Primary, shards: u32) -> Replicant {
     let dir = TempDir::new().unwrap();
     let stage = TempDir::new().unwrap();
     let fence = Arc::new(Fence::new(FOLLOWER, 0));
@@ -116,7 +120,7 @@ fn replicant(p: &Primary) -> Replicant {
         ShardManager::open_clustered(
             dir.path(),
             ShardConfig {
-                shard_count: 1,
+                shard_count: shards,
                 capture: true,
                 ..ShardConfig::floor()
             },
@@ -129,7 +133,7 @@ fn replicant(p: &Primary) -> Replicant {
     let replica = Arc::new(Replica::new(
         ReplicaConfig {
             primary_addr: p.addr.clone(),
-            shards: vec![S0],
+            shards: (0..shards).map(ShardId).collect(),
             poll_interval: Duration::from_millis(5),
             batch: 64,
             snapshot_chunk: 64 * 1024,
@@ -143,7 +147,7 @@ fn replicant(p: &Primary) -> Replicant {
         Arc::clone(&manager),
         Arc::clone(&replica),
         Arc::clone(&fence),
-        vec![S0],
+        (0..shards).map(ShardId).collect(),
     )
     .with_settle_timeout(Duration::from_secs(5));
 
@@ -379,4 +383,111 @@ fn a_standalone_node_leads_everything_by_default() {
     assert_eq!(m.modes().refused_opens(), 0);
     // Silence the unused-field warning on `dir`, which the replicant fixture needs.
     let _ = &dir;
+}
+
+#[test]
+fn placement_moves_shards_one_at_a_time() {
+    // Placement hands out shards individually, so promotion has to be per shard rather than
+    // all-or-nothing: a node routinely leads some and follows others.
+    let p = primary(2);
+    let r = replicant_with_shards(&p, 4);
+
+    // Start following everything, then take two shards.
+    r.promotion.follow().unwrap();
+    for s in 0..4u32 {
+        assert_eq!(r.manager.mode(ShardId(s)), ShardMode::Followed);
+    }
+
+    r.promotion.apply(&[ShardId(0), ShardId(2)], 3).unwrap();
+
+    for s in [0u32, 2] {
+        assert_eq!(r.manager.mode(ShardId(s)), ShardMode::Led, "shard {s}");
+        assert!(r.fence.is_open(ShardId(s)), "shard {s} gate should be open");
+    }
+    for s in [1u32, 3] {
+        assert_eq!(r.manager.mode(ShardId(s)), ShardMode::Followed, "shard {s}");
+        assert!(
+            !r.fence.is_open(ShardId(s)),
+            "shard {s} gate should be shut"
+        );
+    }
+
+    // The replica keeps following only what it does not lead.
+    let following = r.replica.following();
+    assert!(!following.contains(&ShardId(0)) && !following.contains(&ShardId(2)));
+    assert!(following.contains(&ShardId(1)) && following.contains(&ShardId(3)));
+}
+
+#[test]
+fn a_shard_taken_away_is_closed_before_its_file_is_handed_over() {
+    // The ordering that matters. If the gate were closed after the handover, this node would
+    // still be committing SQL into a file the replication path had begun rewriting.
+    let p = primary(2);
+    let r = replicant_with_shards(&p, 4);
+    r.promotion.follow().unwrap();
+    r.promotion.apply(&[ShardId(0), ShardId(1)], 3).unwrap();
+    assert!(r.fence.is_open(ShardId(1)));
+
+    // Placement takes shard 1 away.
+    r.promotion.apply(&[ShardId(0)], 4).unwrap();
+
+    assert!(
+        !r.fence.is_open(ShardId(1)),
+        "a shard taken away must not still be writable"
+    );
+    assert_eq!(r.manager.mode(ShardId(1)), ShardMode::Followed);
+    assert!(r.replica.following().contains(&ShardId(1)));
+    assert!(
+        r.manager
+            .execute_one(ShardId(1), Statement::new("CREATE TABLE z (a INTEGER)"))
+            .is_err(),
+        "and writing it must be refused"
+    );
+
+    // The retained shard is untouched by the change.
+    assert!(r.fence.is_open(ShardId(0)));
+    assert_eq!(r.manager.mode(ShardId(0)), ShardMode::Led);
+}
+
+#[test]
+fn a_gained_shard_is_not_writable_until_its_file_is_taken_over() {
+    // The gate must open last. Opening it before ownership moves would let this node write a
+    // file the replication path still owns and is rewriting underneath it.
+    let p = primary(2);
+    let r = replicant_with_shards(&p, 2);
+    r.promotion.follow().unwrap();
+
+    // While following, the mode refuses opens and the gate is shut. Both, not either.
+    assert!(!r.fence.is_open(ShardId(0)));
+    assert_eq!(r.manager.mode(ShardId(0)), ShardMode::Followed);
+
+    r.promotion.apply(&[ShardId(0)], 2).unwrap();
+
+    // After promotion the two agree the other way.
+    assert!(r.fence.is_open(ShardId(0)));
+    assert_eq!(r.manager.mode(ShardId(0)), ShardMode::Led);
+    r.manager
+        .execute_one(ShardId(0), Statement::new("CREATE TABLE ok (a INTEGER)"))
+        .unwrap();
+}
+
+#[test]
+fn applying_the_same_placement_twice_changes_nothing() {
+    // Placement is republished on every heartbeat. If each republication tore files down and
+    // rebuilt them, a healthy cluster would spend its time handing shards to itself.
+    let p = primary(2);
+    let r = replicant_with_shards(&p, 4);
+    r.promotion.follow().unwrap();
+    r.promotion.apply(&[ShardId(0), ShardId(1)], 3).unwrap();
+
+    let before = r.manager.modes().closed_on_handover();
+    for _ in 0..5 {
+        r.promotion.apply(&[ShardId(0), ShardId(1)], 3).unwrap();
+    }
+    assert_eq!(
+        r.manager.modes().closed_on_handover(),
+        before,
+        "repeating an unchanged placement must not churn connections"
+    );
+    assert!(r.fence.is_open(ShardId(0)) && r.fence.is_open(ShardId(1)));
 }
