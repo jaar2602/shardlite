@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod storage;
+pub mod vfs;
 
 pub use error::{Error, Result};
 

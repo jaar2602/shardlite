@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 4 of 12 · **Status:** single-node engine runs
+**Updated:** 2026-07-19 · **Steps complete:** 5 of 12 · **Status:** single-node engine runs; **VFS spike PASSED**
 
 ---
 
@@ -21,21 +21,21 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 
 | # | Step | Status | Evidence |
 |---|---|---|---|
-| 0 | VFS capture spike | **not started** | — gates all replication work |
+| 0 | VFS capture spike | **done — PASSED** | `tests/vfs_capture.rs` (7) + `src/vfs/wal.rs` (7) |
 | 1 | PRAGMA profiles, connection lifecycle | **done** | `tests/storage_open.rs` (8) |
 | 2 | Execution + batching writer | **done** | `tests/writer.rs` (6) |
 | 3 | Reader pool | **done** | `tests/reader_pool.rs` (5) |
 | 4 | WAL checkpointing | **done** | `tests/checkpoint.rs` (5) |
 | 5 | Shard manager (LRU, thread affinity) | not started | |
 | 6 | Benchmarks + cgroup memory test | not started | |
-| 7 | VFS capture productionized | not started | blocked on step 0 |
-| 8 | Replication + per-shard bootstrap | not started | blocked on step 0 |
+| 7 | VFS capture productionized | not started | **unblocked** |
+| 8 | Replication + per-shard bootstrap | not started | **unblocked** |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | not started | |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**24 Rust tests + 26 CLI assertions. Clippy clean, fmt clean.**
+**38 Rust tests + 26 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -71,6 +71,13 @@ because SQLite would otherwise do this work inside `COMMIT`, stalling a batch ca
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
 
+### WAL capture VFS (`src/vfs/passthrough.rs`, `wal.rs`)
+A pass-through SQLite VFS delegating every call to the default VFS, so the database is an
+ordinary on-disk file with ordinary durability. Successful writes to the `-wal` file are
+also fed to a parser that reconstructs committed transactions as page frames. Followers
+apply those pages directly and never execute SQL — which is why non-deterministic functions
+and per-machine errors cannot make a replica diverge.
+
 ### CLI (`src/main.rs`, `src/db.rs`)
 ```
 meshdb <db-path>              interactive shell
@@ -100,6 +107,15 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | WAL bounded under sustained writes | `wal_stays_bounded_under_sustained_writes` |
 | **Long reader stalls checkpointer; ladder escalates** | `a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation` |
 | Checkpointing loses no data across reopen | `checkpointing_does_not_lose_or_corrupt_data` |
+| VFS is transparent; DB readable with no custom VFS | `ordinary_sqlite_works_through_the_vfs` |
+| Commit frames detected | `commit_frames_are_detected` |
+| **Follower reconstructed byte-identically** | `a_follower_is_reconstructed_byte_identically` |
+| **Negative control: a dropped txn IS detected** | `dropping_one_transaction_is_detected_as_divergence` |
+| **Holds under page reuse, 4.6 MB, freelist churn** | `reconstruction_holds_under_page_reuse_and_churn` |
+| Survives checkpoints and salt rotation | `capture_survives_checkpoints_and_wal_resets` |
+| Survives concurrent readers + TRUNCATE | `capture_survives_concurrent_readers_and_truncate` |
+| **In-place header rewrite honoured** | `a_rewritten_header_carrying_the_commit_marker_is_honoured` |
+| Reused WAL slot takes the newer page | `a_reused_slot_takes_the_newer_page` |
 
 ### Measured, not assumed
 
@@ -114,23 +130,43 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
   guard it would route to a reader, appear to succeed, and do nothing.
 - **A stalled `PASSIVE` checkpoint still costs O(WAL size)** to discover it cannot advance.
   Found when a test took >60s; fixed with exponential stall backoff.
+- **SQLite rewrites WAL frame headers in place.** Measured on 3.53.2: a churn workload wrote
+  4059 frame headers, of which **1641 were in-place rewrites** over a page already written
+  (`walRewriteChecksums` fixing checksums and stamping the commit marker). The WAL is an
+  array of *slots*, not an append log. An append-based parser loses the commit marker and
+  strands the transaction — which is exactly what the first implementation did, passing
+  every light test and failing only under page-reuse churn.
+- **The VFS write pattern itself is clean**: header then page data, no odd-sized writes, in
+  the workloads traced. `WalCapture::take_trace()` reproduces this analysis when the bundled
+  SQLite version is bumped.
 
 ---
 
 ## Outstanding
 
-### Blocking the architecture
+### Step 0 result: **PASSED**
 
-**Step 0, the VFS capture spike, has not been run.** The HA design depends on a
-pass-through VFS that writes to disk normally *and* tees committed WAL frames to a
-replication stream. dqlite proves frames can be captured with stock SQLite, but dqlite keeps
-the whole database in process memory — it never writes to disk. Whether the same works while
-backing a real on-disk file is **unverified**, and at a few hundred GB the in-memory
-fallback does not exist.
+All six criteria met, on SQLite 3.53.2:
 
-If the spike fails, the fallbacks are materially different products: logical replication
-(reintroducing determinism and error-classification divergence), or shared-storage failover
-(no read replicas). **This should be settled before any replication code is written.**
+1. ordinary SQLite works unchanged through the VFS, and the resulting file is readable by a
+   plain SQLite with no custom VFS at all
+2. WAL header and frame headers parse
+3. commit frames are detected
+4. a follower is reconstructed **byte-identically**, `PRAGMA integrity_check` = ok
+5. survives checkpoints, WAL resets, and salt rotation
+6. survives concurrent readers and `TRUNCATE` checkpoints
+
+Verified as non-vacuous: `dropping_one_transaction_is_detected_as_divergence` confirms the
+byte-comparison can fail, and the churn test builds a 4.6 MB database with freelist reuse
+and index rebuilds.
+
+**The physical-replication architecture is viable.** The fallbacks — logical replication
+with its determinism and error-classification divergence, or shared-storage failover with no
+read replicas — are not needed.
+
+**Residual risk:** SQLite's WAL *format* is documented, but its *write pattern* is not an API
+contract. Contained by pinning the bundled SQLite version exactly. When bumping it, re-run
+the trace comparison (`take_trace()`) before trusting capture.
 
 ### Known gaps in what exists
 
@@ -142,6 +178,8 @@ If the spike fails, the fallbacks are materially different products: logical rep
 | No `VACUUM` path | Rejected outright; needs an out-of-transaction maintenance mode |
 | Checkpoint test suite takes ~20s | Real fsyncs; acceptable but the slowest thing in CI |
 | Writer has no backpressure | Unbounded `mpsc`; readers shed load but writers do not |
+| Capture holds an uncommitted txn fully in memory | A huge single transaction is unbounded; needs a spill or cap |
+| `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 
 ### Design decisions not yet made

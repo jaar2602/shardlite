@@ -61,4 +61,7 @@ pub enum Error {
 
     #[error("the statement classifier is poisoned; a previous caller panicked holding it")]
     ClassifierPoisoned,
+
+    #[error("registering the capture VFS: {0}")]
+    VfsRegistration(String),
 }
