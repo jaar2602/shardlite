@@ -20,8 +20,9 @@ use std::thread::JoinHandle;
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::config::PragmaProfile;
+use crate::config::{CheckpointConfig, PragmaProfile};
 use crate::error::{Error, Result};
+use crate::storage::checkpoint::{CheckpointStats, Checkpointer, Counters as CheckpointCounters};
 use crate::storage::exec::{self, Outcome, SqlError};
 use crate::storage::open::{WriterOpened, open_writer};
 
@@ -74,6 +75,7 @@ pub struct Writer {
     tx: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
+    checkpoint_counters: Arc<CheckpointCounters>,
 }
 
 /// A cheap, cloneable handle for submitting writes from any thread.
@@ -88,15 +90,26 @@ impl Writer {
     /// The connection is opened here rather than inside the thread so the caller receives
     /// the [`WriterOpened`] token needed to open readers.
     pub fn spawn(path: &Path, profile: &PragmaProfile) -> Result<(Self, WriterOpened)> {
+        Self::spawn_with(path, profile, CheckpointConfig::floor())
+    }
+
+    pub fn spawn_with(
+        path: &Path,
+        profile: &PragmaProfile,
+        checkpoint: CheckpointConfig,
+    ) -> Result<(Self, WriterOpened)> {
         let (conn, token) = open_writer(path, profile)?;
         let (tx, rx) = mpsc::channel();
         let counters = Arc::new(Counters::default());
+        let checkpoint_counters = Arc::new(CheckpointCounters::default());
 
         let thread = {
             let counters = Arc::clone(&counters);
+            let checkpointer =
+                Checkpointer::new(path, checkpoint, Arc::clone(&checkpoint_counters));
             std::thread::Builder::new()
                 .name("meshdb-writer".to_string())
-                .spawn(move || writer_loop(conn, rx, &counters))
+                .spawn(move || writer_loop(conn, rx, &counters, checkpointer))
                 .expect("spawning the writer thread")
         };
 
@@ -105,6 +118,7 @@ impl Writer {
                 tx: Some(tx),
                 thread: Some(thread),
                 counters,
+                checkpoint_counters,
             },
             token,
         ))
@@ -121,6 +135,16 @@ impl Writer {
             batches: self.counters.batches.load(Ordering::Relaxed),
             requests: self.counters.requests.load(Ordering::Relaxed),
             max_batch: self.counters.max_batch.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        CheckpointStats {
+            passive: self.checkpoint_counters.passive.load(Ordering::Relaxed),
+            truncated: self.checkpoint_counters.truncated.load(Ordering::Relaxed),
+            stalls: self.checkpoint_counters.stalls.load(Ordering::Relaxed),
+            failures: self.checkpoint_counters.failures.load(Ordering::Relaxed),
+            wal_bytes: self.checkpoint_counters.wal_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -158,7 +182,12 @@ impl WriterHandle {
     }
 }
 
-fn writer_loop(mut conn: Connection, rx: Receiver<Job>, counters: &Counters) {
+fn writer_loop(
+    mut conn: Connection,
+    rx: Receiver<Job>,
+    counters: &Counters,
+    mut checkpointer: Checkpointer,
+) {
     loop {
         // Block for the first job, then take whatever else has already arrived. The
         // `try_recv` drain is what produces group commit: everything that queued while
@@ -201,6 +230,11 @@ fn writer_loop(mut conn: Connection, rx: Receiver<Job>, counters: &Counters) {
             .fetch_max(requests as u64, Ordering::Relaxed);
 
         apply_batch(&mut conn, batch);
+
+        // Between transactions, never inside one. This is the whole reason
+        // `wal_autocheckpoint` is disabled: SQLite would otherwise do this work in the
+        // middle of COMMIT, stalling a batch callers are blocked on.
+        checkpointer.after_batch(&conn);
 
         if stopping {
             return;

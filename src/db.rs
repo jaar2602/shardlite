@@ -7,6 +7,7 @@ use rusqlite::Connection;
 
 use crate::config::{PragmaProfile, ReaderPoolConfig};
 use crate::error::{Error, Result};
+use crate::storage::checkpoint::CheckpointStats;
 use crate::storage::exec::Outcome;
 use crate::storage::open::open_reader;
 use crate::storage::reader::{ReaderPool, ReaderStats};
@@ -55,6 +56,10 @@ impl Db {
 
     pub fn reader_stats(&self) -> ReaderStats {
         self.readers.stats()
+    }
+
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        self.writer.checkpoint_stats()
     }
 
     pub fn handle(&self) -> WriterHandle {

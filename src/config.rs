@@ -76,6 +76,44 @@ impl ReaderPoolConfig {
     }
 }
 
+/// Thresholds for the WAL checkpoint escalation ladder.
+///
+/// The limits are cut well below what a normal-hardware design would use, to fit the
+/// floor profile's disk and page-cache budget.
+#[derive(Debug, Clone)]
+pub struct CheckpointConfig {
+    /// Below this WAL file size, don't checkpoint at all.
+    pub soft_limit_bytes: u64,
+
+    /// Above this, and with passive attempts stalling, escalate to a blocking `TRUNCATE`.
+    pub hard_limit_bytes: u64,
+
+    /// Consecutive passive attempts that failed to fully drain before escalating.
+    pub stall_threshold: u32,
+
+    /// Amortizes the `stat` syscall — only check every Nth batch.
+    pub check_every_batches: u64,
+
+    /// Cap on the exponential backoff applied while checkpoints are stalling.
+    ///
+    /// A stalled `PASSIVE` attempt still costs O(WAL size) to discover it cannot advance,
+    /// so retrying at a fixed interval while a reader pins a snapshot burns CPU in
+    /// proportion to a WAL that is itself growing. Backing off keeps that bounded.
+    pub max_stall_backoff: u64,
+}
+
+impl CheckpointConfig {
+    pub fn floor() -> Self {
+        Self {
+            soft_limit_bytes: 16 * 1024 * 1024,
+            hard_limit_bytes: 128 * 1024 * 1024,
+            stall_threshold: 5,
+            check_every_batches: 16,
+            max_stall_backoff: 64,
+        }
+    }
+}
+
 /// The complete PRAGMA configuration for one connection.
 ///
 /// Numeric values here are starting points to be moved by benchmark data. The durable

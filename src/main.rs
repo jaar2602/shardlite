@@ -144,6 +144,11 @@ fn repl(db: &Db) -> ExitCode {
                     "reader: threads={} queries={} rejected_busy={} timed_out={}",
                     r.threads, r.queries, r.rejected_busy, r.timed_out
                 );
+                let c = db.checkpoint_stats();
+                println!(
+                    "wal:    bytes={} passive={} truncated={} stalls={} failures={}",
+                    c.wal_bytes, c.passive, c.truncated, c.stalls, c.failures
+                );
                 continue;
             }
             ".tables" => {
