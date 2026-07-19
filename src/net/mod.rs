@@ -13,11 +13,13 @@
 //! the honest first line and the queue bound remains a second.
 
 pub mod client;
+pub mod forward;
 pub mod protocol;
 pub mod replica;
 pub mod server;
 
 pub use client::Client;
+pub use forward::{ForwardStats, Router};
 pub use protocol::{Request, Response, ShardOutcome};
 pub use replica::{Replica, ReplicaConfig, ReplicaStats};
 pub use server::{NodeServices, Server, ServerConfig, ServerStats};

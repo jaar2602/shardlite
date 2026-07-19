@@ -33,10 +33,10 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | **done** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `tests/promotion.rs` (5) + `src/cluster/` (44) |
-| 11 | Shard placement + move | **multi-write delivered; DDL routing outstanding** | `tests/cluster.rs` (13) + `src/cluster/placement.rs` (7) |
+| 11 | Shard placement + move | **done** | `tests/cluster.rs` (16) + `src/cluster/placement.rs` (7) + `src/net/forward.rs` |
 | 12 | Read consistency levels | not started | |
 
-**230 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**233 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -645,7 +645,32 @@ at each end. Single-shard reads and writes continue untouched — that is the po
 rather than pausing. The guard clears by itself when the roll finishes; a latching guard would
 turn a transient disagreement into a permanent outage.
 
-**Still outstanding: DDL and client routing across nodes.** `execute_all_shards` is a *local* operation —
+**Routing: the server forwards, the client stays simple.** The last piece, and the plan
+already named it — `server/forward.rs`, *"forward to primary"*. A node that receives work for
+a shard it does not own hands it to the owner. A client connects to any node and its writes
+reach the right one; without this, multi-write existed at the storage layer and no client
+could use it.
+
+The alternative — clients holding the placement map and their own connections — pushes
+cluster topology into every client, and a client with a stale map writes to the wrong node.
+
+**Forwarding cannot loop.** Two nodes whose maps disagree for a moment would otherwise pass a
+request back and forth forever, which is a hang: the worst way for this to fail. A forwarded
+request is wrapped in `Request::Direct`, meaning *handle this here or refuse it*.
+
+Cluster-wide DDL is built on the same routing: `ExecuteAll` walks every shard and sends each
+change to that shard's owner, reporting per-shard outcomes because there is no atomicity
+across shards and collapsing them would hide a partial application.
+
+**Superseded:** `cross_shard_ddl_is_broken_by_placement_and_this_records_it` was written to
+fail the moment DDL routing landed. It did, and has been replaced by
+`ddl_reaches_every_shard_from_any_node`.
+
+**A guard that took three attempts to make real.** Removing the `Direct` wrapper kept passing:
+the first test sent `Direct` from a client, which never exercises `Router::forward` at all.
+The property is *what goes on the wire*, so the test now stands up a stub peer and inspects
+the request it receives. Only then did removing the wrapper fail. Worth recording as a
+pattern: a guard aimed at the wrong side of a boundary looks exactly like a passing test. `execute_all_shards` is a *local* operation —
 it applies a statement to every shard **this node holds**. Once shards are spread, no node
 holds them all, so schema changes have no working path. Measured: all three nodes fail.
 `cross_shard_ddl_is_broken_by_placement_and_this_records_it` asserts the breakage so it

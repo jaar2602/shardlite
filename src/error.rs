@@ -120,6 +120,12 @@ pub enum Error {
     NotLeader { highest_seen: u64 },
 
     #[error(
+        "no node currently owns {shard}: placement has not assigned it, or its owner is \
+         unreachable. Writes to it cannot be routed until placement settles"
+    )]
+    NoOwner { shard: String },
+
+    #[error(
         "schema versions disagree across shards: {behind} is on version {lowest} while \
          {ahead} is on {highest}. A schema change is part-applied, so a cross-shard read \
          would combine rows from two different schemas — refusing rather than returning a \

@@ -153,12 +153,14 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             (0..2).map(ShardId).collect(),
         ));
 
+        let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
         let server = Arc::new(
             Server::bind_with(
                 Arc::clone(&manager),
                 meshdb::net::NodeServices {
                     frames: Some(frames),
                     cluster: Some(Arc::clone(&cluster)),
+                    router: Some(router),
                     ..Default::default()
                 },
                 ServerConfig {
@@ -722,43 +724,245 @@ fn losing_a_node_reassigns_its_shards() {
 }
 
 #[test]
-fn cross_shard_ddl_is_broken_by_placement_and_this_records_it() {
-    // A real regression that multi-write introduced, asserted rather than left to be
-    // discovered. `execute_all_shards` is a *local* operation: it applies a statement to
-    // every shard this node holds. Once placement spreads shards across nodes, no node leads
-    // them all, so no node can apply DDL to them all — schema changes have no working path.
-    //
-    // The fix is fan-out to each shard's owner, which needs the placement map at the routing
-    // layer. This test fails the moment that lands, which is the intent: it is a marker, not
-    // an endorsement.
+fn ddl_reaches_every_shard_from_any_node() {
+    // The piece that makes multi-write usable. No node holds every shard, so a schema change
+    // has to reach each shard's owner. This replaces
+    // `cross_shard_ddl_is_broken_by_placement_and_this_records_it`, which existed to prompt
+    // exactly this.
     let nodes = cluster(3);
     let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
-    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        placement.leaders().len() > 1,
+        "the point is that shards live on different nodes"
+    );
+
+    // Ask a node that does NOT own every shard — under placement, none does.
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let outcomes = c
+        .execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    for (shard, o) in &outcomes {
+        assert_eq!(
+            *o,
+            meshdb::net::ShardOutcome::Ok,
+            "shard {shard} did not get the schema change: {o:?}"
+        );
+    }
+
+    // Every shard really has the table, checked at its owner.
+    for s in 0..2u32 {
+        let shard = ShardId(s);
+        let owner_id = placement.owner(shard).expect("owner");
+        let owner = nodes.iter().find(|n| n.id == owner_id).unwrap();
+        owner
+            .manager
+            .execute_one(
+                shard,
+                meshdb::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({s})")),
+            )
+            .unwrap_or_else(|e| panic!("{shard} on node {owner_id} has no table: {e}"));
+        assert_eq!(
+            owner.manager.schema_version(shard).unwrap(),
+            1,
+            "{shard} should have advanced exactly one schema version"
+        );
+    }
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_write_is_forwarded_to_the_node_that_owns_the_shard() {
+    // A client connects to any node and its write reaches the right one. Without this,
+    // multi-write exists at the storage layer but no client can use it.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
     std::thread::sleep(Duration::from_millis(400));
 
-    let results: Vec<(u64, bool)> = nodes
-        .iter()
-        .map(|n| {
-            (
-                n.id,
-                n.manager
-                    .execute_all_shards(meshdb::storage::exec::Statement::new(
-                        "CREATE TABLE ddl (a INTEGER) STRICT",
-                    ))
-                    .is_ok(),
-            )
-        })
-        .collect();
-    println!("execute_all_shards per node: {results:?}");
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    // Find a shard node 0 does not own, and write it through node 0 anyway.
+    let elsewhere = (0..2u32)
+        .map(ShardId)
+        .find(|s| placement.owner(*s) != Some(nodes[0].id))
+        .expect("some shard should live on another node");
+    let owner_id = placement.owner(elsewhere).unwrap();
+    assert_ne!(owner_id, nodes[0].id);
+
+    c.execute(elsewhere.0, "INSERT INTO t VALUES (77)")
+        .unwrap_or_else(|e| panic!("write to {elsewhere} via node {} failed: {e}", nodes[0].id));
+
+    // It landed on the owner, not on the node that took the request.
+    let owner = nodes.iter().find(|n| n.id == owner_id).unwrap();
+    let n = owner
+        .manager
+        .query(
+            elsewhere,
+            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 77"),
+        )
+        .unwrap();
+    match n {
+        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(1));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_forwarded_request_is_answered_or_refused_but_never_forwarded_again() {
+    // Loop prevention, tested directly rather than by trying to engineer two disagreeing
+    // maps. Two nodes whose placement differs for a moment would otherwise pass a request
+    // back and forth forever — a hang, which is the worst way for this to fail.
+    //
+    // A `Direct` request means "handle this here or refuse it", so sending one to a node that
+    // does not own the shard must come back as a refusal, promptly.
+    use meshdb::net::protocol::Request;
+
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    // A shard node 0 does not own.
+    let elsewhere = (0..2u32)
+        .map(ShardId)
+        .find(|s| placement.owner(*s) != Some(nodes[0].id))
+        .expect("some shard should live on another node");
+
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let started = Instant::now();
+    let result = c.request(Request::Direct(Box::new(Request::Execute {
+        shard: elsewhere.0,
+        statements: vec![meshdb::storage::exec::Statement::new(
+            "CREATE TABLE loop_guard (a INTEGER)",
+        )],
+    })));
+    let took = started.elapsed();
 
     assert!(
-        results.iter().all(|(_, ok)| !ok),
-        "a node applied DDL to every shard: {results:?}. If placement now routes DDL to \
-         each shard's owner, this test has served its purpose and should be replaced with \
-         one asserting that DDL succeeds."
+        result.is_err(),
+        "a directed request to a node that does not own the shard must be refused, got {result:?}"
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "it must refuse promptly rather than bouncing; took {took:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("not the leader") || msg.contains("followed"),
+        "the refusal should say why this node cannot serve the shard: {msg}"
     );
 
     for n in &nodes {
         n.stop();
     }
+}
+
+#[test]
+fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
+    // The other half of loop prevention, and the half a client-side test cannot reach:
+    // `Router::forward` must wrap what it sends. Verified by watching the wire, because the
+    // failure it prevents — two nodes bouncing a request forever — only shows up when their
+    // placement maps disagree, which is precisely the state that is hard to arrange on
+    // purpose and certain to happen eventually.
+    use meshdb::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    // A stub peer that completes the handshake, records one request, and answers.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stub_addr = listener.local_addr().unwrap().to_string();
+    let (seen_tx, seen_rx) = mpsc::channel::<Request>();
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut w = std::io::BufWriter::new(stream);
+            let _hello: Request = read_message(&mut r).unwrap();
+            write_message(
+                &mut w,
+                &Response::Welcome {
+                    version: PROTOCOL_VERSION,
+                    shard_count: 2,
+                    epoch: Some(1),
+                },
+            )
+            .unwrap();
+            let req: Request = read_message(&mut r).unwrap();
+            let _ = seen_tx.send(req);
+            write_message(&mut w, &Response::Ok).unwrap();
+        }
+    });
+
+    // A node that believes shard 0 belongs to the stub.
+    let dir = TempDir::new().unwrap();
+    let terms = TermStore::open(dir.path()).unwrap();
+    let fence = Arc::new(Fence::new(1, 0));
+    let election = Election::new(quick(1, vec![2]), terms, Instant::now()).unwrap();
+    let manager = Arc::new(
+        ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap(),
+    );
+    let node = Arc::new(ClusterNode::new(
+        1,
+        election,
+        fence,
+        [(2u64, stub_addr)].into_iter().collect(),
+        manager as Arc<dyn DurabilitySource>,
+        vec![ShardId(0), ShardId(1)],
+    ));
+
+    // Tell it, as a heartbeat would, that node 2 owns shard 0.
+    let mut assignments = std::collections::BTreeMap::new();
+    assignments.insert(ShardId(0), 2u64);
+    assignments.insert(ShardId(1), 1u64);
+    node.handle_heartbeat(&meshdb::cluster::Heartbeat {
+        term: 1,
+        leader: 2,
+        placement: meshdb::cluster::Placement {
+            term: 1,
+            assignments,
+        },
+    })
+    .unwrap();
+
+    let router = meshdb::net::Router::new(Arc::clone(&node));
+    assert!(
+        !router.is_mine(ShardId(0)),
+        "shard 0 should belong to node 2"
+    );
+
+    let sent = Request::Execute {
+        shard: 0,
+        statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+    };
+    router.forward(ShardId(0), sent.clone()).unwrap();
+
+    let observed = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    match observed {
+        Request::Direct(inner) => assert_eq!(*inner, sent, "the inner request must be unchanged"),
+        other => panic!(
+            "a forwarded request must go on the wire wrapped in Direct, or two nodes with \
+             disagreeing maps will bounce it forever; got {other:?}"
+        ),
+    }
+    assert_eq!(router.stats().forwarded, 1);
 }

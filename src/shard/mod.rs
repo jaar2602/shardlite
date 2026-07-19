@@ -536,6 +536,18 @@ impl ShardManager {
         self.writers.schema(shard, None)
     }
 
+    /// Apply a schema change to one shard.
+    ///
+    /// The unit a cluster-wide roll is built from: each shard's owner applies its own, so no
+    /// node needs to hold every shard to change the schema everywhere.
+    pub fn apply_ddl_to(
+        &self,
+        shard: ShardId,
+        ddl: impl Into<crate::storage::exec::Statement>,
+    ) -> crate::Result<i64> {
+        self.writers.schema(shard, Some(ddl.into()))
+    }
+
     /// Apply a schema change to every shard this node leads, one at a time.
     ///
     /// **Rolling, not atomic** — there is no cross-shard atomicity and there never will be.

@@ -67,6 +67,14 @@ pub enum Request {
     SnapshotRead { shard: u32, offset: u64, len: u32 },
     /// Release the freeze. Must be sent, or checkpointing stays suspended.
     SnapshotEnd { shard: u32 },
+    /// Apply a schema change to one shard and return its new version.
+    SchemaApply { shard: u32, ddl: Statement },
+    /// Handle this request here, without forwarding it on.
+    ///
+    /// How a forwarded request is distinguished from a fresh one. Without it, two nodes with
+    /// briefly different placement maps could forward the same request back and forth
+    /// forever; with it, the second node refuses instead of bouncing it.
+    Direct(Box<Request>),
     /// A peer is standing for election.
     Vote(crate::cluster::VoteRequest),
     /// A peer claims leadership and is renewing its lease.
@@ -130,6 +138,10 @@ pub enum Response {
         data: Vec<u8>,
     },
     Ok,
+    SchemaVersion {
+        shard: u32,
+        version: i64,
+    },
     Voted(crate::cluster::VoteReply),
     Beat(crate::cluster::HeartbeatReply),
     /// The statement was rejected deterministically — bad SQL, constraint violation. A

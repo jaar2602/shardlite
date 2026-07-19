@@ -143,6 +143,11 @@ impl ClusterNode {
         self.id
     }
 
+    /// Where a peer listens, for forwarding work to the node that owns a shard.
+    pub fn peer_addr(&self, node: NodeId) -> Option<&str> {
+        self.peers.get(&node).map(|s| s.as_str())
+    }
+
     pub fn fence(&self) -> &Arc<Fence> {
         &self.fence
     }

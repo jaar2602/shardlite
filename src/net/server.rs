@@ -82,6 +82,9 @@ pub struct NodeServices {
     /// Quorum confirmation. Independent of `cluster` because a follower's subscription is
     /// what reports its position, and that works whether or not elections are running.
     pub acks: Option<Arc<crate::replication::AckTracker>>,
+    /// Sends shard work to the node that owns it. Without it a client can only reach shards
+    /// that happen to live on the node it connected to.
+    pub router: Option<Arc<super::forward::Router>>,
 }
 
 pub struct Server {
@@ -301,6 +304,39 @@ fn serve_connection(
 }
 
 fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
+    // A request that arrived already forwarded is handled here or refused, never passed on
+    // again — that is what stops two nodes with briefly different maps bouncing it forever.
+    if let Request::Direct(inner) = req {
+        return handle_local(*inner, shards, services);
+    }
+
+    // Shard-targeted work goes to the node that owns the shard.
+    if let Some(router) = &services.router
+        && let Some(shard) = target_shard(&req)
+        && !router.is_mine(shard)
+    {
+        return match router.forward(shard, req) {
+            // Passed back unchanged: a node that rewrote a forwarded failure as its own
+            // would make every problem look local.
+            Ok(response) => response,
+            Err(e) => error_response(e),
+        };
+    }
+
+    handle_local(req, shards, services)
+}
+
+/// The shard a request is about, if it is about one.
+fn target_shard(req: &Request) -> Option<ShardId> {
+    match req {
+        Request::Query { shard, .. }
+        | Request::Execute { shard, .. }
+        | Request::SchemaApply { shard, .. } => Some(ShardId(*shard)),
+        _ => None,
+    }
+}
+
+fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
     let frames = services.frames.as_deref();
     let cluster = services.cluster.as_deref();
     match req {
@@ -387,23 +423,42 @@ fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Respo
             }
         }
 
-        Request::ExecuteAll { statement } => match shards.execute_all_shards(statement) {
-            Ok(results) => Response::AllShards {
-                outcomes: results
-                    .into_iter()
-                    .map(|(id, o)| {
-                        (
-                            id.0,
-                            match o {
-                                Outcome::Rejected(m) => ShardOutcome::Rejected(m),
-                                Outcome::Ok(_) => ShardOutcome::Ok,
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-            Err(e) => error_response(e),
-        },
+        // A cluster-wide schema change. Each shard's own owner applies it, so no node needs
+        // to hold every shard — which under placement no node does. The roll is sequential
+        // and its per-shard results are reported individually, because there is no atomicity
+        // across shards and pretending otherwise would hide a partial application.
+        Request::ExecuteAll { statement } => {
+            let mut outcomes = Vec::new();
+            for s in 0..shards.shard_count() {
+                let shard = ShardId(s);
+                let local = services.router.as_ref().is_none_or(|r| r.is_mine(shard));
+                let outcome = if local {
+                    match shards.apply_ddl_to(shard, statement.clone()) {
+                        Ok(_) => ShardOutcome::Ok,
+                        Err(e) => ShardOutcome::Rejected(e.to_string()),
+                    }
+                } else {
+                    let router = services.router.as_ref().expect("checked above");
+                    match router.forward(
+                        shard,
+                        Request::SchemaApply {
+                            shard: s,
+                            ddl: statement.clone(),
+                        },
+                    ) {
+                        Ok(Response::SchemaVersion { .. }) => ShardOutcome::Ok,
+                        Ok(Response::Error { message, .. })
+                        | Ok(Response::Rejected { message }) => ShardOutcome::Rejected(message),
+                        Ok(other) => {
+                            ShardOutcome::Rejected(format!("unexpected response: {other:?}"))
+                        }
+                        Err(e) => ShardOutcome::Rejected(e.to_string()),
+                    }
+                };
+                outcomes.push((s, outcome));
+            }
+            Response::AllShards { outcomes }
+        }
 
         Request::Subscribe {
             node,
@@ -467,6 +522,14 @@ fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Respo
             },
             Err(e) => error_response(e),
         },
+
+        Request::SchemaApply { shard, ddl } => match shards.apply_ddl_to(ShardId(shard), ddl) {
+            Ok(version) => Response::SchemaVersion { shard, version },
+            Err(e) => error_response(e),
+        },
+
+        // Unwrapped above; reaching here would mean a nested wrapper, which nothing sends.
+        Request::Direct(inner) => handle_local(*inner, shards, services),
 
         Request::Vote(req) => match cluster {
             Some(c) => match c.handle_vote_request(&req) {
