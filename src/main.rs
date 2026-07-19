@@ -238,6 +238,7 @@ fn repl(db: &Db) -> ExitCode {
                 let w = db.writer_stats();
                 let r = db.reader_stats();
                 let c = db.shards().checkpoint_stats();
+                let wc = meshdb::storage::wal_conversion_stats();
                 println!(
                     "writer: threads={} batches={} requests={} max_batch={} mean_batch={:.2}",
                     w.threads,
@@ -257,6 +258,11 @@ fn repl(db: &Db) -> ExitCode {
                 println!(
                     "wal:    bytes={} passive={} truncated={} stalls={} failures={}",
                     c.wal_bytes, c.passive, c.truncated, c.stalls, c.failures
+                );
+                // Retrying the WAL conversion hides contention unless it is counted.
+                println!(
+                    "open:   wal_retries={} contended={} failed={} max_wait={}ms",
+                    wc.retries, wc.contended_opens, wc.failed_opens, wc.max_wait_ms
                 );
                 continue;
             }

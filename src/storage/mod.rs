@@ -13,3 +13,4 @@ pub mod pragma;
 pub use checkpoint::{CheckpointOutcome, CheckpointStats};
 pub use exec::{Executed, Outcome, QueryResult, Statement, Value, WriteOutcome};
 pub use open::{open_reader_existing, open_writer, open_writer_vfs};
+pub use pragma::{WalConversionStats, wal_conversion_stats};

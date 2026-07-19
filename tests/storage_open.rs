@@ -250,3 +250,49 @@ fn a_contended_open_waits_on_the_busy_timeout_instead_of_failing() {
          busy_timeout is not in effect when the lock is taken"
     );
 }
+
+#[test]
+fn wal_conversion_contention_is_counted_and_logged() {
+    // Retrying the conversion makes contention invisible unless something records it. A
+    // silent retry turns "your shards are being opened by too many writers" or "your
+    // storage is slow" into no signal at all.
+    use meshdb::storage::wal_conversion_stats;
+
+    let before = wal_conversion_stats();
+
+    let dir = TempDir::new().unwrap();
+    let path = db_path(&dir);
+
+    // Force the contention deterministically: hold the write lock on a non-WAL database.
+    let holder = meshdb::rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("CREATE TABLE t(x);").unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let opener = {
+        let path = path.clone();
+        std::thread::spawn(move || open_writer(&path, &PragmaProfile::writer_floor()).is_ok())
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    holder.execute_batch("COMMIT;").unwrap();
+    assert!(opener.join().unwrap(), "the open should have succeeded");
+
+    let after = wal_conversion_stats();
+    assert!(
+        after.retries > before.retries,
+        "retries were not counted: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.contended_opens > before.contended_opens,
+        "the contended open was not counted: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.max_wait_ms >= 100,
+        "the wait should have been recorded, got {}ms",
+        after.max_wait_ms
+    );
+    // Contention that resolves is not a failure.
+    assert_eq!(
+        after.failed_opens, before.failed_opens,
+        "a successful open must not be counted as failed"
+    );
+}

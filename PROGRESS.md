@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**108 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**109 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -99,7 +99,14 @@ is warnings and above.
 
 Instrumented where an operator would actually be debugging: checkpoint stalls and TRUNCATE
 escalation, shard open/evict, capture overflow and recovery, sink refusals, snapshot holds
-being broken, replication gaps, and epoch bumps.
+being broken, replication gaps, epoch bumps, and WAL-conversion contention.
+
+**Retries are counted, not just survived.** Retrying the WAL conversion fixes the failure
+but would otherwise hide the contention that caused it. `wal_conversion_stats()` exposes
+retries, contended opens, failures and the longest wait — surfaced in the shell's `.stats`
+— and a conversion needing 8+ attempts or 250 ms+ logs at `warn` rather than `debug`,
+because at that point it is saying something about the deployment rather than reporting
+ordinary concurrency.
 
 ### Replication (`src/replication/`)
 A follower applies **pages, never SQL** — the reason physical replication was chosen, since
@@ -242,6 +249,9 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | A partial from another snapshot is discarded | `a_partial_transfer_of_a_different_snapshot_is_discarded` |
 | An incomplete transfer cannot be installed | `a_transfer_cannot_be_installed_half_finished` |
 | **Fan-out answers match a single-shard ground truth** | `aggregates_match_a_single_shard`, `ordered_queries_match_a_single_shard` |
+| **A contended open waits instead of failing** | `opening_while_another_connection_holds_the_write_lock_succeeds` (verified by disabling the retry) |
+| 24 concurrent opens of a fresh database all succeed | `many_concurrent_opens_of_a_fresh_database_all_succeed` |
+| **Contention is counted, not silently absorbed** | `wal_conversion_contention_is_counted_and_logged` (verified by disabling the counter) |
 | **The shard count does not change the answer** (1, 4, 16, 64) | `the_shard_count_does_not_change_the_answer` |
 | Uncombinable shapes are refused, with a reason | `queries_that_cannot_be_combined_are_refused` |
 | Empty shards contribute nothing | `an_empty_shard_contributes_nothing` |
