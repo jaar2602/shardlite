@@ -1,7 +1,7 @@
 //! A blocking client.
 
 use std::io::{BufReader, BufWriter};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -24,11 +24,35 @@ impl Client {
     }
 
     pub fn connect_with(addr: &str, timeout: Duration) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
+        Self::connect_bounded(addr, timeout, timeout)
+    }
+
+    /// Connect with an explicit bound on both the TCP handshake and every subsequent I/O.
+    ///
+    /// The default timeouts are sized for clients, where waiting is better than failing. They
+    /// are actively wrong for the cluster loop: a peer that is *hung* rather than crashed —
+    /// backlogged, paused, half-partitioned — accepts the connection and then never answers,
+    /// and a 30 second read would freeze the election loop for 30 seconds. A leader frozen
+    /// that long never evaluates its lease, so it never steps down, and it keeps its write
+    /// gate open the whole time. Bounding both waits well below the election timeout is what
+    /// makes an unresponsive peer indistinguishable from a dead one, which is the only way the
+    /// lease can do its job.
+    pub fn connect_bounded(addr: &str, connect: Duration, io: Duration) -> Result<Self> {
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| Error::Protocol(format!("resolving {addr}: {e}")))?
+            .next()
+            .ok_or_else(|| Error::Protocol(format!("{addr} resolved to no address")))?;
+        let stream = TcpStream::connect_timeout(&resolved, connect)
             .map_err(|e| Error::Protocol(format!("connecting to {addr}: {e}")))?;
         stream
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(io))
             .map_err(|e| Error::Protocol(format!("set_read_timeout: {e}")))?;
+        // Without this a peer that stops reading blocks the sender in `write` instead, which
+        // freezes the loop just as thoroughly as a missing read timeout.
+        stream
+            .set_write_timeout(Some(io))
+            .map_err(|e| Error::Protocol(format!("set_write_timeout: {e}")))?;
         stream
             .set_nodelay(true)
             .map_err(|e| Error::Protocol(format!("set_nodelay: {e}")))?;
@@ -140,6 +164,32 @@ impl Client {
     /// snapshot transfer, used by [`super::replica::Replica`].
     pub fn request(&mut self, req: Request) -> Result<Response> {
         self.round_trip(req)
+    }
+
+    /// Ask a peer for its vote.
+    pub(crate) fn request_vote(
+        &mut self,
+        req: &crate::cluster::VoteRequest,
+    ) -> Result<crate::cluster::VoteReply> {
+        match self.round_trip(Request::Vote(req.clone()))? {
+            Response::Voted(r) => Ok(r),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to a vote request: {other:?}"
+            ))),
+        }
+    }
+
+    /// Assert leadership to a peer and renew the lease.
+    pub(crate) fn heartbeat(
+        &mut self,
+        hb: &crate::cluster::Heartbeat,
+    ) -> Result<crate::cluster::HeartbeatReply> {
+        match self.round_trip(Request::Beat(hb.clone()))? {
+            Response::Beat(r) => Ok(r),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to a heartbeat: {other:?}"
+            ))),
+        }
     }
 
     fn round_trip(&mut self, req: Request) -> Result<Response> {

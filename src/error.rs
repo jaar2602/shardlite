@@ -89,6 +89,27 @@ pub enum Error {
     #[error("shard configuration: {0}")]
     ShardConfig(String),
 
+    #[error("cluster configuration: {0}")]
+    ClusterConfig(String),
+
+    #[error(
+        "fenced: refusing a message carrying {token}, having already seen term {highest_seen}; \
+         the sender has been deposed and does not know yet"
+    )]
+    Fenced { token: String, highest_seen: u64 },
+
+    #[error(
+        "this node is not the leader (highest term seen: {highest_seen}); writes must go to \
+         the current leader"
+    )]
+    NotLeader { highest_seen: u64 },
+
+    #[error(
+        "this node has left the cluster and no longer votes or acknowledges leaders; it is \
+         shutting down"
+    )]
+    Departed,
+
     #[error("{0}")]
     Manifest(String),
 

@@ -5,6 +5,7 @@
 //! sharding across files, not from concurrent writers to one file. SQLite serializes
 //! writes at the file level in the pager, and no unpatched design escapes that.
 
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod error;

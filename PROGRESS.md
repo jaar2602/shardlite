@@ -32,11 +32,11 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
-| 10 | Cluster: election, fencing, failover | not started | |
+| 10 | Cluster: election, fencing, failover | **done — leadership plane** | `tests/cluster.rs` (8) + `src/cluster/` (40) |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**129 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**177 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -445,8 +445,8 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Item | Why it matters |
 |---|---|
+| **Data-plane promotion** | Step 10 elects a leader and gates writes, but a promoted follower does not yet reopen its shard files read-write and start serving. That mechanism is entangled with placement and lands with step 11. Until then leadership is decided and enforced, not yet *acted on*. |
 | Read consistency levels | `Stale` / `AtLeastLsn` / `Linearizable` — step 12. |
-| Cluster election, fencing, failover | Step 10. |
 | Shard placement and movement | Step 11. Also the unresolved rebalancing policy. |
 | Per-shard merkle verification | Step 9. Divergence detection is currently a whole-database hash. |
 | authn/authz | Nothing at all. |
@@ -480,6 +480,38 @@ far enough behind is told `NeedsBootstrap` and takes a snapshot. It is counted, 
 bootstrapping *repeatedly* — meaning retention is too small for the write rate — is visible
 rather than merely slow.
 
+### Step 10 result: the leadership plane
+
+**Decision changed from the plan.** The plan specified openraft. The codebase has no async
+runtime anywhere — thread-per-connection, synchronous throughout — and the plan had already
+decided the Raft log carries only membership and leadership. openraft would have meant a tokio
+runtime plus `RaftStorage`/`RaftNetwork`/state-machine/snapshot implementations, to use roughly
+its election half. Raft's *election* algorithm is implemented directly instead: terms, votes, a
+heartbeat lease, and the election restriction. No new dependency.
+
+Skipping the log moves the hard part rather than removing it. Raft's log-matching property is
+what normally guarantees a new leader holds every committed entry; `cluster/durability.rs`
+re-establishes that over frame positions, and is the highest-risk file in the module.
+
+| Piece | Guarantee |
+|---|---|
+| `term.rs` | A node votes at most once per term, durably. The one place paying temp-write→fsync→rename: a forgotten vote means two leaders in one term. |
+| `durability.rs` | A candidate must be at least as advanced on **every** shard. Aggregates would let a node far ahead on a busy shard win while behind on a quiet one. Cross-epoch positions are **refused, not ordered** — `(epoch, lsn)` ordering silently elects a node with a higher epoch and less data. |
+| `election.rs` | Follower/candidate/leader, jittered timeouts, and the lease: a leader that cannot reach a quorum steps itself down. |
+| `fence.rs` | Two halves — the **token** (followers refuse a deposed leader's messages) and the **gate** (a deposed leader refuses its own writes). Either alone is insufficient. |
+| `node.rs` | Drives the state machine over TCP; the state machine itself performs no I/O and so is testable without a network. |
+
+**Measured:** failover in **463–483 ms** against a 5 s budget, on a three-node cluster over
+real TCP.
+
+Three bugs found by testing, each verified non-vacuous by removing the fix:
+
+| Bug | Consequence had it shipped |
+|---|---|
+| A hung peer froze the election loop | Cluster RPCs inherited the client's 30 s read timeout. A peer that is *hung* rather than crashed — backlogged, paused, half-partitioned — accepts the connection and never answers, blocking the leader in a socket read for 30 s. A leader frozen that long never evaluates its lease, never steps down, and **keeps its write gate open the whole time** — the exact split-brain the lease exists to prevent. Peer round trips are now bounded at a third of the election timeout, on both connect and I/O. |
+| Adopting a higher term reset the election timer | A candidate that can never win, because the election restriction refuses it, would suppress the whole cluster forever: each time it stood it bumped the term, every peer reset its timer, and no qualified node ever got to stand. A leaderless cluster with no visible cause. |
+| A stopping node kept answering heartbeats | `stop()` ended a node's own loop but its server kept acknowledging leadership on connections already open, so a leader that had genuinely lost its cluster kept being told it still had one. Departure has to be visible to peers, not only to the departing node. |
+
 ### Debt deliberately deferred
 
 These do not get harder with time, so they were left rather than done now: structured
@@ -490,6 +522,11 @@ Also deferred, and worth naming: `Replica` reconnects per `sync_once`, which is 
 poll interval but wasteful under continuous catch-up; and an abandoned freeze is only
 detected when the connection's read times out, so `idle_timeout` bounds how long a dead
 follower can pin a primary's WAL.
+
+From step 10: `ClusterNode` holds one cached connection per peer and campaigns to peers
+sequentially, so one slow peer delays the next vote request by up to `peer_timeout`. Bounded
+and correct, but a parallel fan-out would shorten elections in a larger cluster. Cluster
+membership is also static — configured at startup, with no join/leave protocol.
 
 ### Design decisions not yet made
 

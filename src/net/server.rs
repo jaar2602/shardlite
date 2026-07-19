@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::cluster::ClusterNode;
 use crate::error::{Error, Result};
 use crate::replication::{FrameLog, Served};
 use crate::shard::{ShardId, ShardManager};
@@ -72,6 +73,9 @@ pub struct Server {
     /// Recent frames, so a follower that fell briefly behind can resume without a full
     /// bootstrap. `None` when this node is not capturing.
     frames: Option<Arc<FrameLog>>,
+    /// Election participation. `None` on a standalone node, which then answers cluster
+    /// messages by saying plainly that it is not a member.
+    cluster: Option<Arc<ClusterNode>>,
     cfg: ServerConfig,
     counters: Arc<Counters>,
     shutdown: Arc<AtomicBool>,
@@ -91,6 +95,16 @@ impl Server {
         frames: Option<Arc<FrameLog>>,
         cfg: ServerConfig,
     ) -> Result<Self> {
+        Self::bind_full(shards, frames, None, cfg)
+    }
+
+    /// Bind with a frame log and cluster membership — a full replica set member.
+    pub fn bind_full(
+        shards: Arc<ShardManager>,
+        frames: Option<Arc<FrameLog>>,
+        cluster: Option<Arc<ClusterNode>>,
+        cfg: ServerConfig,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(&cfg.addr)
             .map_err(|e| Error::Protocol(format!("binding {}: {e}", cfg.addr)))?;
         tracing::info!(addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
@@ -99,6 +113,7 @@ impl Server {
             listener,
             shards,
             frames,
+            cluster,
             cfg,
             counters: Arc::new(Counters::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -173,6 +188,7 @@ impl Server {
 
             let shards = Arc::clone(&self.shards);
             let frames = self.frames.clone();
+            let cluster = self.cluster.clone();
             let counters = Arc::clone(&self.counters);
             let idle = self.cfg.idle_timeout;
             std::thread::Builder::new()
@@ -182,9 +198,14 @@ impl Server {
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
-                    if let Err(e) =
-                        serve_connection(stream, &shards, frames.as_deref(), &counters, idle)
-                    {
+                    if let Err(e) = serve_connection(
+                        stream,
+                        &shards,
+                        frames.as_deref(),
+                        cluster.as_deref(),
+                        &counters,
+                        idle,
+                    ) {
                         tracing::debug!(peer, error = %e, "connection ended");
                     }
                     counters.live.fetch_sub(1, Ordering::Relaxed);
@@ -199,6 +220,7 @@ fn serve_connection(
     stream: TcpStream,
     shards: &ShardManager,
     frames: Option<&FrameLog>,
+    cluster: Option<&ClusterNode>,
     counters: &Counters,
     idle: Duration,
 ) -> Result<()> {
@@ -235,7 +257,7 @@ fn serve_connection(
                 _ => None,
             };
 
-            let resp = handle(req, shards, frames);
+            let resp = handle(req, shards, frames, cluster);
             match (freeze, &resp) {
                 (Some((shard, true)), Response::SnapshotInfo { .. }) => {
                     held.insert(shard);
@@ -270,7 +292,12 @@ fn serve_connection(
     result
 }
 
-fn handle(req: Request, shards: &ShardManager, frames: Option<&FrameLog>) -> Response {
+fn handle(
+    req: Request,
+    shards: &ShardManager,
+    frames: Option<&FrameLog>,
+    cluster: Option<&ClusterNode>,
+) -> Response {
     match req {
         Request::Hello { version, client } => {
             if version != PROTOCOL_VERSION {
@@ -422,6 +449,37 @@ fn handle(req: Request, shards: &ShardManager, frames: Option<&FrameLog>) -> Res
             },
             Err(e) => error_response(e),
         },
+
+        Request::Vote(req) => match cluster {
+            Some(c) => match c.handle_vote_request(&req) {
+                Ok(reply) => Response::Voted(reply),
+                Err(e) => error_response(e),
+            },
+            None => not_a_member("a vote request"),
+        },
+
+        Request::Beat(hb) => match cluster {
+            Some(c) => match c.handle_heartbeat(&hb) {
+                Ok(reply) => Response::Beat(reply),
+                Err(e) => error_response(e),
+            },
+            None => not_a_member("a heartbeat"),
+        },
+    }
+}
+
+/// A standalone node must say plainly that it is not a cluster member.
+///
+/// Answering a vote request with a generic error, or worse with silence, would look to the
+/// candidate exactly like an unreachable peer — and a node misconfigured out of its own
+/// cluster would then present as a network fault forever.
+fn not_a_member(what: &str) -> Response {
+    Response::Error {
+        message: format!(
+            "this node is not a cluster member, so it cannot answer {what}; it was started \
+             without cluster configuration"
+        ),
+        retryable: false,
     }
 }
 

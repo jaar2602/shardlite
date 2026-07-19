@@ -1,0 +1,485 @@
+//! Election, fencing and failover across three real nodes over TCP.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use meshdb::cluster::{
+    ClusterNode, Durability, DurabilitySource, Election, ElectionConfig, Fence, FenceToken, NodeId,
+    TermStore,
+};
+use meshdb::net::{Server, ServerConfig};
+use meshdb::replication::{FrameLog, FrameLogConfig};
+use meshdb::shard::{ShardConfig, ShardId, ShardManager};
+use tempfile::TempDir;
+
+/// Fast enough that a test finishes quickly, still far enough apart that a healthy leader is
+/// not timed out by scheduling noise.
+fn quick(node: NodeId, peers: Vec<NodeId>) -> ElectionConfig {
+    ElectionConfig {
+        node,
+        peers,
+        election_timeout: Duration::from_millis(400),
+        heartbeat_interval: Duration::from_millis(100),
+    }
+}
+
+struct Node {
+    id: NodeId,
+    cluster: Arc<ClusterNode>,
+    server: Arc<Server>,
+    manager: Arc<ShardManager>,
+    addr: String,
+    _dir: TempDir,
+}
+
+impl Node {
+    fn stop(&self) {
+        self.cluster.stop();
+        self.server
+            .shutdown_handle()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A node part-built: its listener is bound so its address is known, but its cluster
+/// membership cannot be attached until every peer's address exists.
+struct Pending {
+    id: NodeId,
+    dir: TempDir,
+    manager: Arc<ShardManager>,
+    frames: Arc<FrameLog>,
+    probe: Arc<Server>,
+    addr: String,
+}
+
+/// Bring up `n` nodes that all know each other, and start their election loops.
+fn cluster(n: usize) -> Vec<Arc<Node>> {
+    // Bind every listener first so each node can be told the others' addresses.
+    let mut built: Vec<Pending> = Vec::new();
+
+    for i in 0..n {
+        let id = (i + 1) as NodeId;
+        let dir = TempDir::new().unwrap();
+        let frames = Arc::new(FrameLog::new(FrameLogConfig {
+            total_bytes: 4 * 1024 * 1024,
+            shard_count: 2,
+        }));
+        let manager = Arc::new(
+            ShardManager::open_with_sink(
+                dir.path(),
+                ShardConfig {
+                    shard_count: 2,
+                    capture: true,
+                    ..ShardConfig::floor()
+                },
+                Some(frames.clone()),
+            )
+            .unwrap(),
+        );
+        // Bound to port 0 now; the cluster node is attached below, once every address exists.
+        let server = Arc::new(
+            Server::bind_full(
+                Arc::clone(&manager),
+                Some(Arc::clone(&frames)),
+                None,
+                ServerConfig {
+                    addr: "127.0.0.1:0".into(),
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let addr = server.local_addr().unwrap().to_string();
+        built.push(Pending {
+            id,
+            dir,
+            manager,
+            frames,
+            probe: server,
+            addr,
+        });
+    }
+
+    let addrs: BTreeMap<NodeId, String> = built.iter().map(|p| (p.id, p.addr.clone())).collect();
+
+    // Rebind each server with its cluster node attached. The first bind was only to learn the
+    // port; dropping it frees the port for the real listener.
+    let mut nodes = Vec::new();
+    for Pending {
+        id,
+        dir,
+        manager,
+        frames,
+        probe,
+        addr,
+    } in built
+    {
+        drop(probe);
+        let peers: BTreeMap<NodeId, String> = addrs
+            .iter()
+            .filter(|(p, _)| **p != id)
+            .map(|(&p, a)| (p, a.clone()))
+            .collect();
+
+        let terms = TermStore::open(&dir.path().join("cluster")).unwrap();
+        let fence = Arc::new(Fence::new(id, 0));
+        let election = Election::new(
+            quick(id, peers.keys().copied().collect()),
+            terms,
+            Instant::now(),
+        )
+        .unwrap();
+        let cluster = Arc::new(ClusterNode::new(
+            id,
+            election,
+            Arc::clone(&fence),
+            peers,
+            Arc::clone(&manager) as Arc<dyn DurabilitySource>,
+        ));
+
+        let server = Arc::new(
+            Server::bind_full(
+                Arc::clone(&manager),
+                Some(frames),
+                Some(Arc::clone(&cluster)),
+                ServerConfig {
+                    addr: addr.clone(),
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        let s = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let _ = s.serve();
+        });
+        nodes.push(Arc::new(Node {
+            id,
+            cluster,
+            server,
+            manager,
+            addr,
+            _dir: dir,
+        }));
+    }
+
+    // Only start ticking once every listener is up, or the first campaign races the binds.
+    std::thread::sleep(Duration::from_millis(80));
+    for n in &nodes {
+        let c = Arc::clone(&n.cluster);
+        std::thread::spawn(move || c.run(Duration::from_millis(40)));
+    }
+    nodes
+}
+
+/// Wait until exactly one node among `live` claims leadership, or time out.
+fn await_leader(live: &[Arc<Node>], within: Duration) -> Option<Arc<Node>> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        let leaders: Vec<&Arc<Node>> = live.iter().filter(|n| n.cluster.is_leader()).collect();
+        if leaders.len() == 1 {
+            return Some(Arc::clone(leaders[0]));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+#[test]
+fn three_nodes_elect_exactly_one_leader() {
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader was elected");
+
+    // The others must agree, and must not think they lead.
+    let followers: Vec<&Arc<Node>> = nodes.iter().filter(|n| n.id != leader.id).collect();
+    for f in &followers {
+        assert!(!f.cluster.is_leader(), "node {} also thinks it leads", f.id);
+    }
+
+    // Only the leader may write.
+    assert!(
+        leader.cluster.fence().is_open(),
+        "the leader's write gate must be open"
+    );
+    for f in &followers {
+        assert!(
+            !f.cluster.fence().is_open(),
+            "follower {} must not be permitted to write",
+            f.id
+        );
+    }
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn killing_the_leader_elects_a_new_one_within_the_budget() {
+    // Step 10's headline requirement: a new primary inside 5 seconds.
+    let nodes = cluster(3);
+    let first = await_leader(&nodes, Duration::from_secs(5)).expect("no initial leader");
+    let first_term = first.cluster.term();
+
+    first.stop();
+    let survivors: Vec<Arc<Node>> = nodes
+        .iter()
+        .filter(|n| n.id != first.id)
+        .map(Arc::clone)
+        .collect();
+
+    let started = Instant::now();
+    let second = await_leader(&survivors, Duration::from_secs(5))
+        .expect("no new leader after the old one was killed");
+    let took = started.elapsed();
+
+    assert_ne!(second.id, first.id);
+    assert!(
+        took < Duration::from_secs(5),
+        "failover took {took:?}, over the 5s budget"
+    );
+    assert!(
+        second.cluster.term() > first_term,
+        "a new leader must hold a later term: {} vs {first_term}",
+        second.cluster.term()
+    );
+    assert!(second.cluster.fence().is_open());
+    println!(
+        "failover in {took:?}, term {first_term} -> {}",
+        second.cluster.term()
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_deposed_leader_is_fenced_and_stops_writing() {
+    // Both halves of fencing, on real nodes: the deposed leader's own gate closes, and its
+    // token no longer clears the bar its successor raised.
+    let nodes = cluster(3);
+    let first = await_leader(&nodes, Duration::from_secs(5)).expect("no initial leader");
+    let old_token = FenceToken::new(first.cluster.term(), first.id);
+    assert!(first.cluster.fence().is_open());
+
+    first.stop();
+    let survivors: Vec<Arc<Node>> = nodes
+        .iter()
+        .filter(|n| n.id != first.id)
+        .map(Arc::clone)
+        .collect();
+    let second = await_leader(&survivors, Duration::from_secs(5)).expect("no new leader");
+
+    // The successor, and every node that heard from it, now refuses the old token.
+    let err = second
+        .cluster
+        .fence()
+        .validate(old_token)
+        .expect_err("the deposed leader's token must be refused");
+    assert!(err.to_string().contains("fenced"), "{err}");
+    assert!(
+        second.cluster.fence().stats().rejected > 0,
+        "the rejection must be counted, not silently absorbed"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_node_that_cannot_reach_a_quorum_does_not_lead() {
+    // A single node of a three-node cluster is a minority. It must never conclude it leads,
+    // or a partition produces two writers.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5));
+
+    // Cut the other two off.
+    let alone = Arc::clone(&nodes[0]);
+    for n in nodes.iter().skip(1) {
+        n.stop();
+    }
+
+    // Give it well past several election timeouts to convince itself.
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert!(
+        !alone.cluster.is_leader(),
+        "a minority of one must not lead a three-node cluster"
+    );
+    assert!(
+        !alone.cluster.fence().is_open(),
+        "and its write gate must be shut"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_leader_keeps_leading_while_the_cluster_is_healthy() {
+    // Leadership must be stable. A cluster that re-elects every few seconds does no useful
+    // work, and the usual cause — a heartbeat too close to the timeout — is silent otherwise.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let term = leader.cluster.term();
+
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert!(
+        leader.cluster.is_leader(),
+        "the leader must not have flapped"
+    );
+    assert_eq!(
+        leader.cluster.term(),
+        term,
+        "a healthy cluster must not change terms; it re-elected {} times",
+        leader.cluster.stats().elections_started
+    );
+    assert_eq!(
+        leader.cluster.stats().stepped_down,
+        0,
+        "a healthy leader must never step down"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_candidate_that_is_behind_cannot_win() {
+    // The election restriction over real durability sources, not hand-built structs. A node
+    // holding fewer writes must not be able to take leadership and lose them.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+
+    // Give the leader real committed positions the others do not have.
+    let mut c = meshdb::net::Client::connect(&leader.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    for i in 1..=20 {
+        leader
+            .manager
+            .execute_one(
+                ShardId(0),
+                meshdb::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({i})")),
+            )
+            .unwrap();
+    }
+
+    let ahead = leader.manager.durability();
+    let behind = nodes
+        .iter()
+        .find(|n| n.id != leader.id)
+        .unwrap()
+        .manager
+        .durability();
+
+    assert!(
+        ahead.lsn(ShardId(0)) > behind.lsn(ShardId(0)),
+        "the leader should be ahead: {ahead:?} vs {behind:?}"
+    );
+    assert!(
+        !behind.may_lead(&ahead),
+        "a node that is behind must not be electable: {behind:?} cannot lead over {ahead:?}"
+    );
+    assert!(ahead.may_lead(&behind), "and the leader must still qualify");
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_standalone_node_says_it_is_not_a_cluster_member() {
+    // Answering a vote request with silence would look exactly like an unreachable peer, and
+    // a node misconfigured out of its cluster would present as a network fault forever.
+    use meshdb::net::protocol::Request;
+
+    let dir = TempDir::new().unwrap();
+    let manager = Arc::new(
+        ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 1,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap(),
+    );
+    let server = Arc::new(
+        Server::bind(
+            manager,
+            ServerConfig {
+                addr: "127.0.0.1:0".into(),
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let addr = server.local_addr().unwrap().to_string();
+    let s = Arc::clone(&server);
+    std::thread::spawn(move || {
+        let _ = s.serve();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut c = meshdb::net::Client::connect(&addr).unwrap();
+    let req = meshdb::cluster::VoteRequest {
+        term: 1,
+        candidate: 9,
+        durability: Durability::new(0),
+    };
+    // The client surfaces a server-side `Response::Error` as an `Err`, so the refusal arrives
+    // as a failed request carrying the explanation.
+    let err = c
+        .request(Request::Vote(req))
+        .expect_err("a standalone node must refuse, not answer");
+    assert!(err.to_string().contains("not a cluster member"), "{err}");
+}
+
+#[test]
+fn a_hung_peer_cannot_freeze_the_election_loop() {
+    // The bug this guards against is subtle and severe. A peer that is *hung* rather than
+    // crashed accepts the TCP connection and then never answers. With a client-sized read
+    // timeout the leader blocks in a socket read for far longer than its own election
+    // timeout, so it never evaluates its lease, never steps down, and keeps its write gate
+    // open the entire time — the exact split-brain the lease exists to prevent.
+    //
+    // Every peer round trip must therefore fail well inside the election timeout.
+    use std::net::TcpListener;
+
+    // A listener that accepts and then does nothing at all.
+    let black_hole = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = black_hole.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in black_hole.incoming() {
+            // Hold the connection open, read nothing, write nothing.
+            held.push(stream);
+        }
+    });
+
+    let election_timeout = Duration::from_millis(400);
+    let bound = election_timeout / 3;
+
+    let started = Instant::now();
+    let result = meshdb::net::Client::connect_bounded(&addr, bound, bound);
+    let took = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a peer that never answers must not look like a healthy one"
+    );
+    assert!(
+        took < election_timeout,
+        "a hung peer blocked the caller for {took:?}, past the {election_timeout:?} election \
+         timeout; a leader would still be inside this read when it should be stepping down"
+    );
+    println!("hung peer gave up after {took:?}");
+}

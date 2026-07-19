@@ -62,6 +62,10 @@ pub enum Request {
     SnapshotRead { shard: u32, offset: u64, len: u32 },
     /// Release the freeze. Must be sent, or checkpointing stays suspended.
     SnapshotEnd { shard: u32 },
+    /// A peer is standing for election.
+    Vote(crate::cluster::VoteRequest),
+    /// A peer claims leadership and is renewing its lease.
+    Beat(crate::cluster::Heartbeat),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,6 +125,8 @@ pub enum Response {
         data: Vec<u8>,
     },
     Ok,
+    Voted(crate::cluster::VoteReply),
+    Beat(crate::cluster::HeartbeatReply),
     /// The statement was rejected deterministically — bad SQL, constraint violation. A
     /// result, not a transport failure.
     Rejected {

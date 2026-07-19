@@ -61,6 +61,14 @@ impl Follower {
         &self.dir
     }
 
+    /// Every shard this follower holds a position for.
+    ///
+    /// A shard absent here is one this follower has nothing for, which an election must treat
+    /// as position 0 rather than as agreement.
+    pub fn positions(&self) -> BTreeMap<ShardId, Position> {
+        self.positions.lock().expect("follower mutex").clone()
+    }
+
     pub fn position(&self, shard: ShardId) -> Position {
         self.positions
             .lock()

@@ -38,7 +38,14 @@ pub use reader_fleet::ReaderFleet;
 pub use writer_fleet::{WriterFleet, WriterFleetStats};
 
 /// Identifies one shard — one SQLite file, with one writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `transparent` so it is indistinguishable from a bare `u32` on the wire, matching the
+/// `shard: u32` fields the protocol already uses. The newtype is for the type system, not
+/// for the byte stream.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct ShardId(pub u32);
 
 impl ShardId {
@@ -314,6 +321,11 @@ impl ShardManager {
     }
 
     /// The primary's stream epoch, if capture is on.
+    /// How many shards this manager owns. Fixed at creation.
+    pub fn shard_count(&self) -> u32 {
+        self.cfg.shard_count
+    }
+
     pub fn epoch(&self) -> Option<u64> {
         self.writers.positions().map(|p| p.epoch())
     }
