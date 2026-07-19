@@ -106,6 +106,12 @@ pub enum Error {
         detail: String,
     },
 
+    #[error(
+        "snapshot of {shard} was invalidated: its WAL grew past the hold limit during the \
+         copy, so checkpointing had to resume and the file changed underneath. Retake it."
+    )]
+    SnapshotInvalidated { shard: String },
+
     /// The replication stream is incomplete; the node must stop accepting writes.
     #[error(
         "capture for {shard} exceeded its retention limit with {retained} bytes unconsumed. \

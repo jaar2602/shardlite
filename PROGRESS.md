@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**84 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
+**86 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -86,8 +86,18 @@ Follower crash safety rests on idempotence: pages are fsynced, *then* the positi
 recorded. A crash between them replays transactions, which is harmless because writing the
 same page twice gives the same page. The reverse order would silently skip them.
 
-Bootstrap runs on the writer thread — ship pending frames, checkpoint, record the position,
-copy — so it is atomic with respect to writes and the follower resumes at exactly `lsn + 1`.
+Bootstrap splits into a fast writer-thread part and a slow caller-thread part. The writer
+ships pending frames, checkpoints, records the position, and **freezes** the shard —
+suspending checkpointing, which in WAL mode means committed pages stay in the WAL and the
+main file cannot change. The copy then runs on the caller's thread. Measured on a 23.6 MB
+shard: `begin_snapshot` 2.3 ms against a 22.9 ms copy, with concurrent writes to another
+shard on the same writer thread unaffected. The writer-thread cost is proportional to *WAL*
+size (capped at 16 MB) rather than database size, so it does not grow with the data.
+
+The freeze cannot be held indefinitely — with checkpointing suspended the WAL grows without
+bound, and filling the disk is worse than a failed snapshot. Past `snapshot_hold_max_wal`
+the hold is broken and the snapshot invalidated, so the caller retakes it rather than
+shipping a file that changed underneath.
 
 ### Frame capture and sinks (`src/replication/`, wired in `shard/writer_fleet.rs`)
 Shard writer connections can be routed through the capture VFS, with committed frames
@@ -180,6 +190,8 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | Overflow fails writes, never drops frames | `overflow_fails_writes_rather_than_dropping_frames` |
 | Capture does not change the on-disk file | `captured_and_uncaptured_databases_are_identical_on_disk` |
 | **Follower converges byte-identically with its primary** | `a_follower_converges_with_its_primary` |
+| **Snapshot does not block the writer thread** | `snapshotting_a_large_shard_does_not_block_the_writer_thread` |
+| The frozen file does not change while held | `the_frozen_file_does_not_change_while_a_snapshot_is_held` |
 | **A gap is refused, not applied across** | `a_gap_is_refused_rather_than_applied_across` |
 | Bootstrap then stream, resuming at exactly `lsn+1` | `a_follower_bootstraps_from_a_snapshot_and_then_streams` |
 | A clean restart continues the stream | `a_clean_restart_continues_the_stream_without_rebootstrap` |
@@ -312,8 +324,7 @@ the trace comparison (`take_trace()`) before trusting capture.
 | Overflow is per-shard and sticky | Once raised the shard refuses writes until the process restarts; no recovery path yet |
 | **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
 | No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
-| Bootstrap copies the whole shard file | No incremental or resumable copy; a large shard blocks its writer thread for the duration |
-| Snapshot blocks the writer thread | `take_snapshot` runs inline, so one shard's bootstrap stalls every shard on that thread |
+| Bootstrap copies the whole shard file | No incremental or resumable copy; a failed copy restarts from zero |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 

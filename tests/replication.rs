@@ -364,3 +364,152 @@ fn an_empty_follower_cannot_join_mid_stream() {
         other => panic!("expected ReplicationGap joining mid-stream, got {other:?}"),
     }
 }
+
+#[test]
+fn snapshotting_a_large_shard_does_not_block_the_writer_thread() {
+    // The copy must not run on the writer thread. If it does, bootstrapping one shard
+    // freezes every shard sharing that thread for the duration of the copy — at a few
+    // hundred GB, minutes of stalled writes that look like an outage.
+    //
+    // Measured as: the writer-thread portion (`begin_snapshot`) must not scale with shard
+    // size, while the copy plainly does.
+    use std::time::Instant;
+
+    let pdir = TempDir::new().unwrap();
+    let snapdir = TempDir::new().unwrap();
+    // Two shards on ONE writer thread, so a stall on either is visible to the other.
+    let c = ShardConfig {
+        shard_count: 2,
+        writer_threads: 1,
+        capture: true,
+        ..ShardConfig::floor()
+    };
+    let primary = Arc::new(ShardManager::open_with_sink(pdir.path(), c, None).unwrap());
+
+    primary
+        .execute_all_shards("CREATE TABLE t (id INTEGER PRIMARY KEY, pad BLOB) STRICT")
+        .unwrap();
+
+    // Make shard 0 big enough that copying it is clearly measurable.
+    let pad = vec![0u8; 4096];
+    for chunk in 0..80 {
+        let stmts: Vec<Statement> = (0..64)
+            .map(|i| {
+                Statement::with_params(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    vec![Value::Integer(chunk * 64 + i), Value::Blob(pad.clone())],
+                )
+            })
+            .collect();
+        primary.execute(S0, stmts).unwrap();
+    }
+
+    let begin_at = Instant::now();
+    let (_epoch, _lsn, source) = primary.begin_snapshot(S0).unwrap();
+    let begin_took = begin_at.elapsed();
+
+    let size = std::fs::metadata(&source).unwrap().len();
+    assert!(
+        size > 8 * 1024 * 1024,
+        "shard is only {size} bytes; too small for this test to mean anything"
+    );
+
+    // While the file is frozen, the other shard on the same writer thread must still accept
+    // writes. Under the old inline-copy design this would have been blocked.
+    let dest = snapdir.path().join("s0.snapshot");
+    let other = Arc::clone(&primary);
+    let writes = std::thread::spawn(move || {
+        let mut done = 0;
+        for i in 0..200 {
+            if other
+                .execute_one(ShardId(1), format!("INSERT INTO t VALUES ({i}, x'00')"))
+                .is_ok()
+            {
+                done += 1;
+            }
+        }
+        done
+    });
+
+    let copy_at = Instant::now();
+    std::fs::copy(&source, &dest).unwrap();
+    let copy_took = copy_at.elapsed();
+
+    let done = writes.join().unwrap();
+    assert!(
+        primary.end_snapshot(S0).unwrap(),
+        "snapshot was invalidated"
+    );
+
+    println!(
+        "shard={size} bytes  begin_snapshot={begin_took:?}  copy={copy_took:?}  \
+         concurrent writes to the other shard={done}"
+    );
+    assert_eq!(
+        done, 200,
+        "writes to another shard were blocked by the snapshot"
+    );
+
+    // The whole point: the writer-thread portion is not proportional to the copy.
+    assert!(
+        begin_took < copy_took,
+        "begin_snapshot ({begin_took:?}) should be far cheaper than the copy ({copy_took:?}); \
+         if it is not, the copy is still happening on the writer thread"
+    );
+
+    // And the snapshot is usable.
+    let conn = meshdb::rusqlite::Connection::open(&dest).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+}
+
+#[test]
+fn the_frozen_file_does_not_change_while_a_snapshot_is_held() {
+    // The correctness claim behind moving the copy off the writer thread: with checkpointing
+    // suspended, committed pages stay in the WAL, so the main file cannot change under a
+    // concurrent copy.
+    let pdir = TempDir::new().unwrap();
+    let c = ShardConfig {
+        shard_count: 1,
+        writer_threads: 1,
+        capture: true,
+        ..ShardConfig::floor()
+    };
+    let primary = ShardManager::open_with_sink(pdir.path(), c, None).unwrap();
+    primary
+        .execute_one(S0, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT")
+        .unwrap();
+    for i in 1..=100 {
+        primary.execute_one(S0, insert(i)).unwrap();
+    }
+
+    let (_e, _l, source) = primary.begin_snapshot(S0).unwrap();
+    let before = std::fs::read(&source).unwrap();
+
+    // Plenty of writes, all of which must land in the WAL rather than the frozen file.
+    for i in 101..=600 {
+        primary.execute_one(S0, insert(i)).unwrap();
+    }
+
+    let after = std::fs::read(&source).unwrap();
+    assert!(
+        before == after,
+        "the main file changed during a snapshot hold ({} -> {} bytes)",
+        before.len(),
+        after.len()
+    );
+
+    assert!(primary.end_snapshot(S0).unwrap());
+
+    // After release, checkpointing resumes and the data is all there.
+    let tmp = TempDir::new().unwrap();
+    let snap = tmp.path().join("after.db");
+    primary.snapshot(S0, &snap).unwrap();
+    let conn = meshdb::rusqlite::Connection::open(&snap).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 600);
+}

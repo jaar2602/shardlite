@@ -119,6 +119,13 @@ pub struct ShardConfig {
     /// Per-shard cap on frames a sink has not yet consumed. 0 disables the cap.
     pub max_retained_bytes: usize,
 
+    /// How large a shard's WAL may grow while a snapshot copy holds off checkpointing.
+    ///
+    /// The hold is what freezes the file being copied, but it cannot last forever: with
+    /// checkpointing suspended the WAL grows unbounded, and filling the disk is worse than
+    /// a failed snapshot. Past this the hold is broken and the snapshot invalidated.
+    pub snapshot_hold_max_wal: u64,
+
     /// Upper bound on statements merged into one shard's transaction.
     ///
     /// Bounds memory and worst-case latency; it is **not** a throughput tuning knob — group
@@ -147,6 +154,7 @@ impl ShardConfig {
             max_batch: 64,
             capture: false,
             max_retained_bytes: crate::vfs::wal::DEFAULT_MAX_RETAINED_BYTES,
+            snapshot_hold_max_wal: 256 * 1024 * 1024,
         }
     }
 
@@ -274,8 +282,22 @@ impl ShardManager {
     }
 
     /// Snapshot `shard` to `dest`, returning the `(epoch, lsn)` it represents.
+    ///
+    /// The copy runs on the calling thread; the writer is occupied only long enough to
+    /// checkpoint and freeze the file.
     pub fn snapshot(&self, shard: ShardId, dest: &Path) -> crate::Result<(u64, u64)> {
         self.writers.snapshot(shard, dest)
+    }
+
+    /// Freeze `shard`'s main file, returning `(epoch, lsn, path)`. Pair with
+    /// [`Self::end_snapshot`].
+    pub fn begin_snapshot(&self, shard: ShardId) -> crate::Result<(u64, u64, PathBuf)> {
+        self.writers.begin_snapshot(shard)
+    }
+
+    /// Release the freeze; `false` means the snapshot must be retaken.
+    pub fn end_snapshot(&self, shard: ShardId) -> crate::Result<bool> {
+        self.writers.end_snapshot(shard)
     }
 
     /// The primary's stream epoch, if capture is on.

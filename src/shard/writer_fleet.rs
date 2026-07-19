@@ -49,14 +49,15 @@ enum Job {
         shard: ShardId,
         reply: SyncSender<Result<()>>,
     },
-    /// Copy a shard to `dest` at a known stream position.
-    ///
-    /// Runs on the writer thread, which is what makes it atomic with respect to writes:
-    /// nothing can commit between recording the position and copying the file.
-    Snapshot {
+    /// Freeze a shard's main file and report the position it represents.
+    BeginSnapshot {
         shard: ShardId,
-        dest: PathBuf,
-        reply: SyncSender<Result<(u64, u64)>>,
+        reply: SyncSender<Result<(u64, u64, PathBuf)>>,
+    },
+    /// Release the freeze. Reports whether the snapshot is still valid.
+    EndSnapshot {
+        shard: ShardId,
+        reply: SyncSender<Result<bool>>,
     },
     Shutdown,
 }
@@ -71,6 +72,16 @@ struct OpenShard {
     /// returns the same buffer. A WAL reset on reopen bumps the generation and discards
     /// uncommitted frames, which is correct — they were never committed.
     capture: Option<Arc<WalCapture>>,
+    /// True while a snapshot copy is in flight.
+    ///
+    /// Checkpointing is suspended for the duration. That is what freezes the main database
+    /// file: in WAL mode, committed pages only reach the main file via a checkpoint, so with
+    /// checkpointing suspended every subsequent write lands in the WAL and the bytes being
+    /// copied cannot change underneath the copy.
+    snapshot_hold: bool,
+    /// Set if the hold had to be broken to stop the WAL growing without bound. The snapshot
+    /// in flight is then unusable, because checkpointing resumed under it.
+    snapshot_invalidated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -165,6 +176,7 @@ impl WriterFleet {
                 max_batch: cfg.max_batch,
                 capture: cfg.capture,
                 max_retained_bytes: cfg.max_retained_bytes,
+                snapshot_hold_max_wal: cfg.snapshot_hold_max_wal,
                 sink: sink.clone(),
                 positions: positions.clone(),
                 counters: Arc::clone(&counters),
@@ -224,14 +236,57 @@ impl WriterFleet {
 
     /// Copy `shard` to `dest`, returning the `(epoch, lsn)` it represents.
     ///
-    /// The follower installs this and resumes from `lsn + 1`. Everything committed before
-    /// the snapshot is inside the file; everything after arrives as frames.
+    /// **The copy runs on the calling thread, not the writer thread.** The writer is only
+    /// occupied long enough to checkpoint and record the position; copying a multi-gigabyte
+    /// shard inline would stall every other shard sharing that thread for the duration,
+    /// which at scale is minutes of frozen writes.
+    ///
+    /// The follower installs this and resumes from `lsn + 1`.
     pub fn snapshot(&self, shard: ShardId, dest: &Path) -> Result<(u64, u64)> {
+        let (epoch, lsn, source) = self.begin_snapshot(shard)?;
+
+        let copy = std::fs::copy(&source, dest).map_err(|e| {
+            Error::Manifest(format!(
+                "snapshotting {} to {}: {e}",
+                source.display(),
+                dest.display()
+            ))
+        });
+
+        // Release the freeze even if the copy failed, or checkpointing stays suspended and
+        // the WAL grows without bound.
+        let still_valid = self.end_snapshot(shard);
+        copy?;
+
+        match still_valid? {
+            true => Ok((epoch, lsn)),
+            false => Err(Error::SnapshotInvalidated {
+                shard: shard.to_string(),
+            }),
+        }
+    }
+
+    /// Freeze `shard`'s main file and report `(epoch, lsn, path)`.
+    ///
+    /// The file at `path` will not change until [`Self::end_snapshot`]. Callers must pair
+    /// the two, or checkpointing stays suspended.
+    pub fn begin_snapshot(&self, shard: ShardId) -> Result<(u64, u64, PathBuf)> {
         let (reply_tx, reply_rx) = sync_channel(1);
         self.sender(shard)?
-            .send(Job::Snapshot {
+            .send(Job::BeginSnapshot {
                 shard,
-                dest: dest.to_path_buf(),
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
+    /// Release the freeze. `false` means the snapshot was invalidated and must be retaken.
+    pub fn end_snapshot(&self, shard: ShardId) -> Result<bool> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::EndSnapshot {
+                shard,
                 reply: reply_tx,
             })
             .map_err(|_| Error::WriterGone)?;
@@ -315,6 +370,7 @@ struct ThreadCtx {
     max_batch: usize,
     capture: bool,
     max_retained_bytes: usize,
+    snapshot_hold_max_wal: u64,
     sink: Option<Arc<dyn FrameSink>>,
     positions: Option<Arc<StreamPositions>>,
     counters: Arc<Counters>,
@@ -339,8 +395,12 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
                 continue;
             }
-            Job::Snapshot { shard, dest, reply } => {
-                let _ = reply.send(take_snapshot(&mut open, &ctx, shard, &dest));
+            Job::BeginSnapshot { shard, reply } => {
+                let _ = reply.send(begin_snapshot(&mut open, &ctx, shard));
+                continue;
+            }
+            Job::EndSnapshot { shard, reply } => {
+                let _ = reply.send(end_snapshot(&mut open, &ctx, shard));
                 continue;
             }
             Job::Shutdown => return,
@@ -358,8 +418,11 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 Ok(Job::EnsureOpen { shard, reply }) => {
                     let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
                 }
-                Ok(Job::Snapshot { shard, dest, reply }) => {
-                    let _ = reply.send(take_snapshot(&mut open, &ctx, shard, &dest));
+                Ok(Job::BeginSnapshot { shard, reply }) => {
+                    let _ = reply.send(begin_snapshot(&mut open, &ctx, shard));
+                }
+                Ok(Job::EndSnapshot { shard, reply }) => {
+                    let _ = reply.send(end_snapshot(&mut open, &ctx, shard));
                 }
                 Ok(Job::Shutdown) => {
                     // Honour it only after the batch in hand commits — dropping it would
@@ -434,8 +497,27 @@ fn apply_shard_batch(
             for (p, outcomes) in group.into_iter().zip(results) {
                 let _ = p.reply.send(Ok(outcomes));
             }
-            // Between transactions, never inside one.
-            entry.checkpointer.after_batch(&entry.conn);
+            // Between transactions, never inside one — and never while a snapshot copy is
+            // in flight, because checkpointing is what would change the file being copied.
+            if entry.snapshot_hold {
+                // The hold cannot be honoured indefinitely: with checkpointing suspended the
+                // WAL grows without bound, and running out of disk is worse than a failed
+                // snapshot. Break the hold, and mark the snapshot unusable so the caller
+                // retakes it rather than shipping a file that changed underneath it.
+                let wal = crate::storage::checkpoint::wal_path_for(&shard.path(&ctx.dir));
+                let wal_bytes = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                if wal_bytes >= ctx.snapshot_hold_max_wal {
+                    eprintln!(
+                        "meshdb WARN: {shard} WAL reached {wal_bytes} bytes during a snapshot; \
+                         breaking the hold and invalidating the snapshot"
+                    );
+                    entry.snapshot_hold = false;
+                    entry.snapshot_invalidated = true;
+                    entry.checkpointer.after_batch(&entry.conn);
+                }
+            } else {
+                entry.checkpointer.after_batch(&entry.conn);
+            }
         }
         Err(reason) => {
             for p in group {
@@ -447,18 +529,17 @@ fn apply_shard_batch(
     }
 }
 
-/// Copy a shard at a known stream position, on the writer thread.
-fn take_snapshot(
+/// Freeze a shard's main file at a known stream position. Fast: no copying happens here.
+fn begin_snapshot(
     open: &mut Lru<OpenShard>,
     ctx: &ThreadCtx,
     shard: ShardId,
-    dest: &Path,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, PathBuf)> {
     let entry = ensure_shard(open, ctx, shard)?;
 
-    // Order matters. Ship everything captured so far, so the frames the follower will
-    // receive begin exactly after this snapshot; then fold the WAL into the main file, so
-    // the bytes we copy contain all of it.
+    // Order matters. Ship everything captured so far, so the frames the follower receives
+    // begin exactly after this snapshot; then fold the WAL into the main file, so the bytes
+    // about to be copied contain all of it.
     drain_capture(entry, ctx, shard)?;
     entry
         .conn
@@ -467,21 +548,23 @@ fn take_snapshot(
         })
         .map_err(crate::Error::Sqlite)?;
 
+    // From here until the hold is released, checkpointing is suspended, so committed pages
+    // stay in the WAL and the main file cannot change under the copy.
+    entry.snapshot_hold = true;
+    entry.snapshot_invalidated = false;
+
     let (epoch, lsn) = match &ctx.positions {
         Some(p) => (p.epoch(), p.last_allocated(shard)),
         None => (0, 0),
     };
+    Ok((epoch, lsn, shard.path(&ctx.dir)))
+}
 
-    let src = shard.path(&ctx.dir);
-    std::fs::copy(&src, dest).map_err(|e| {
-        Error::Manifest(format!(
-            "snapshotting {} to {}: {e}",
-            src.display(),
-            dest.display()
-        ))
-    })?;
-
-    Ok((epoch, lsn))
+/// Release the freeze; `false` if it had to be broken and the snapshot is unusable.
+fn end_snapshot(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> Result<bool> {
+    let entry = ensure_shard(open, ctx, shard)?;
+    entry.snapshot_hold = false;
+    Ok(!entry.snapshot_invalidated)
 }
 
 /// Hand this shard's committed frames to the sink.
@@ -560,6 +643,8 @@ fn ensure_shard<'a>(
             conn,
             checkpointer,
             capture,
+            snapshot_hold: false,
+            snapshot_invalidated: false,
         })
     })?;
 
