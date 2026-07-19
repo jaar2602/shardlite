@@ -305,6 +305,14 @@ impl ShardManager {
         self.writers.end_snapshot(shard)
     }
 
+    /// The highest position handed out for `shard`, or 0 if none.
+    pub fn last_lsn(&self, shard: ShardId) -> u64 {
+        self.writers
+            .positions()
+            .map(|p| p.last_allocated(shard))
+            .unwrap_or(0)
+    }
+
     /// The primary's stream epoch, if capture is on.
     pub fn epoch(&self) -> Option<u64> {
         self.writers.positions().map(|p| p.epoch())

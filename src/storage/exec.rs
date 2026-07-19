@@ -3,8 +3,8 @@
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 
-/// A SQLite value, owned so it can cross a channel between threads.
-#[derive(Debug, Clone, PartialEq)]
+/// A SQLite value, owned so it can cross a channel between threads or a network.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Integer(i64),
@@ -59,7 +59,7 @@ impl rusqlite::ToSql for Value {
 ///    — into fixed values decided once by the primary. Binding is how those values travel
 ///    without re-parsing or re-quoting the statement, so the parameter channel has to exist
 ///    before that work can start.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Statement {
     pub sql: String,
     pub params: Vec<Value>,

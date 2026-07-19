@@ -92,6 +92,16 @@ pub enum Error {
     #[error("{0}")]
     Manifest(String),
 
+    #[error("protocol: {0}")]
+    Protocol(String),
+
+    /// The server is shedding load. Retrying later is the right response.
+    #[error("server is busy: {0}")]
+    Busy(String),
+
+    #[error("too many connections ({current}/{limit}); the server is shedding load")]
+    TooManyConnections { current: usize, limit: usize },
+
     /// A follower was handed frames it cannot place in its stream.
     #[error(
         "replication gap on {shard}: expected LSN {expected}, got {got} ({detail}). \

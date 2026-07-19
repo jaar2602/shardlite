@@ -29,7 +29,7 @@ use crate::vfs::CommittedTxn;
 pub type Lsn = u64;
 
 /// A committed transaction with its position.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamTxn {
     pub lsn: Lsn,
     pub txn: CommittedTxn,

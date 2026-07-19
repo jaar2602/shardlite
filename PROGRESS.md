@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**109 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**121 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,26 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Network transport (`src/net/`)
+A length-prefixed bincode protocol, a thread-per-connection server, and a blocking client.
+
+**Threads rather than async, deliberately.** Every request ends in the blocking writer or
+reader fleets, so an async server would add a `spawn_blocking` hop per request in exchange
+for scaling to many *idle* connections — not the shape of a node targeting 1 CPU and 150 MB.
+
+The **connection cap is where load shedding actually binds**: with one in-flight request per
+connection, the bounded write queue behind it cannot fill from connections alone. Refusals
+are counted (`ServerStats::refused_at_capacity`) and logged, not silently dropped.
+
+Distinctions the protocol keeps rather than flattening: a *rejected* statement (constraint
+violation, bad SQL) is a result and reaches the client as one, while an *error* carries a
+`retryable` flag so backpressure is distinguishable from a permanent fault. Length prefixes
+are checked against a cap before allocating, so four bytes cannot make the server reserve
+gigabytes.
+
+Clients ask the server to route keys rather than reimplementing the hash — a client-side
+copy that drifted would silently misroute every key.
 
 ### Cross-shard query planner (`src/query/`)
 Reads fan out across shards and are merged. The governing rule is that **anything which
@@ -248,6 +268,13 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **A transfer resumes where it stopped** | `a_snapshot_transfer_resumes_where_it_stopped` |
 | A partial from another snapshot is discarded | `a_partial_transfer_of_a_different_snapshot_is_discarded` |
 | An incomplete transfer cannot be installed | `a_transfer_cannot_be_installed_half_finished` |
+| **Client writes and reads back over TCP** | `a_client_can_write_and_read_back` |
+| Reads fan out across shards over the wire | `reads_fan_out_across_shards_over_the_wire` |
+| Refusals survive the transport with their reason | `an_uncombinable_query_is_refused_over_the_wire_too` |
+| A rejection is a result, not a broken connection | `a_rejected_statement_is_a_result_not_a_transport_failure` |
+| 12 concurrent clients lose no writes | `many_clients_work_concurrently` |
+| **The connection cap sheds and counts it** | `the_connection_cap_sheds_load_and_counts_it` |
+| An oversized length prefix is refused before allocating | `an_oversized_length_prefix_is_refused_before_allocating` |
 | **Fan-out answers match a single-shard ground truth** | `aggregates_match_a_single_shard`, `ordered_queries_match_a_single_shard` |
 | **A contended open waits instead of failing** | `opening_while_another_connection_holds_the_write_lock_succeeds` (verified by disabling the retry) |
 | 24 concurrent opens of a fresh database all succeed | `many_concurrent_opens_of_a_fresh_database_all_succeed` |
@@ -419,8 +446,8 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Item | Why it matters |
 |---|---|
-| **Network transport** | The largest remaining piece. Replication is proven in-process only; there is no server, no protocol, no client. It is also what would make the write backpressure real. |
-| Follower-driven catch-up | The primary pushes; a follower that falls behind cannot request a range. Needs the transport. |
+| Follower-driven catch-up, completed | `Subscribe` exists and a follower is told `NeedsBootstrap` or "caught up" — but frames are not *retained* after the sink consumes them, so a follower slightly behind cannot yet be served from history. |
+| Replication over the wire | The protocol carries `Frames`, but a networked follower loop does not exist; replication is still driven in-process. |
 | Read consistency levels | `Stale` / `AtLeastLsn` / `Linearizable` — step 12. |
 | Cluster election, fencing, failover | Step 10. |
 | Shard placement and movement | Step 11. Also the unresolved rebalancing policy. |

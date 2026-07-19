@@ -27,6 +27,10 @@ tracing = "0.1.44"
 # consumers do not pull it in.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 sqlparser = "0.62.0"
+serde = { version = "1.0.229", features = ["derive"] }
+# Pinned to the 2.x line deliberately: bincode 3.0.0 on crates.io is a placeholder whose
+# lib.rs is a single `compile_error!("https://xkcd.com/2347/")`. 2.0.1 is the real release.
+bincode = { version = "2", features = ["serde"] }
 
 [[bench]]
 name = "write_throughput"

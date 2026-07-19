@@ -83,14 +83,14 @@ impl FrameHeader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Frame {
     pub page_no: u32,
     pub data: Vec<u8>,
 }
 
 /// One committed transaction: the pages it wrote, and the database size after it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommittedTxn {
     pub db_size_pages: u32,
     pub page_size: u32,

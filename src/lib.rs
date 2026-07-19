@@ -8,6 +8,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod net;
 pub mod query;
 pub mod replication;
 pub mod shard;
