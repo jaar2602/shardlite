@@ -38,8 +38,16 @@ shell commands:
   .tables   list tables on the current shard
   .quit     exit
 
-DDL (CREATE / DROP / ALTER) is applied to every shard automatically. Other
-statements go to the current shard; there is no cross-shard query planner yet.";
+DDL (CREATE / DROP / ALTER) is applied to every shard automatically.
+
+Reads fan out across all shards and are merged. Shapes that cannot be combined
+correctly — JOIN, GROUP BY, DISTINCT, AVG, OFFSET — are refused rather than
+answered wrongly; run those against one shard with .shard N.
+
+Note that a fan-out is not a consistent snapshot: each shard is read at its own
+moment, and there is no cross-shard atomicity in this design.
+
+Writes go to the current shard, since the CLI has no routing key.";
 
 fn main() -> ExitCode {
     init_tracing();
@@ -328,6 +336,29 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
                 false
             }
         };
+    }
+
+    // Reads fan out by default; a shape that cannot be merged is refused rather than
+    // silently answered from one shard. Writes must NOT come through here — the planner
+    // refuses non-SELECT statements, so a write routed into the fan-out would be reported
+    // as unsupported and never actually run.
+    let fan_out = db.shard_count() > 1 && !Db::is_ddl(sql) && db.is_read(sql).unwrap_or(false);
+    if fan_out {
+        match db.query_all(sql) {
+            Ok(result) => {
+                print_table(&result);
+                return true;
+            }
+            Err(meshdb::Error::Unsupported(msg)) => {
+                eprintln!("cannot fan out: {msg}");
+                eprintln!("(use `.shard N` to target one shard)");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return false;
+            }
+        }
     }
 
     match db.run_on(shard, sql) {

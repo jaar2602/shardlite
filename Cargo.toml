@@ -26,6 +26,7 @@ tracing = "0.1.44"
 # Only the binary installs a subscriber, behind a feature so `cargo test` and library
 # consumers do not pull it in.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+sqlparser = "0.62.0"
 
 [[bench]]
 name = "write_throughput"

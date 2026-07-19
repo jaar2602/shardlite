@@ -110,12 +110,30 @@ impl Db {
         self.shards.execute_all_shards(sql)
     }
 
+    /// Answer a read across every shard, refusing shapes that cannot be combined correctly.
+    pub fn query_all(&self, sql: &str) -> Result<crate::storage::exec::QueryResult> {
+        reject_unsupported(sql)?;
+        self.shards.query_all_shards(sql)
+    }
+
     /// Rebuild a shard, reclaiming free pages.
     ///
     /// Needs roughly twice the shard's size in free disk, and rewrites every page — so with
     /// capture on it produces a replication stream the size of the whole shard.
     pub fn vacuum(&self, shard: ShardId) -> Result<()> {
         self.shards.vacuum(shard)
+    }
+
+    /// True when SQLite considers this statement read-only.
+    ///
+    /// The CLI uses this to decide whether to fan out. Fanning out a write would hand it to
+    /// the planner, which refuses non-SELECT statements — so the write would be reported as
+    /// unsupported and silently never run.
+    pub fn is_read(&self, sql: &str) -> Result<bool> {
+        if first_keyword(sql) == "PRAGMA" {
+            return Ok(true);
+        }
+        self.is_readonly(sql)
     }
 
     /// True when a statement changes schema and therefore belongs on every shard.

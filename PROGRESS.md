@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**93 Rust tests + 36 CLI assertions. Clippy clean, fmt clean.**
+**106 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,25 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Cross-shard query planner (`src/query/`)
+Reads fan out across shards and are merged. The governing rule is that **anything which
+cannot be answered correctly is refused, never approximated** — a plausible-looking wrong
+number is worse than an error, because nothing downstream can tell the difference.
+
+Combinable: plain `SELECT` (concatenate), `ORDER BY` with optional `LIMIT` (per-shard sort,
+merge, truncate), and `COUNT` / `SUM` / `MIN` / `MAX` — exactly the aggregates that are
+associative, so combining partial results reproduces the global answer.
+
+Refused with a reason: `JOIN` (rows that must meet live on different shards), `GROUP BY` and
+`HAVING` (a group can span shards), `DISTINCT` (a value can appear on several), `AVG` (a mean
+of means is not the mean — ask for `SUM` and `COUNT`), `OFFSET` (the rows skipped per shard
+are not the rows to skip globally), set operations, CTEs, and any aggregate mixed with plain
+columns.
+
+**A fan-out is not a consistent snapshot.** Each shard is read at its own moment, so it can
+observe a write on one shard and miss a concurrent one on another. There is no cross-shard
+atomicity in this design, so that is a property of the answer rather than a gap to close.
 
 ### Logging (`tracing`)
 The library emits through the `tracing` facade and installs **no** subscriber, so an
@@ -222,6 +241,10 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **A transfer resumes where it stopped** | `a_snapshot_transfer_resumes_where_it_stopped` |
 | A partial from another snapshot is discarded | `a_partial_transfer_of_a_different_snapshot_is_discarded` |
 | An incomplete transfer cannot be installed | `a_transfer_cannot_be_installed_half_finished` |
+| **Fan-out answers match a single-shard ground truth** | `aggregates_match_a_single_shard`, `ordered_queries_match_a_single_shard` |
+| **The shard count does not change the answer** (1, 4, 16, 64) | `the_shard_count_does_not_change_the_answer` |
+| Uncombinable shapes are refused, with a reason | `queries_that_cannot_be_combined_are_refused` |
+| Empty shards contribute nothing | `an_empty_shard_contributes_nothing` |
 | A clean restart continues the stream | `a_clean_restart_continues_the_stream_without_rebootstrap` |
 | An unclean restart bumps the epoch | `an_unclean_shutdown_bumps_the_epoch_and_forces_rebootstrap` |
 | An empty follower may join at LSN 1, but not mid-stream | `an_empty_follower_may_join_a_stream_at_its_beginning`, `an_empty_follower_cannot_join_mid_stream` |
@@ -295,6 +318,16 @@ Capture's CPU cost, measured separately by `cargo run --example vfs_overhead`: *
 - **`VACUUM` on a database whose data is still in the WAL grows the main file.** The first
   version of that test compared a 4 KiB main file against a 471 KiB one and concluded vacuum
   had made things worse; the data simply had not been checkpointed yet.
+- **Fanning a *write* into the query planner silently drops it.** The planner refuses
+  non-SELECT statements, so routing an `INSERT` through it reported "unsupported" and the
+  write never ran — a cross-shard `count(*)` returned 0 after three successful-looking
+  inserts. The CLI now checks `Db::is_read` before fanning out. Caught only because the
+  manual check printed the count; the smoke test had sent the inserts to `/dev/null`.
+- **The `SQLITE_BUSY`-at-open test is load-sensitive, not wrong.** It passes in isolation and
+  under its own suite, and failed only with the whole suite running in parallel. Asserting
+  zero failures made it flaky; it now asserts that no failure happened *immediately*, since
+  an unset timeout fails in microseconds while a genuine expiry takes seconds. The
+  underlying cause is still not root-caused.
 - **A blocking request/reply API caps queue depth at the caller count.** The write queue
   bound was initially untestable for this reason: 32 threads cannot fill a 1024-deep queue
   when each blocks until its batch commits. The first version of the backpressure test
@@ -356,16 +389,9 @@ the trace comparison (`take_trace()`) before trusting capture.
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
 | **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
 | No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
-| Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 
 ### Remaining work, in one place
-
-**In progress**
-
-| Item | State |
-|---|---|
-| Cross-shard query planner | starting — `execute_all_shards` is the only helper and it is not atomic |
 
 **Not started**
 

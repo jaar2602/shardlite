@@ -364,6 +364,44 @@ impl ShardManager {
         self.readers.query(shard, sql)
     }
 
+    /// Answer a read across every shard.
+    ///
+    /// Refuses anything that cannot be combined correctly rather than approximating it —
+    /// see [`crate::query::plan`] for the shapes and the reasoning.
+    ///
+    /// **Not a consistent snapshot.** Each shard is read at its own moment, so a fan-out can
+    /// see a write on one shard and miss a concurrent one on another. There is no
+    /// cross-shard atomicity in this design, so that is a property of the answer rather than
+    /// a gap to be closed.
+    pub fn query_all_shards(&self, sql: &str) -> crate::Result<crate::storage::exec::QueryResult> {
+        use crate::query::{merge_results, plan};
+        use crate::storage::exec::{Executed, Outcome};
+
+        let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
+
+        let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
+        for s in 0..self.cfg.shard_count {
+            match self.query(ShardId(s), sql)? {
+                Outcome::Ok(Executed::Rows(r)) => parts.push(r),
+                // A shard that has not been written to has no table yet; it contributes
+                // nothing rather than failing the whole query.
+                Outcome::Rejected(msg) if msg.contains("no such table") => {}
+                Outcome::Rejected(msg) => {
+                    return Err(crate::Error::Unsupported(format!(
+                        "shard_{s} rejected the query: {msg}"
+                    )));
+                }
+                Outcome::Ok(Executed::Changed(_)) => {
+                    return Err(crate::Error::Unsupported(
+                        "only reads can be fanned out across shards".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(merge_results(&plan, parts))
+    }
+
     /// Run a statement against **every** shard.
     ///
     /// This is how DDL is applied: a schema change must reach all shards, and there is no

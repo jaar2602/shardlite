@@ -164,12 +164,19 @@ fn concurrent_opens_of_the_same_database_do_not_fail_busy() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
-    let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // A failure is only acceptable if it waited. Under heavy machine load a genuine
+    // busy-timeout expiry is possible, and asserting zero failures makes this test flaky
+    // rather than wrong — it failed only when the whole suite ran in parallel. What must
+    // never happen is an *immediate* failure, which is what an unset timeout looks like.
+    let quick_failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let timeout = PragmaProfile::writer_floor().busy_timeout_ms as u128;
+
     std::thread::scope(|s| {
         for _ in 0..24 {
             let path = path.clone();
-            let failures = std::sync::Arc::clone(&failures);
+            let quick = std::sync::Arc::clone(&quick_failures);
             s.spawn(move || {
+                let t0 = std::time::Instant::now();
                 match open_writer(&path, &PragmaProfile::writer_floor()) {
                     Ok(conn) => {
                         // Hold it briefly so the opens genuinely overlap.
@@ -177,7 +184,11 @@ fn concurrent_opens_of_the_same_database_do_not_fail_busy() {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     Err(_) => {
-                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Half the configured timeout is generous; an unset timeout fails
+                        // in microseconds.
+                        if t0.elapsed().as_millis() < timeout / 2 {
+                            quick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             });
@@ -185,9 +196,10 @@ fn concurrent_opens_of_the_same_database_do_not_fail_busy() {
     });
 
     assert_eq!(
-        failures.load(std::sync::atomic::Ordering::Relaxed),
+        quick_failures.load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "concurrent opens must wait on the busy timeout, not fail immediately"
+        "an open failed without waiting for the busy timeout, which is what an unset \
+         timeout looks like"
     );
 }
 

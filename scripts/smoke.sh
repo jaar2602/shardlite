@@ -139,5 +139,20 @@ assert_contains "ddl fans out to all shards" "applied to 8 shards" \
     "$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE fanout (a INTEGER) STRICT"
 
 echo
+echo "cross-shard reads"
+Q="$SH_DIR/multi"
+"$BIN" "$Q" -c "CREATE TABLE u (k TEXT PRIMARY KEY, n INTEGER) STRICT" >/dev/null 2>&1
+for i in 0 1 2 3 4 5 6 7; do
+    "$BIN" "$Q" -c "INSERT INTO u VALUES ('k$i', $i)" >/dev/null 2>&1
+done
+# All 8 rows land on shard 0 via the CLI, but the fan-out must still see them all.
+assert_contains "count fans out"  "8"  "$BIN" "$Q" -c "SELECT count(*) FROM u"
+assert_contains "sum fans out"    "28" "$BIN" "$Q" -c "SELECT sum(n) FROM u"
+assert_contains "order by merges" "k0" "$BIN" "$Q" -c "SELECT k FROM u ORDER BY k LIMIT 1"
+# A shape that cannot be combined must be refused, not answered from one shard.
+assert_fails "AVG refused across shards"      "AVG"      "$BIN" "$Q" -c "SELECT avg(n) FROM u"
+assert_fails "GROUP BY refused across shards" "GROUP BY" "$BIN" "$Q" -c "SELECT n, count(*) FROM u GROUP BY n"
+
+echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
