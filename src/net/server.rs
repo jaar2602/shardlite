@@ -1,5 +1,6 @@
 //! A thread-per-connection server over a [`ShardManager`].
 
+use std::collections::BTreeSet;
 use std::io::{BufReader, BufWriter};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::replication::{FrameLog, Served};
 use crate::shard::{ShardId, ShardManager};
 use crate::storage::exec::{Executed, Outcome};
 
@@ -45,6 +47,7 @@ struct Counters {
     refused_at_capacity: AtomicU64,
     requests: AtomicU64,
     errors: AtomicU64,
+    abandoned_freezes: AtomicU64,
     live: AtomicUsize,
 }
 
@@ -56,12 +59,19 @@ pub struct ServerStats {
     pub refused_at_capacity: u64,
     pub requests: u64,
     pub errors: u64,
+    /// Snapshot freezes released because the connection holding one went away. Each is a
+    /// follower that died mid-bootstrap; a node accumulating them is one whose WAL keeps
+    /// being pinned by copies that never finish.
+    pub abandoned_freezes: u64,
     pub live: usize,
 }
 
 pub struct Server {
     listener: TcpListener,
     shards: Arc<ShardManager>,
+    /// Recent frames, so a follower that fell briefly behind can resume without a full
+    /// bootstrap. `None` when this node is not capturing.
+    frames: Option<Arc<FrameLog>>,
     cfg: ServerConfig,
     counters: Arc<Counters>,
     shutdown: Arc<AtomicBool>,
@@ -69,6 +79,18 @@ pub struct Server {
 
 impl Server {
     pub fn bind(shards: Arc<ShardManager>, cfg: ServerConfig) -> Result<Self> {
+        Self::bind_with_frames(shards, None, cfg)
+    }
+
+    /// Bind with a frame log, making this node able to serve followers.
+    ///
+    /// The same `FrameLog` must be the manager's sink, or the server will serve an empty
+    /// history while the frames go elsewhere.
+    pub fn bind_with_frames(
+        shards: Arc<ShardManager>,
+        frames: Option<Arc<FrameLog>>,
+        cfg: ServerConfig,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(&cfg.addr)
             .map_err(|e| Error::Protocol(format!("binding {}: {e}", cfg.addr)))?;
         tracing::info!(addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
@@ -76,6 +98,7 @@ impl Server {
         Ok(Self {
             listener,
             shards,
+            frames,
             cfg,
             counters: Arc::new(Counters::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -94,6 +117,7 @@ impl Server {
             refused_at_capacity: self.counters.refused_at_capacity.load(Ordering::Relaxed),
             requests: self.counters.requests.load(Ordering::Relaxed),
             errors: self.counters.errors.load(Ordering::Relaxed),
+            abandoned_freezes: self.counters.abandoned_freezes.load(Ordering::Relaxed),
             live: self.counters.live.load(Ordering::Relaxed),
         }
     }
@@ -148,6 +172,7 @@ impl Server {
             self.counters.accepted.fetch_add(1, Ordering::Relaxed);
 
             let shards = Arc::clone(&self.shards);
+            let frames = self.frames.clone();
             let counters = Arc::clone(&self.counters);
             let idle = self.cfg.idle_timeout;
             std::thread::Builder::new()
@@ -157,7 +182,9 @@ impl Server {
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
-                    if let Err(e) = serve_connection(stream, &shards, &counters, idle) {
+                    if let Err(e) =
+                        serve_connection(stream, &shards, frames.as_deref(), &counters, idle)
+                    {
                         tracing::debug!(peer, error = %e, "connection ended");
                     }
                     counters.live.fetch_sub(1, Ordering::Relaxed);
@@ -171,6 +198,7 @@ impl Server {
 fn serve_connection(
     stream: TcpStream,
     shards: &ShardManager,
+    frames: Option<&FrameLog>,
     counters: &Counters,
     idle: Duration,
 ) -> Result<()> {
@@ -188,21 +216,61 @@ fn serve_connection(
     );
     let mut w = BufWriter::new(stream);
 
-    loop {
-        // A closed or idle connection ends the loop as an error, which the caller logs at
-        // debug — disconnection is ordinary, not a fault.
-        let req: Request = read_message(&mut r)?;
-        counters.requests.fetch_add(1, Ordering::Relaxed);
+    // Freezes this connection holds. A freeze suspends checkpointing, so one abandoned by a
+    // follower that crashed mid-bootstrap would grow the WAL without bound — the connection
+    // must release what it took, whatever way it ends.
+    let mut held: BTreeSet<ShardId> = BTreeSet::new();
 
-        let resp = handle(req, shards);
-        if matches!(resp, Response::Error { .. }) {
-            counters.errors.fetch_add(1, Ordering::Relaxed);
+    let result = (|| -> Result<()> {
+        loop {
+            // A closed or idle connection ends the loop as an error, which the caller logs
+            // at debug — disconnection is ordinary, not a fault.
+            let req: Request = read_message(&mut r)?;
+            counters.requests.fetch_add(1, Ordering::Relaxed);
+
+            // Noted before the request is consumed; applied only if it actually succeeded.
+            let freeze = match &req {
+                Request::SnapshotBegin { shard } => Some((ShardId(*shard), true)),
+                Request::SnapshotEnd { shard } => Some((ShardId(*shard), false)),
+                _ => None,
+            };
+
+            let resp = handle(req, shards, frames);
+            match (freeze, &resp) {
+                (Some((shard, true)), Response::SnapshotInfo { .. }) => {
+                    held.insert(shard);
+                }
+                (Some((shard, false)), Response::Ok) => {
+                    held.remove(&shard);
+                }
+                _ => {}
+            }
+
+            if matches!(resp, Response::Error { .. }) {
+                counters.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            write_message(&mut w, &resp)?;
         }
-        write_message(&mut w, &resp)?;
+    })();
+
+    for shard in held {
+        // Warned, not merely handled: an abandoned freeze means a follower died mid-copy,
+        // and a node where that happens repeatedly is one whose WAL keeps being pinned.
+        counters.abandoned_freezes.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            %shard,
+            "connection ended still holding a snapshot freeze; releasing it so checkpointing \
+             can resume"
+        );
+        if let Err(e) = shards.end_snapshot(shard) {
+            tracing::error!(%shard, error = %e, "releasing an abandoned snapshot freeze failed");
+        }
     }
+
+    result
 }
 
-fn handle(req: Request, shards: &ShardManager) -> Response {
+fn handle(req: Request, shards: &ShardManager, frames: Option<&FrameLog>) -> Response {
     match req {
         Request::Hello { version, client } => {
             if version != PROTOCOL_VERSION {
@@ -309,8 +377,81 @@ fn handle(req: Request, shards: &ShardManager) -> Response {
             shard,
             epoch,
             from_lsn,
-        } => serve_subscribe(shards, ShardId(shard), epoch, from_lsn),
+            max_txns,
+        } => serve_subscribe(
+            shards,
+            frames,
+            ShardId(shard),
+            epoch,
+            from_lsn,
+            max_txns as usize,
+        ),
+
+        Request::SnapshotBegin { shard } => match shards.begin_snapshot(ShardId(shard)) {
+            Ok((epoch, lsn, path)) => match std::fs::metadata(&path) {
+                Ok(m) => Response::SnapshotInfo {
+                    shard,
+                    epoch,
+                    lsn,
+                    total_bytes: m.len(),
+                },
+                Err(e) => {
+                    // Release the freeze we just took, or checkpointing stays suspended for
+                    // a snapshot nobody is going to read.
+                    let _ = shards.end_snapshot(ShardId(shard));
+                    error_response(Error::Protocol(format!("sizing snapshot: {e}")))
+                }
+            },
+            Err(e) => error_response(e),
+        },
+
+        Request::SnapshotRead { shard, offset, len } => {
+            match read_snapshot_chunk(shards, ShardId(shard), offset, len as usize) {
+                Ok(data) => Response::SnapshotChunk { data },
+                Err(e) => error_response(e),
+            }
+        }
+
+        Request::SnapshotEnd { shard } => match shards.end_snapshot(ShardId(shard)) {
+            Ok(true) => Response::Ok,
+            Ok(false) => Response::Error {
+                message: format!(
+                    "the snapshot of shard_{shard} was invalidated while it was being read;                      retake it"
+                ),
+                retryable: true,
+            },
+            Err(e) => error_response(e),
+        },
     }
+}
+
+fn read_snapshot_chunk(
+    shards: &ShardManager,
+    shard: ShardId,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Bounded so one request cannot ask for a reply larger than the frame limit.
+    let len = len.min(super::protocol::MAX_FRAME_BYTES / 2);
+    let path = shard.path(shards.dir());
+    let mut f = std::fs::File::open(&path)
+        .map_err(|e| Error::Protocol(format!("opening {}: {e}", path.display())))?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::Protocol(format!("seeking to {offset}: {e}")))?;
+
+    let mut buf = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        match f.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => return Err(Error::Protocol(format!("reading snapshot: {e}"))),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
 }
 
 /// Serve a follower asking for frames from a position.
@@ -320,7 +461,14 @@ fn handle(req: Request, shards: &ShardManager) -> Response {
 /// primary only holds frames until its sink consumes them — so a request for anything other
 /// than the live position is answered with `NeedsBootstrap` rather than silently serving a
 /// gap.
-fn serve_subscribe(shards: &ShardManager, shard: ShardId, epoch: u64, from_lsn: u64) -> Response {
+fn serve_subscribe(
+    shards: &ShardManager,
+    frames: Option<&FrameLog>,
+    shard: ShardId,
+    epoch: u64,
+    from_lsn: u64,
+    max_txns: usize,
+) -> Response {
     let Some(current_epoch) = shards.epoch() else {
         return Response::Error {
             message: "this node is not capturing frames, so it has no stream to subscribe to \
@@ -330,7 +478,11 @@ fn serve_subscribe(shards: &ShardManager, shard: ShardId, epoch: u64, from_lsn: 
         };
     };
 
-    if epoch != current_epoch {
+    // Epoch 0 is "I hold no copy and claim no generation" — a fresh follower. It is not a
+    // mismatch, so it is not refused here; whether it can be served depends only on whether
+    // the frames it needs are still retained, which the frame log answers below. Refusing it
+    // outright would force a snapshot even when the whole history is still in hand.
+    if epoch != 0 && epoch != current_epoch {
         return Response::NeedsBootstrap {
             shard: shard.0,
             reason: format!(
@@ -340,36 +492,30 @@ fn serve_subscribe(shards: &ShardManager, shard: ShardId, epoch: u64, from_lsn: 
         };
     }
 
-    let last = shards.last_lsn(shard);
-    if from_lsn > last + 1 {
-        return Response::NeedsBootstrap {
+    let Some(log) = frames else {
+        return Response::Error {
+            message: "this node has no frame log, so it cannot serve followers".into(),
+            retryable: false,
+        };
+    };
+
+    match log.serve(shard, from_lsn, max_txns.clamp(1, 512)) {
+        Served::Frames(txns) => Response::Frames {
+            shard: shard.0,
+            epoch: current_epoch,
+            txns,
+        },
+        Served::UpToDate => Response::UpToDate { shard: shard.0 },
+        // Retention is bounded, so history the follower needs may already be gone. Sending
+        // what *is* retained would leave a hole the follower could not see; saying "too old"
+        // sends it to bootstrap instead.
+        Served::TooOld { lowest_retained } => Response::NeedsBootstrap {
             shard: shard.0,
             reason: format!(
-                "follower asked for LSN {from_lsn} but this node has only reached {last}"
+                "frames before LSN {lowest_retained} are no longer retained; take a snapshot \
+                 and resume from it"
             ),
-        };
-    }
-
-    // Frames are not retained after the sink consumes them, so anything older than the live
-    // position cannot be replayed. Saying so beats serving a partial answer.
-    if from_lsn <= last {
-        return Response::NeedsBootstrap {
-            shard: shard.0,
-            reason: format!(
-                "frames before LSN {} are no longer retained; take a snapshot and resume \
-                 from it",
-                last + 1
-            ),
-        };
-    }
-
-    // Caught up: nothing new since `last`. An empty batch is the honest answer to a poll,
-    // and is distinguishable from `NeedsBootstrap` precisely because the two are different
-    // situations.
-    Response::Frames {
-        shard: shard.0,
-        epoch: current_epoch,
-        txns: Vec::new(),
+        },
     }
 }
 

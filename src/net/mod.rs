@@ -14,8 +14,10 @@
 
 pub mod client;
 pub mod protocol;
+pub mod replica;
 pub mod server;
 
 pub use client::Client;
 pub use protocol::{Request, Response, ShardOutcome};
+pub use replica::{Replica, ReplicaConfig, ReplicaStats};
 pub use server::{Server, ServerConfig, ServerStats};

@@ -304,6 +304,7 @@ fn subscribing_without_capture_says_why() {
             shard: 0,
             epoch: 1,
             from_lsn: 1,
+            max_txns: 16,
         },
     )
     .unwrap();

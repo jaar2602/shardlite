@@ -30,12 +30,13 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 6 | Benchmarks + cgroup memory test | **done** | `benches/write_throughput.rs`, `src/bin/memcheck.rs`, `scripts/bench.sh` |
 | 7 | VFS capture productionized | **done** | `tests/capture_wiring.rs` (9) |
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
+| 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | not started | |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**121 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**129 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -436,8 +437,6 @@ the trace comparison (`take_trace()`) before trusting capture.
 | `first_keyword` guard cannot see past a leading comment | `-- x\nBEGIN` slips through. Real guard is the authorizer (step 8) |
 | `busy_timeout` ordering fix is unproven | Moving it before lock-taking statements is correct on its own merits, but neither test discriminates it — both pass with the bug reintroduced. The 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
-| **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
-| No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 
 ### Remaining work, in one place
@@ -446,8 +445,6 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Item | Why it matters |
 |---|---|
-| Follower-driven catch-up, completed | `Subscribe` exists and a follower is told `NeedsBootstrap` or "caught up" — but frames are not *retained* after the sink consumes them, so a follower slightly behind cannot yet be served from history. |
-| Replication over the wire | The protocol carries `Frames`, but a networked follower loop does not exist; replication is still driven in-process. |
 | Read consistency levels | `Stale` / `AtLeastLsn` / `Linearizable` — step 12. |
 | Cluster election, fencing, failover | Step 10. |
 | Shard placement and movement | Step 11. Also the unresolved rebalancing policy. |
@@ -463,11 +460,36 @@ the trace comparison (`take_trace()`) before trusting capture.
 | Client-held transactions unsupported | A held `BEGIN` would pin the writer and defeat batching. Permanent. |
 | Multi-statement client transactions | Same cause. |
 
+### Step 8b result: frame retention + networked replication
+
+A follower now runs against a real primary over TCP. `FrameLog` retains recent frames within
+a **total** budget divided by shard count — the same trap the connection LRU had, where a
+per-unit number silently multiplies by 64. `Replica` pulls rather than being pushed at, so
+the follower's own position is the single source of truth about its progress.
+
+Three bugs were found by writing the tests, each verified non-vacuous by removing the fix:
+
+| Bug | Consequence had it shipped |
+|---|---|
+| The replica asked the primary which epoch to claim, then claimed it | The primary's epoch check compared its own answer against itself and could never fail. A follower holding a copy from an older generation would have been fed a newer generation's frames as if they continued its own — silent corruption, not a detected gap. |
+| A fresh follower recorded the epoch it *asked* with, not the one the frames came from | Its copy would be stamped with a generation it does not belong to, making every later subscription look stale. |
+| A snapshot freeze was never released if the connection holding it went away | A follower crashing mid-bootstrap suspends the primary's checkpointing **forever**; the WAL then grows without bound. A crashed follower would slowly take the primary down with it. Now released on connection teardown, counted as `abandoned_freezes`, and warned. |
+
+Bootstrap is treated as a normal outcome, not a failure: retention is bounded, so a follower
+far enough behind is told `NeedsBootstrap` and takes a snapshot. It is counted, so a follower
+bootstrapping *repeatedly* — meaning retention is too small for the write rate — is visible
+rather than merely slow.
+
 ### Debt deliberately deferred
 
 These do not get harder with time, so they were left rather than done now: structured
 logging (still `eprintln!`), a `VACUUM` maintenance path, a cross-shard query planner, and
 the ~20s checkpoint test suite.
+
+Also deferred, and worth naming: `Replica` reconnects per `sync_once`, which is fine at a
+poll interval but wasteful under continuous catch-up; and an abandoned freeze is only
+detected when the connection's read times out, so `idle_timeout` bounds how long a dead
+follower can pin a primary's WAL.
 
 ### Design decisions not yet made
 

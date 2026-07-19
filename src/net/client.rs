@@ -134,6 +134,14 @@ impl Client {
         self.execute(shard, Statement::with_params(sql, params))
     }
 
+    /// Send a request and return the raw response.
+    ///
+    /// The escape hatch for verbs outside the ordinary client surface — subscription and
+    /// snapshot transfer, used by [`super::replica::Replica`].
+    pub fn request(&mut self, req: Request) -> Result<Response> {
+        self.round_trip(req)
+    }
+
     fn round_trip(&mut self, req: Request) -> Result<Response> {
         write_message(&mut self.w, &req)?;
         let resp: Response = read_message(&mut self.r)?;

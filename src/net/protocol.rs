@@ -53,7 +53,15 @@ pub enum Request {
         shard: u32,
         epoch: u64,
         from_lsn: u64,
+        /// Cap on transactions per response, so one reply cannot exceed the frame limit.
+        max_txns: u32,
     },
+    /// Begin a snapshot of `shard`, freezing it. Answered with its identity and size.
+    SnapshotBegin { shard: u32 },
+    /// Read `len` bytes of the frozen snapshot from `offset`.
+    SnapshotRead { shard: u32, offset: u64, len: u32 },
+    /// Release the freeze. Must be sent, or checkpointing stays suspended.
+    SnapshotEnd { shard: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +104,23 @@ pub enum Response {
         shard: u32,
         reason: String,
     },
+    /// The follower is level with the primary. Distinct from an empty `Frames` batch only
+    /// in intent, but the distinction is worth keeping: one means "nothing new", the other
+    /// would mean "here is what you asked for".
+    UpToDate {
+        shard: u32,
+    },
+    SnapshotInfo {
+        shard: u32,
+        epoch: u64,
+        lsn: u64,
+        total_bytes: u64,
+    },
+    SnapshotChunk {
+        /// Empty when the snapshot has been fully read.
+        data: Vec<u8>,
+    },
+    Ok,
     /// The statement was rejected deterministically — bad SQL, constraint violation. A
     /// result, not a transport failure.
     Rejected {

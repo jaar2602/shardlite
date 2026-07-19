@@ -16,6 +16,7 @@
 
 pub mod bootstrap;
 pub mod follower;
+pub mod log;
 pub mod stream;
 
 use std::sync::Mutex;
@@ -23,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer};
 pub use follower::{Follower, Need, Position};
+pub use log::{FrameLog, FrameLogConfig, FrameLogStats, Served};
 pub use stream::{Lsn, StreamPositions, StreamTxn};
 
 use crate::shard::ShardId;
