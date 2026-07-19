@@ -32,7 +32,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
-| 10 | Cluster: election, fencing, failover | **done — leadership plane** | `tests/cluster.rs` (8) + `src/cluster/` (40) |
+| 10 | Cluster: election, fencing, failover | **incomplete — see below** | `tests/cluster.rs` (8) + `src/cluster/` (40) |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
@@ -480,7 +480,40 @@ far enough behind is told `NeedsBootstrap` and takes a snapshot. It is counted, 
 bootstrapping *repeatedly* — meaning retention is too small for the write rate — is visible
 rather than merely slow.
 
-### Step 10 result: the leadership plane
+### Step 10 is NOT complete — three gaps against the agreed plan
+
+Recorded plainly because an earlier version of this document, and the commit message for
+`59151f3`, claimed more than was built.
+
+**Gap 1 — no quorum-ack. Acknowledged writes can be lost on failover.**
+
+The plan says: *"Primary waits for quorum ack before acknowledging the client."* That does not
+exist. The write path drains frames to the **local** `FrameLog` before replying, which is
+honest about local durability, but followers **pull** asynchronously. A leader that commits,
+acknowledges the client, and dies before any follower polls has lost that write. The election
+restriction cannot recover it — the new leader legitimately never received it.
+
+This contradicts the project's governing requirement that nothing is lost. As it stands the
+system is **correct and stable under failover, but not lossless**: failover selects the
+most-advanced *survivor*, which is not the same as selecting a node that holds everything that
+was acknowledged.
+
+**Gap 2 — the write gate is not wired to anything.**
+
+`Fence::check_may_write` exists, is tested, and is called from nowhere in `src/shard/` or
+`src/storage/`. The gate opens and closes correctly and the cluster tests assert on
+`is_open()`, but a deposed leader handed a write through `ShardManager` would still execute it,
+because no code on the write path consults the fence. The mechanism is real; the wiring is
+absent. The claim that "a deposed leader refuses its own writes" was premature.
+
+**Gap 3 — data-plane promotion.** Known and previously recorded: a promoted follower does not
+reopen its shards read-write and begin serving.
+
+Order of work agreed: **quorum-ack, then gate-wiring, then placement.** Quorum-ack comes first
+because it is the named non-negotiable property, and because it changes the direction of
+replication — building placement on the current pull-only model would mean reworking it.
+
+### Step 10 so far: the leadership plane
 
 **Decision changed from the plan.** The plan specified openraft. The codebase has no async
 runtime anywhere — thread-per-connection, synchronous throughout — and the plan had already
@@ -498,7 +531,7 @@ re-establishes that over frame positions, and is the highest-risk file in the mo
 | `term.rs` | A node votes at most once per term, durably. The one place paying temp-write→fsync→rename: a forgotten vote means two leaders in one term. |
 | `durability.rs` | A candidate must be at least as advanced on **every** shard. Aggregates would let a node far ahead on a busy shard win while behind on a quiet one. Cross-epoch positions are **refused, not ordered** — `(epoch, lsn)` ordering silently elects a node with a higher epoch and less data. |
 | `election.rs` | Follower/candidate/leader, jittered timeouts, and the lease: a leader that cannot reach a quorum steps itself down. |
-| `fence.rs` | Two halves — the **token** (followers refuse a deposed leader's messages) and the **gate** (a deposed leader refuses its own writes). Either alone is insufficient. |
+| `fence.rs` | Two halves — the **token** (followers refuse a deposed leader's messages) and the **gate** (a deposed leader refuses its own writes). Either alone is insufficient. **The gate is built and tested but NOT wired to the write path — see the gap below.** |
 | `node.rs` | Drives the state machine over TCP; the state machine itself performs no I/O and so is testable without a network. |
 
 **Measured:** failover in **463–483 ms** against a 5 s budget, on a three-node cluster over
