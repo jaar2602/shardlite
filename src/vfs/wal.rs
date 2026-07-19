@@ -178,11 +178,16 @@ impl WalCapture {
         }
     }
 
-    /// True once retention exceeded the cap.
+    /// True while retention is over its cap.
     ///
     /// Frames are never dropped to stay under it — dropping would silently truncate the
     /// replication stream, which is the exact failure physical replication exists to avoid.
-    /// The flag is raised instead, and the writer turns it into a hard error.
+    /// The flag is raised instead and the writer refuses writes.
+    ///
+    /// Because nothing was dropped, this is **recoverable**: once a sink consumes the
+    /// backlog and retention falls back under the cap, the flag clears and writes resume.
+    /// It only stays raised while the backlog genuinely persists — a sink that is down, or
+    /// a single transaction too large to ever fit.
     pub fn overflowed(&self) -> bool {
         self.state.lock().expect("capture mutex").overflowed
     }
@@ -404,7 +409,43 @@ impl WalCapture {
             .map(|f| f.data.len())
             .sum();
         st.retained_bytes = st.retained_bytes.saturating_sub(freed);
+
+        // Nothing was ever dropped, so a backlog that has now been consumed leaves the
+        // stream intact and writes can resume.
+        if st.overflowed && st.retained_bytes + Self::pending_bytes(&st) <= st.max_retained_bytes {
+            st.overflowed = false;
+            tracing::info!(
+                retained_bytes = st.retained_bytes,
+                "capture backlog cleared; writes can resume"
+            );
+        }
         taken
+    }
+
+    /// Return drained transactions to the front of the queue.
+    ///
+    /// Draining hands ownership to the caller, so a sink that then refuses them would
+    /// otherwise drop them on the floor — delivered nowhere, retained nowhere, and their
+    /// place in the stream already consumed. That is silent truncation, which is the one
+    /// failure physical replication exists to prevent, so a refusal must give them back.
+    pub fn requeue(&self, txns: Vec<CommittedTxn>) {
+        if txns.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock().expect("capture mutex");
+        let bytes: usize = txns
+            .iter()
+            .flat_map(|t| t.frames.iter())
+            .map(|f| f.data.len())
+            .sum();
+        st.retained_bytes += bytes;
+        if st.max_retained_bytes > 0 && st.retained_bytes > st.max_retained_bytes {
+            st.overflowed = true;
+        }
+        // Front, not back: commit order is what the follower relies on.
+        let mut restored = txns;
+        restored.append(&mut st.committed);
+        st.committed = restored;
     }
 
     pub fn stats(&self) -> CaptureStats {

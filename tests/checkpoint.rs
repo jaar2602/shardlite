@@ -44,6 +44,13 @@ fn tight() -> CheckpointConfig {
     }
 }
 
+/// Rows sized so the WAL crosses the tight limits above quickly.
+///
+/// The suite was ~20s, dominated by writing padded rows one fsync per batch. The limits
+/// are what the tests actually exercise, so fewer, fatter rows reach them in a fraction of
+/// the time without weakening any assertion.
+const PAD: usize = 4_000;
+
 fn wal_len(db: &std::path::Path) -> u64 {
     std::fs::metadata(wal_path_for(db))
         .map(|m| m.len())
@@ -55,7 +62,7 @@ fn wal_len(db: &std::path::Path) -> u64 {
 /// Submitted in chunks rather than one statement at a time: `synchronous = FULL` means
 /// one fsync per *batch*, so row-at-a-time here would spend the whole test in fsync.
 fn write_rows(h: &WriterFleet, start: i64, n: i64) {
-    let pad = "x".repeat(400);
+    let pad = "x".repeat(PAD);
     for chunk_start in (start..start + n).step_by(50) {
         let chunk_end = (chunk_start + 50).min(start + n);
         let stmts: Vec<String> = (chunk_start..chunk_end)
@@ -77,7 +84,7 @@ fn wal_stays_bounded_under_sustained_writes() {
         "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
     )
     .unwrap();
-    write_rows(h, 1, 700);
+    write_rows(h, 1, 120);
 
     let stats = w.checkpoint_stats();
     println!(
@@ -121,7 +128,7 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
 
-        write_rows(h, 100, 700);
+        write_rows(h, 100, 120);
 
         let during = w.checkpoint_stats();
         println!(
@@ -139,7 +146,7 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
     } // read transaction ends here
 
     // With the snapshot released, checkpointing can drain and reclaim.
-    write_rows(h, 100_000, 200);
+    write_rows(h, 100_000, 60);
     let after = w.checkpoint_stats();
     println!(
         "after release: passive={} truncated={} stalls={} wal={}",
@@ -167,14 +174,14 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
             "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
         )
         .unwrap();
-        write_rows(h, 1, 600);
+        write_rows(h, 1, 120);
 
         let out = h
             .execute_one(S0, "SELECT count(*), sum(id) FROM t")
             .unwrap();
         match out {
             meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
-                assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(600));
+                assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(120));
             }
             other => panic!("expected rows, got {other:?}"),
         }
@@ -187,9 +194,9 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
         .unwrap();
     match out {
         meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
-            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(600));
-            // 1 + 2 + ... + 600
-            assert_eq!(r.rows[0][1], meshdb::storage::Value::Integer(180_300));
+            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(120));
+            // 1 + 2 + ... + 120
+            assert_eq!(r.rows[0][1], meshdb::storage::Value::Integer(7_260));
         }
         other => panic!("expected rows, got {other:?}"),
     }
@@ -212,7 +219,7 @@ fn checkpointing_is_skipped_below_the_soft_limit() {
         "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
     )
     .unwrap();
-    write_rows(h, 1, 100);
+    write_rows(h, 1, 40);
 
     let stats = w.checkpoint_stats();
     assert_eq!(
@@ -240,7 +247,7 @@ fn readers_still_work_while_checkpointing_runs() {
         // `Connection` is `Send` but not `Sync`, so the reader moves into its thread
         // rather than being borrowed by it.
         s.spawn(move || {
-            for _ in 0..80 {
+            for _ in 0..40 {
                 let n: i64 = reader
                     .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
                     .expect("reads must keep working during checkpointing");

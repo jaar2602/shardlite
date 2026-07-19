@@ -110,6 +110,14 @@ impl Db {
         self.shards.execute_all_shards(sql)
     }
 
+    /// Rebuild a shard, reclaiming free pages.
+    ///
+    /// Needs roughly twice the shard's size in free disk, and rewrites every page — so with
+    /// capture on it produces a replication stream the size of the whole shard.
+    pub fn vacuum(&self, shard: ShardId) -> Result<()> {
+        self.shards.vacuum(shard)
+    }
+
     /// True when a statement changes schema and therefore belongs on every shard.
     pub fn is_ddl(sql: &str) -> bool {
         matches!(first_keyword(sql).as_str(), "CREATE" | "DROP" | "ALTER")
@@ -164,7 +172,8 @@ fn reject_unsupported(sql: &str) -> Result<()> {
         }
         "VACUUM" => {
             "VACUUM cannot run inside a transaction, and every batch is wrapped in one. \
-             It will be offered as a maintenance operation instead."
+             Use the maintenance path instead — `.vacuum` in the shell, or \
+             ShardManager::vacuum."
         }
         _ => return Ok(()),
     };

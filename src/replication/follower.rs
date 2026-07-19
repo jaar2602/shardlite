@@ -135,6 +135,13 @@ impl Follower {
 
         for (expect, t) in (pos.applied_lsn + 1..).zip(txns.iter()) {
             if t.lsn != expect {
+                tracing::error!(
+                    %shard,
+                    epoch,
+                    expected = expect,
+                    got = t.lsn,
+                    "replication gap; refusing to apply across it"
+                );
                 return Err(Error::ReplicationGap {
                     shard: shard.to_string(),
                     expected: expect,
@@ -185,6 +192,7 @@ impl Follower {
         // Any WAL left from a previous life describes a database that no longer exists.
         let _ = std::fs::remove_file(crate::storage::checkpoint::wal_path_for(&dest));
 
+        tracing::info!(%shard, epoch, lsn, "installed snapshot");
         self.set_position(
             shard,
             Position {

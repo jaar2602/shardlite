@@ -22,6 +22,10 @@ thiserror = "2.0"
 # `recv` while holding the lock starves every other reader. Default features off (drops
 # the async/select machinery); the async half is available when the network server needs it.
 flume = { version = "0.12.0", default-features = false }
+tracing = "0.1.44"
+# Only the binary installs a subscriber, behind a feature so `cargo test` and library
+# consumers do not pull it in.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [[bench]]
 name = "write_throughput"
@@ -29,3 +33,10 @@ harness = false
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = ["cli"]
+# Only the binary installs a subscriber. The library emits events through the `tracing`
+# facade and installs nothing, so a consumer chooses its own destination — or none, in
+# which case the macros compile to near-nothing.
+cli = ["dep:tracing-subscriber"]

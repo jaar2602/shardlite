@@ -289,6 +289,11 @@ impl ShardManager {
         self.writers.snapshot(shard, dest)
     }
 
+    /// Rebuild `shard`, reclaiming free pages. See [`WriterFleet::vacuum`] for its cost.
+    pub fn vacuum(&self, shard: ShardId) -> crate::Result<()> {
+        self.writers.vacuum(shard)
+    }
+
     /// Freeze `shard`'s main file, returning `(epoch, lsn, path)`. Pair with
     /// [`Self::end_snapshot`].
     pub fn begin_snapshot(&self, shard: ShardId) -> crate::Result<(u64, u64, PathBuf)> {

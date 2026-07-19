@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**86 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
+**92 Rust tests + 36 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,17 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Logging (`tracing`)
+The library emits through the `tracing` facade and installs **no** subscriber, so an
+embedding consumer picks its own destination — or none, in which case the macros compile to
+near-nothing. Only the binary installs one, behind the `cli` feature, writing to stderr so
+logs never mix with query results on stdout. `MESHDB_LOG=debug` turns up detail; the default
+is warnings and above.
+
+Instrumented where an operator would actually be debugging: checkpoint stalls and TRUNCATE
+escalation, shard open/evict, capture overflow and recovery, sink refusals, snapshot holds
+being broken, replication gaps, and epoch bumps.
 
 ### Replication (`src/replication/`)
 A follower applies **pages, never SQL** — the reason physical replication was chosen, since
@@ -189,6 +200,11 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **Retention bounded by one batch** | `retention_stays_bounded_because_the_writer_drains_every_batch` |
 | Overflow fails writes, never drops frames | `overflow_fails_writes_rather_than_dropping_frames` |
 | Capture does not change the on-disk file | `captured_and_uncaptured_databases_are_identical_on_disk` |
+| **A refused batch is requeued, not lost** | `overflow_fails_writes_while_the_backlog_cannot_be_shifted` |
+| **Overflow clears once the backlog drains** | `overflow_clears_once_the_backlog_is_consumed` |
+| Rolled-back stream positions are reused | `rolling_back_returns_positions_for_reuse` |
+| VACUUM reclaims space and keeps the data | `vacuum_reclaims_space_and_keeps_the_data` |
+| VACUUM is refused under a snapshot hold | `vacuum_is_refused_while_a_snapshot_is_held` |
 | **Follower converges byte-identically with its primary** | `a_follower_converges_with_its_primary` |
 | **Snapshot does not block the writer thread** | `snapshotting_a_large_shard_does_not_block_the_writer_thread` |
 | The frozen file does not change while held | `the_frozen_file_does_not_change_while_a_snapshot_is_held` |
@@ -259,6 +275,14 @@ Capture's CPU cost, measured separately by `cargo run --example vfs_overhead`: *
 - **An LRU multiplies per-connection cache by its capacity.** 16 open writer connections at
   the single-database 8 MiB would be 128 MB — the whole container budget. Sharded profiles
   use 1 MiB writers and 512 KiB readers for this reason alone.
+- **Draining a capture and then failing to ship it loses frames outright.** Found by a test:
+  `drain_committed` hands ownership to the caller, so a sink that then refused a batch left
+  those frames delivered nowhere, retained nowhere, and their stream positions already
+  consumed — the exact silent truncation the design forbids. A refusal now requeues the
+  frames and rolls back the positions.
+- **`VACUUM` on a database whose data is still in the WAL grows the main file.** The first
+  version of that test compared a 4 KiB main file against a 471 KiB one and concluded vacuum
+  had made things worse; the data simply had not been checkpointed yet.
 - **A blocking request/reply API caps queue depth at the caller count.** The write queue
   bound was initially untestable for this reason: 32 threads cannot fill a 1024-deep queue
   when each blocks until its batch commits. The first version of the backpressure test
@@ -315,13 +339,9 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Gap | Impact |
 |---|---|
-| No structured logging — `eprintln!` only | Not operable as a service |
 | `first_keyword` guard cannot see past a leading comment | `-- x\nBEGIN` slips through. Real guard is the authorizer (step 8) |
-| No `VACUUM` path | Rejected outright; needs an out-of-transaction maintenance mode |
-| Checkpoint test suite takes ~20s | Real fsyncs; acceptable but the slowest thing in CI |
 | `busy_timeout` ordering fix is unproven | Moving it before lock-taking statements is correct on its own merits, but neither test discriminates it — both pass with the bug reintroduced. The 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
-| Overflow is per-shard and sticky | Once raised the shard refuses writes until the process restarts; no recovery path yet |
 | **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
 | No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
 | Bootstrap copies the whole shard file | No incremental or resumable copy; a failed copy restarts from zero |
@@ -336,9 +356,9 @@ the ~20s checkpoint test suite.
 
 ### Design decisions not yet made
 
-- **Shard count default.** Now enforced by the manifest, but the *default* is still open:
-  the CLI uses 1 for usability, `ShardConfig::floor()` uses 64. A user who accepts the CLI
-  default and later needs to scale must migrate.
+- ~~Shard count default~~ — **resolved.** There is no default. The CLI requires `--shards N`
+  when creating a directory and refuses it for an existing one, because a value that cannot
+  be revised should not be one you got by accident.
 - **Single-node 3-container mode:** buys rolling upgrades, not availability. Does not
   survive host failure, disk failure, or OOM. At a few hundred GB it also costs 3× disk and
   3× write I/O. Needs an explicit decision on whether it is supported at scale.

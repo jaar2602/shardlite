@@ -260,44 +260,45 @@ fn retention_stays_bounded_because_the_writer_drains_every_batch() {
 }
 
 #[test]
-fn overflow_fails_writes_rather_than_dropping_frames() {
-    // A sink that cannot keep up must not be papered over. Frames are never dropped, so the
-    // only honest response is to stop accepting writes — committing locally what no replica
-    // will receive is the divergence physical replication exists to prevent.
-    //
-    // Simulated with a tiny cap and no sink draining, which is the same condition.
+fn overflow_fails_writes_while_the_backlog_cannot_be_shifted() {
+    // Overflow is only reachable when the backlog genuinely cannot move — a sink that is
+    // not consuming. With no sink at all the drain always succeeds, so retention never
+    // persists and this state is unreachable; the earlier version of this test asserted
+    // behaviour that the drain-first ordering removed.
     let dir = TempDir::new().unwrap();
+    let sink = Arc::new(FlakySink::default());
     let mut c = cfg(1, true);
-    c.max_retained_bytes = 64 * 1024; // far below one batch of 4 KiB blobs
-    let w = fleet(&dir, c, None);
+    c.max_retained_bytes = 32 * 1024;
+    let w = fleet(&dir, c, Some(sink.clone()));
 
+    // Schema first, while the sink is healthy. Taking it down before the DDL fails the DDL
+    // too — correct behaviour, but it means the test never reaches what it is testing.
     w.execute_one(
         S0,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, pad BLOB) STRICT",
     )
     .unwrap();
+    sink.down.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Force a single transaction large enough to blow the cap before it commits.
     let pad = vec![0u8; 4096];
-    let stmts: Vec<Statement> = (0..200)
-        .map(|i| {
-            Statement::with_params(
-                "INSERT INTO t VALUES (?1, ?2)",
-                vec![Value::Integer(i), Value::Blob(pad.clone())],
-            )
-        })
-        .collect();
-
-    // The batch itself may commit; what matters is that the failure surfaces and does not
-    // silently continue with an incomplete stream.
-    let first = w.execute(S0, stmts);
-    let second = w.execute_one(S0, "INSERT INTO t VALUES (99999, x'00')");
-
-    let saw_overflow = matches!(first, Err(Error::CaptureOverflow { .. }))
-        || matches!(second, Err(Error::CaptureOverflow { .. }));
+    let mut saw_overflow = false;
+    for i in 0..60 {
+        let stmt = Statement::with_params(
+            "INSERT INTO t VALUES (?1, ?2)",
+            vec![Value::Integer(i), Value::Blob(pad.clone())],
+        );
+        if matches!(
+            w.execute(S0, vec![stmt]),
+            Err(Error::CaptureOverflow { .. })
+        ) {
+            saw_overflow = true;
+            break;
+        }
+    }
     assert!(
         saw_overflow,
-        "expected CaptureOverflow; got first={first:?} second={second:?}"
+        "a sink that never consumes must eventually produce CaptureOverflow rather than \
+         letting retention grow without limit"
     );
 }
 
@@ -351,4 +352,149 @@ fn reads_still_work_against_a_captured_database() {
         Outcome::Ok(Executed::Rows(r)) => assert_eq!(r.rows[0][0], Value::Integer(50)),
         other => panic!("expected rows, got {other:?}"),
     }
+}
+
+/// A sink that can be taken down and brought back, to exercise overflow recovery.
+#[derive(Default)]
+struct FlakySink {
+    down: std::sync::atomic::AtomicBool,
+    accepted: std::sync::atomic::AtomicU64,
+}
+
+impl FrameSink for FlakySink {
+    fn accept(
+        &self,
+        _shard: ShardId,
+        _epoch: u64,
+        txns: Vec<meshdb::replication::StreamTxn>,
+    ) -> meshdb::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Unsupported("sink is down".into()));
+        }
+        self.accepted
+            .fetch_add(txns.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn overflow_clears_once_the_backlog_is_consumed() {
+    // Overflow is a backlog, not a loss: frames are never dropped to stay under the cap.
+    // So once a sink comes back and the backlog drains, writes must resume on their own.
+    // Requiring a restart to clear it would turn a transient sink outage into an outage of
+    // the database.
+    let dir = TempDir::new().unwrap();
+    let sink = Arc::new(FlakySink::default());
+    let mut c = cfg(1, true);
+    c.max_retained_bytes = 32 * 1024;
+    let w = fleet(&dir, c, Some(sink.clone()));
+
+    w.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad BLOB) STRICT",
+    )
+    .unwrap();
+
+    // Take the sink down and write until the backlog trips the cap.
+    sink.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pad = vec![0u8; 4096];
+    let mut failed = 0;
+    for i in 0..40 {
+        let stmt = Statement::with_params(
+            "INSERT INTO t VALUES (?1, ?2)",
+            vec![Value::Integer(i), Value::Blob(pad.clone())],
+        );
+        if w.execute(S0, vec![stmt]).is_err() {
+            failed += 1;
+        }
+    }
+    assert!(
+        failed > 0,
+        "a sink that is down must eventually refuse writes"
+    );
+
+    // Bring it back. The next write drains the backlog, clearing the overflow.
+    sink.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let recovered = w.execute_one(S0, "INSERT INTO t VALUES (9999, x'00')");
+    assert!(
+        recovered.is_ok(),
+        "writes must resume once the backlog drains, got {recovered:?}"
+    );
+    assert!(
+        sink.accepted.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the backlog should have reached the sink, not been dropped"
+    );
+
+    // And it keeps working.
+    for i in 100..110 {
+        w.execute_one(S0, format!("INSERT INTO t VALUES ({i}, x'00')"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn vacuum_reclaims_space_and_keeps_the_data() {
+    // VACUUM cannot run inside a transaction, which is why the ordinary statement path
+    // rejects it; this is the maintenance path that runs it on the writer thread outside
+    // one.
+    let dir = TempDir::new().unwrap();
+    let w = fleet(&dir, cfg(1, false), None);
+
+    w.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad BLOB) STRICT",
+    )
+    .unwrap();
+    let pad = vec![0u8; 4096];
+    for chunk in 0..20 {
+        let stmts: Vec<Statement> = (0..50)
+            .map(|i| {
+                Statement::with_params(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    vec![Value::Integer(chunk * 50 + i), Value::Blob(pad.clone())],
+                )
+            })
+            .collect();
+        w.execute(S0, stmts).unwrap();
+    }
+    w.execute_one(S0, "DELETE FROM t WHERE id % 10 != 0")
+        .unwrap();
+
+    // Force a checkpoint before measuring. Until the WAL is folded in the main file holds
+    // almost nothing — the first version of this test compared a 4 KiB main file against a
+    // 471 KiB one and concluded vacuum had made things worse.
+    let (_e, _l, _p) = w.begin_snapshot(S0).unwrap();
+    w.end_snapshot(S0).unwrap();
+    let before = std::fs::metadata(S0.path(dir.path())).unwrap().len();
+
+    w.vacuum(S0).unwrap();
+    let after = std::fs::metadata(S0.path(dir.path())).unwrap().len();
+
+    println!("vacuum: {before} -> {after} bytes");
+    assert!(
+        after < before / 2,
+        "vacuum should have reclaimed most of the file: {before} -> {after}"
+    );
+
+    match w.execute_one(S0, "SELECT count(*) FROM t").unwrap() {
+        Outcome::Ok(Executed::Rows(r)) => assert_eq!(r.rows[0][0], Value::Integer(100)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn vacuum_is_refused_while_a_snapshot_is_held() {
+    // VACUUM rewrites every page, which would change the file a snapshot copy is reading.
+    let dir = TempDir::new().unwrap();
+    let w = fleet(&dir, cfg(1, false), None);
+    w.execute_one(S0, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    let (_e, _l, _src) = w.begin_snapshot(S0).unwrap();
+    assert!(
+        w.vacuum(S0).is_err(),
+        "vacuum must not run under a snapshot hold"
+    );
+    assert!(w.end_snapshot(S0).unwrap());
+    w.vacuum(S0).unwrap();
 }

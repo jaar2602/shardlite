@@ -50,10 +50,22 @@ assert_fails() {
 
 sql() { "$BIN" "$DB" -c "$1"; }
 
+# Shard count is immutable, so the CLI refuses to guess one. Create explicitly.
+create() { "$BIN" "$1" --shards "$2" -c "SELECT 1" >/dev/null 2>&1; }
+
 echo "building..."
 cargo build --quiet 2>&1 | tail -5
 [[ -x "$BIN" ]] || { echo "build failed: $BIN not found"; exit 1; }
 echo "data dir: $DB"
+echo
+
+echo "shard count must be chosen explicitly"
+assert_fails "new directory without --shards is refused" "--shards N is required" "$BIN" "$DB" -c "SELECT 1"
+create "$DB" 1
+assert_contains "created with --shards 1" "shard_count=1" cat "$DB/meshdb.manifest"
+assert_fails "--shards on an existing directory that disagrees" "cannot change that" \
+    "$BIN" "$DB" --shards 4 -c "SELECT 1"
+assert_contains "opening an existing directory needs no --shards" "1" "$BIN" "$DB" -c "SELECT 1"
 echo
 
 echo "schema and writes"
@@ -82,7 +94,7 @@ echo "unsupported statements (guarded, with a reason)"
 # guard it would route to a reader, appear to succeed, and silently do nothing.
 assert_fails "BEGIN rejected"   "writer owns transaction boundaries" "$BIN" "$DB" -c "BEGIN"
 assert_fails "COMMIT rejected"  "unsupported"                        "$BIN" "$DB" -c "COMMIT"
-assert_fails "VACUUM rejected"  "cannot run inside a transaction"    "$BIN" "$DB" -c "VACUUM"
+assert_fails "VACUUM points at the maintenance path" "Use the maintenance path" "$BIN" "$DB" -c "VACUUM"
 assert_fails "ATTACH rejected"  "no atomic commit across"            "$BIN" "$DB" -c "ATTACH DATABASE 'x.db' AS x"
 
 echo
@@ -108,6 +120,7 @@ assert_contains "repl .tables"     "users"    bash -c "printf '.tables\n.quit\n'
 assert_contains "repl .stats writer" "mean_batch" bash -c "printf '.stats\n.quit\n' | $BIN $DB"
 assert_contains "repl .stats reader" "threads=2"  bash -c "printf '.stats\n.quit\n' | $BIN $DB"
 assert_contains "repl .info"         "shard_count" bash -c "printf '.info\n.quit\n' | $BIN $DB"
+assert_contains "repl .vacuum"       "ok"          bash -c "printf '.vacuum\n.quit\n' | $BIN $DB"
 assert_contains "repl .stats wal"    "wal:"       bash -c "printf '.stats\n.quit\n' | $BIN $DB"
 # Reads must be served by the pool, not by the writer thread.
 assert_contains "select counted as a reader query" "queries=1" \
@@ -118,7 +131,7 @@ echo "manifest guards the immutable shard count"
 SH_DIR=$(mktemp -d); trap 'rm -rf "$DB_DIR" "$SH_DIR"' EXIT
 "$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
 assert_contains "manifest records shard count" "shard_count=8" cat "$SH_DIR/multi/meshdb.manifest"
-assert_fails "reopening with a different count is refused" "re-routes every key" \
+assert_fails "reopening with a different count is refused" "cannot change that" \
     "$BIN" "$SH_DIR/multi" --shards 4 -c "SELECT 1"
 assert_contains "reopening with the same count works" "1" "$BIN" "$SH_DIR/multi" --shards 8 -c "SELECT 1"
 # DDL must reach every shard, not just the one being targeted.

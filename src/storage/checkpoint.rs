@@ -158,6 +158,15 @@ impl Checkpointer {
         match checkpoint(conn, "PASSIVE") {
             Ok((busy, log_pages, checkpointed)) => {
                 self.counters.passive.fetch_add(1, Ordering::Relaxed);
+                if busy != 0 || checkpointed < log_pages {
+                    // The starvation signal. Worth seeing before it becomes an escalation.
+                    tracing::debug!(
+                        busy = busy != 0,
+                        log_pages,
+                        checkpointed,
+                        "passive checkpoint could not fully drain the WAL"
+                    );
+                }
                 CheckpointOutcome::Passive {
                     log_pages,
                     checkpointed,
@@ -166,6 +175,7 @@ impl Checkpointer {
             }
             Err(e) => {
                 self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, "passive checkpoint failed");
                 CheckpointOutcome::Failed(e.to_string())
             }
         }
@@ -175,10 +185,11 @@ impl Checkpointer {
         // Loud on purpose: reaching this means readers have been starving the checkpointer
         // long enough for the WAL to pass its hard limit. Silent escalation is how this
         // gets discovered in production instead of in testing.
-        eprintln!(
-            "meshdb WARN: WAL at {before_bytes} bytes with {} consecutive stalled \
-             checkpoints; escalating to TRUNCATE (briefly blocks readers)",
-            self.consecutive_stalls
+        tracing::warn!(
+            wal_bytes = before_bytes,
+            consecutive_stalls = self.consecutive_stalls,
+            "WAL passed its hard limit with checkpoints stalling; escalating to TRUNCATE, \
+             which briefly blocks readers"
         );
 
         match checkpoint(conn, "TRUNCATE") {

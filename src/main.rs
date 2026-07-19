@@ -5,24 +5,36 @@ use std::process::ExitCode;
 
 use meshdb::db::Db;
 use meshdb::shard::ShardId;
+use meshdb::shard::manifest::Manifest;
 use meshdb::storage::exec::{Executed, Outcome, QueryResult};
 
 const USAGE: &str = "\
 meshdb — HA multi-write SQLite server (single-node)
 
 usage:
-  meshdb <data-dir> [--shards N]        interactive shell
+  meshdb <data-dir> --shards N          create a new data directory
+  meshdb <data-dir>                     interactive shell (existing directory)
   meshdb <data-dir> -c \"SQL\"            run one statement and exit
   meshdb <data-dir> -f <file>           run statements from a file, one per line
 
---shards N applies only when creating a new directory. It is recorded in the
-manifest and IMMUTABLE: changing it re-routes every key.
+--shards N is REQUIRED when creating a new directory and is refused for an
+existing one. It is recorded in the manifest and cannot be changed afterwards,
+because changing it re-routes every key. There is deliberately no default: a
+value you cannot revise should not be one you got by accident.
+
+  1        single database; no cross-shard concerns, and no way to scale later
+  16-64    typical; 64 covers roughly 100 MB to 1 TB
+  256      maximum
+
+Note that statements other than DDL go to one shard at a time (see .shard), as
+there is no cross-shard query planner yet.
 
 shell commands:
   .help     show this message
   .info     manifest and shard layout
   .shard N  target shard N for subsequent statements (default 0)
   .stats    writer, reader and WAL statistics
+  .vacuum   rebuild the current shard, reclaiming free pages
   .tables   list tables on the current shard
   .quit     exit
 
@@ -30,6 +42,7 @@ DDL (CREATE / DROP / ALTER) is applied to every shard automatically. Other
 statements go to the current shard; there is no cross-shard query planner yet.";
 
 fn main() -> ExitCode {
+    init_tracing();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!("{USAGE}");
@@ -41,14 +54,14 @@ fn main() -> ExitCode {
     }
 
     let dir = std::path::PathBuf::from(&args[0]);
-    let mut shards = 1u32;
+    let mut requested: Option<u32> = None;
     let mut rest: Vec<&str> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--shards" => match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
                 Some(n) => {
-                    shards = n;
+                    requested = Some(n);
                     i += 2;
                 }
                 None => {
@@ -62,6 +75,51 @@ fn main() -> ExitCode {
             }
         }
     }
+
+    // Shard count is immutable once data exists, so it is never defaulted. Being asked once
+    // costs nothing; getting it wrong by omission costs a migration.
+    let manifest_path = Manifest::path(&dir);
+    let on_disk = manifest_path
+        .exists()
+        .then(|| Manifest::read(&manifest_path))
+        .transpose();
+    let shards = match on_disk {
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        Ok(Some(m)) => match requested {
+            None => m.shard_count,
+            Some(n) if n == m.shard_count => m.shard_count,
+            Some(n) => {
+                eprintln!(
+                    "error: {} already holds data for {} shards; --shards {n} cannot change \
+                     that.\nShard count is fixed at creation because changing it re-routes \
+                     every key. Omit --shards to open it, or create a new directory.",
+                    dir.display(),
+                    m.shard_count
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        Ok(None) => match requested {
+            Some(n) => n,
+            None => {
+                eprintln!(
+                    "error: {} does not exist yet, so --shards N is required.\n\n\
+                     The shard count is recorded at creation and cannot be changed \
+                     afterwards — changing it re-routes every key, making existing rows \
+                     unreachable. There is no default because a value you cannot revise \
+                     should not be one you got by accident.\n\n\
+                     \x20 --shards 1     single database; nothing to scale later\n\
+                     \x20 --shards 64    typical; covers roughly 100 MB to 1 TB\n\
+                     \x20 --shards 256   maximum",
+                    dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     let db = match Db::open(&dir, shards) {
         Ok(db) => db,
@@ -205,6 +263,15 @@ fn repl(db: &Db) -> ExitCode {
             _ => {}
         }
 
+        if sql == ".vacuum" {
+            println!("rebuilding {current} (needs ~2x its size in free disk)...");
+            match db.vacuum(current) {
+                Ok(()) => println!("ok"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+            continue;
+        }
+
         if let Some(n) = sql.strip_prefix(".shard ") {
             match n.trim().parse::<u32>() {
                 Ok(n) if n < db.shard_count() => {
@@ -339,4 +406,24 @@ fn print_table(r: &QueryResult) {
         r.rows.len(),
         if r.rows.len() == 1 { "" } else { "s" }
     );
+}
+
+/// Install a log subscriber for the CLI.
+///
+/// Only the binary does this. The library emits through the `tracing` facade and installs
+/// nothing, so an embedding consumer picks its own destination — or none.
+///
+/// Defaults to warnings and above; `MESHDB_LOG=debug` (or any `RUST_LOG`-style filter)
+/// turns up the detail.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("MESHDB_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // Logs go to stderr so they never mix with query results on stdout.
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }

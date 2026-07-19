@@ -59,6 +59,11 @@ enum Job {
         shard: ShardId,
         reply: SyncSender<Result<bool>>,
     },
+    /// Rebuild a shard, reclaiming free pages.
+    Vacuum {
+        shard: ShardId,
+        reply: SyncSender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -266,6 +271,25 @@ impl WriterFleet {
         }
     }
 
+    /// Rebuild `shard`, reclaiming free pages.
+    ///
+    /// Runs on the writer thread **outside** a transaction — `VACUUM` cannot run inside
+    /// one, which is why it is rejected on the ordinary statement path.
+    ///
+    /// Expensive in two ways worth knowing before scheduling it: it needs roughly twice the
+    /// shard's size in free disk, and it rewrites every page, so with capture on it
+    /// produces a replication stream the size of the whole shard.
+    pub fn vacuum(&self, shard: ShardId) -> Result<()> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::Vacuum {
+                shard,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
     /// Freeze `shard`'s main file and report `(epoch, lsn, path)`.
     ///
     /// The file at `path` will not change until [`Self::end_snapshot`]. Callers must pair
@@ -349,7 +373,11 @@ impl Drop for WriterFleet {
         if let Some(p) = &self.positions
             && let Err(e) = p.mark_clean()
         {
-            eprintln!("meshdb WARN: could not persist stream position: {e}");
+            tracing::error!(
+                error = %e,
+                "could not persist the stream position; the next start will bump the epoch \
+                 and every follower will re-bootstrap"
+            );
         }
         for tx in self.senders.drain(..) {
             let _ = tx.send(Job::Shutdown);
@@ -403,6 +431,10 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(end_snapshot(&mut open, &ctx, shard));
                 continue;
             }
+            Job::Vacuum { shard, reply } => {
+                let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
+                continue;
+            }
             Job::Shutdown => return,
         }
 
@@ -423,6 +455,9 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 }
                 Ok(Job::EndSnapshot { shard, reply }) => {
                     let _ = reply.send(end_snapshot(&mut open, &ctx, shard));
+                }
+                Ok(Job::Vacuum { shard, reply }) => {
+                    let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
                 }
                 Ok(Job::Shutdown) => {
                     // Honour it only after the batch in hand commits — dropping it would
@@ -507,9 +542,11 @@ fn apply_shard_batch(
                 let wal = crate::storage::checkpoint::wal_path_for(&shard.path(&ctx.dir));
                 let wal_bytes = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
                 if wal_bytes >= ctx.snapshot_hold_max_wal {
-                    eprintln!(
-                        "meshdb WARN: {shard} WAL reached {wal_bytes} bytes during a snapshot; \
-                         breaking the hold and invalidating the snapshot"
+                    tracing::warn!(
+                        %shard,
+                        wal_bytes,
+                        "WAL grew past the snapshot hold limit; breaking the hold and \
+                         invalidating the snapshot in flight"
                     );
                     entry.snapshot_hold = false;
                     entry.snapshot_invalidated = true;
@@ -560,6 +597,31 @@ fn begin_snapshot(
     Ok((epoch, lsn, shard.path(&ctx.dir)))
 }
 
+/// Rebuild a shard. Must not run inside a transaction, hence its own job.
+fn vacuum_shard(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> Result<()> {
+    let entry = ensure_shard(open, ctx, shard)?;
+    if entry.snapshot_hold {
+        return Err(Error::Unsupported(format!(
+            "{shard} is frozen for a snapshot; VACUUM would rewrite the file being copied"
+        )));
+    }
+    tracing::info!(%shard, "vacuum starting");
+    entry
+        .conn
+        .execute_batch("VACUUM")
+        .map_err(crate::Error::Sqlite)?;
+    // VACUUM leaves everything in the WAL; fold it back so the space is actually returned.
+    entry
+        .conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_err(crate::Error::Sqlite)?;
+    drain_capture(entry, ctx, shard)?;
+    tracing::info!(%shard, "vacuum complete");
+    Ok(())
+}
+
 /// Release the freeze; `false` if it had to be broken and the snapshot is unusable.
 fn end_snapshot(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> Result<bool> {
     let entry = ensure_shard(open, ctx, shard)?;
@@ -573,16 +635,9 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
         return Ok(());
     };
 
-    if capture.overflowed() {
-        // Frames are never dropped to stay under the cap, so reaching it means the stream
-        // is already incomplete. Failing every write from here is the only honest response:
-        // continuing would commit locally what no replica will ever see.
-        return Err(Error::CaptureOverflow {
-            shard: shard.to_string(),
-            retained: capture.retained_bytes(),
-        });
-    }
-
+    // Drain first, then check. Frames are never dropped, so an overflow is a backlog rather
+    // than a loss — and draining it is the recovery. Checking before draining would leave a
+    // shard permanently refusing writes even after its sink came back.
     let txns = capture.drain_committed();
     if txns.is_empty() {
         return Ok(());
@@ -603,12 +658,59 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
         })
         .collect();
 
-    match &ctx.sink {
-        Some(sink) => sink.accept(shard, epoch, positioned),
+    let count = positioned.len();
+    let result = match &ctx.sink {
+        Some(sink) => sink.accept(shard, epoch, positioned.clone()),
         // Capture on with no sink: drop them, having proven they were captured. Only
         // sensible for measuring capture's cost, which is why `NullSink` is named as it is.
         None => Ok(()),
+    };
+
+    if let Err(e) = result {
+        // The sink refused, so these frames reached nobody. Draining already took them out
+        // of the capture, so without giving them back they would be lost outright — never
+        // delivered, never retained, and their place in the stream consumed. Put both back.
+        tracing::warn!(%shard, error = %e, count, "sink refused a batch; requeueing it");
+        capture.requeue(positioned.into_iter().map(|p| p.txn).collect());
+        if let Some(p) = &ctx.positions {
+            p.rollback(shard, count);
+        }
+
+        // Which failure to report matters. A refusal on its own is transient and the sink's
+        // own error says most about it. Once the requeued backlog passes the retention cap
+        // the binding constraint has changed: the node can no longer accept writes at all,
+        // whatever this particular batch did, and saying so is more useful than repeating
+        // the sink error.
+        if capture.overflowed() {
+            tracing::error!(
+                %shard,
+                retained_bytes = capture.retained_bytes(),
+                "capture backlog passed its limit while the sink was refusing; refusing writes"
+            );
+            return Err(Error::CaptureOverflow {
+                shard: shard.to_string(),
+                retained: capture.retained_bytes(),
+            });
+        }
+        return Err(e);
     }
+
+    // Still over the cap after draining means the backlog cannot be shifted — a sink that
+    // is not consuming, or one transaction too large to ever fit. Refusing writes is the
+    // only honest response: committing locally what no replica will receive is the
+    // divergence physical replication exists to prevent.
+    if capture.overflowed() {
+        tracing::error!(
+            %shard,
+            retained_bytes = capture.retained_bytes(),
+            "capture retention is still over its limit after draining; refusing writes"
+        );
+        return Err(Error::CaptureOverflow {
+            shard: shard.to_string(),
+            retained: capture.retained_bytes(),
+        });
+    }
+    Ok(())
 }
 
 /// Get the shard's connection, opening it (and evicting a colder one) if needed.
@@ -651,8 +753,10 @@ fn ensure_shard<'a>(
     if event.opened {
         ctx.counters.shard_opens.fetch_add(1, Ordering::Relaxed);
         ctx.counters.open_now.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(%shard, "opened shard writer connection");
     }
     if event.evicted > 0 {
+        tracing::debug!(%shard, evicted = event.evicted, "evicted colder shards to make room");
         ctx.counters
             .shard_evictions
             .fetch_add(event.evicted, Ordering::Relaxed);

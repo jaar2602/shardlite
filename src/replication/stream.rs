@@ -76,8 +76,18 @@ impl StreamPositions {
             // Either the first run, or the previous one died before persisting. Either way
             // the LSN it reached is unknown, so continuing the epoch would let a follower
             // accept a stream with an invisible hole.
+            let previous = p.epoch;
             p.epoch += 1;
             p.next.clear();
+            if previous > 0 {
+                tracing::warn!(
+                    previous_epoch = previous,
+                    epoch = p.epoch,
+                    "the last run did not shut down cleanly, so its stream position cannot \
+                     be trusted; bumping the epoch, which forces every follower to \
+                     re-bootstrap"
+                );
+            }
         }
         p.clean = false;
 
@@ -100,6 +110,18 @@ impl StreamPositions {
         let start = *g.next.entry(shard).or_insert(1);
         g.next.insert(shard, start + count as Lsn);
         start
+    }
+
+    /// Hand back `count` positions allocated but never shipped.
+    ///
+    /// Safe only because allocation happens on the shard's single writer thread, so no
+    /// other allocation can interleave. Without this a refused batch would leave a
+    /// permanent hole in the stream, and the follower would refuse everything after it.
+    pub fn rollback(&self, shard: ShardId, count: usize) {
+        let mut g = self.inner.lock().expect("stream mutex");
+        if let Some(next) = g.next.get_mut(&shard) {
+            *next = next.saturating_sub(count as Lsn).max(1);
+        }
     }
 
     /// Last position handed out for `shard`, or 0 if none.
@@ -178,6 +200,22 @@ mod tests {
 
         // Shards are independent streams.
         assert_eq!(p.allocate(ShardId(1), 1), 1);
+    }
+
+    #[test]
+    fn rolling_back_returns_positions_for_reuse() {
+        // A batch the sink refused must not consume its place in the stream, or the
+        // follower sees a permanent hole and refuses everything after it.
+        let dir = TempDir::new().unwrap();
+        let p = StreamPositions::load_or_init(dir.path()).unwrap();
+
+        assert_eq!(p.allocate(ShardId(0), 5), 1);
+        p.rollback(ShardId(0), 5);
+        assert_eq!(
+            p.allocate(ShardId(0), 5),
+            1,
+            "rolled-back positions must be handed out again"
+        );
     }
 
     #[test]
