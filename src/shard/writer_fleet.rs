@@ -18,7 +18,7 @@ use super::lru::Lru;
 use super::{ShardConfig, ShardId};
 use crate::config::{CheckpointConfig, PragmaProfile};
 use crate::error::{Error, Result};
-use crate::replication::FrameSink;
+use crate::replication::{FrameSink, StreamPositions, StreamTxn};
 use crate::storage::apply;
 use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
 use crate::storage::exec::{Outcome, Statement};
@@ -48,6 +48,15 @@ enum Job {
     EnsureOpen {
         shard: ShardId,
         reply: SyncSender<Result<()>>,
+    },
+    /// Copy a shard to `dest` at a known stream position.
+    ///
+    /// Runs on the writer thread, which is what makes it atomic with respect to writes:
+    /// nothing can commit between recording the position and copying the file.
+    Snapshot {
+        shard: ShardId,
+        dest: PathBuf,
+        reply: SyncSender<Result<(u64, u64)>>,
     },
     Shutdown,
 }
@@ -104,6 +113,7 @@ pub struct WriterFleet {
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
     cfg: ShardConfig,
+    positions: Option<Arc<StreamPositions>>,
 }
 
 impl WriterFleet {
@@ -130,9 +140,12 @@ impl WriterFleet {
         sink: Option<Arc<dyn FrameSink>>,
     ) -> Result<Self> {
         cfg.validate()?;
-        if cfg.capture {
+        let positions = if cfg.capture {
             crate::vfs::register()?;
-        }
+            Some(Arc::new(StreamPositions::load_or_init(dir)?))
+        } else {
+            None
+        };
         std::fs::create_dir_all(dir).map_err(|e| {
             Error::ShardConfig(format!("creating data directory {}: {e}", dir.display()))
         })?;
@@ -153,6 +166,7 @@ impl WriterFleet {
                 capture: cfg.capture,
                 max_retained_bytes: cfg.max_retained_bytes,
                 sink: sink.clone(),
+                positions: positions.clone(),
                 counters: Arc::clone(&counters),
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
             };
@@ -170,6 +184,7 @@ impl WriterFleet {
             counters,
             checkpoint_counters,
             cfg,
+            positions,
         })
     }
 
@@ -207,6 +222,22 @@ impl WriterFleet {
         Ok(out.pop().expect("one request yields one outcome"))
     }
 
+    /// Copy `shard` to `dest`, returning the `(epoch, lsn)` it represents.
+    ///
+    /// The follower installs this and resumes from `lsn + 1`. Everything committed before
+    /// the snapshot is inside the file; everything after arrives as frames.
+    pub fn snapshot(&self, shard: ShardId, dest: &Path) -> Result<(u64, u64)> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::Snapshot {
+                shard,
+                dest: dest.to_path_buf(),
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
     /// Open the shard's writer connection if it is not already open.
     ///
     /// Readers call this before opening their own connection for a cold shard.
@@ -235,6 +266,11 @@ impl WriterFleet {
         }
     }
 
+    /// The primary's stream identity, if capture is on.
+    pub fn positions(&self) -> Option<&Arc<StreamPositions>> {
+        self.positions.as_ref()
+    }
+
     pub fn checkpoint_counters(&self) -> &Arc<CheckpointCounters> {
         &self.checkpoint_counters
     }
@@ -253,6 +289,13 @@ impl WriterFleet {
 
 impl Drop for WriterFleet {
     fn drop(&mut self) {
+        // Record the stream position before the threads stop. Without this the next run
+        // cannot trust its LSNs, bumps the epoch, and forces every follower to re-bootstrap.
+        if let Some(p) = &self.positions
+            && let Err(e) = p.mark_clean()
+        {
+            eprintln!("meshdb WARN: could not persist stream position: {e}");
+        }
         for tx in self.senders.drain(..) {
             let _ = tx.send(Job::Shutdown);
         }
@@ -273,6 +316,7 @@ struct ThreadCtx {
     capture: bool,
     max_retained_bytes: usize,
     sink: Option<Arc<dyn FrameSink>>,
+    positions: Option<Arc<StreamPositions>>,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
 }
@@ -295,6 +339,10 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
                 continue;
             }
+            Job::Snapshot { shard, dest, reply } => {
+                let _ = reply.send(take_snapshot(&mut open, &ctx, shard, &dest));
+                continue;
+            }
             Job::Shutdown => return,
         }
 
@@ -309,6 +357,9 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 }
                 Ok(Job::EnsureOpen { shard, reply }) => {
                     let _ = reply.send(ensure_shard(&mut open, &ctx, shard).map(|_| ()));
+                }
+                Ok(Job::Snapshot { shard, dest, reply }) => {
+                    let _ = reply.send(take_snapshot(&mut open, &ctx, shard, &dest));
                 }
                 Ok(Job::Shutdown) => {
                     // Honour it only after the batch in hand commits — dropping it would
@@ -396,6 +447,43 @@ fn apply_shard_batch(
     }
 }
 
+/// Copy a shard at a known stream position, on the writer thread.
+fn take_snapshot(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    shard: ShardId,
+    dest: &Path,
+) -> Result<(u64, u64)> {
+    let entry = ensure_shard(open, ctx, shard)?;
+
+    // Order matters. Ship everything captured so far, so the frames the follower will
+    // receive begin exactly after this snapshot; then fold the WAL into the main file, so
+    // the bytes we copy contain all of it.
+    drain_capture(entry, ctx, shard)?;
+    entry
+        .conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_err(crate::Error::Sqlite)?;
+
+    let (epoch, lsn) = match &ctx.positions {
+        Some(p) => (p.epoch(), p.last_allocated(shard)),
+        None => (0, 0),
+    };
+
+    let src = shard.path(&ctx.dir);
+    std::fs::copy(&src, dest).map_err(|e| {
+        Error::Manifest(format!(
+            "snapshotting {} to {}: {e}",
+            src.display(),
+            dest.display()
+        ))
+    })?;
+
+    Ok((epoch, lsn))
+}
+
 /// Hand this shard's committed frames to the sink.
 fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Result<()> {
     let Some(capture) = &entry.capture else {
@@ -416,8 +504,24 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
     if txns.is_empty() {
         return Ok(());
     }
+
+    // Positions are assigned here, on the writer thread, so they are dense and ordered by
+    // construction — the follower's ability to detect loss depends on that density.
+    let (epoch, first) = match &ctx.positions {
+        Some(p) => (p.epoch(), p.allocate(shard, txns.len())),
+        None => (0, 1),
+    };
+    let positioned: Vec<StreamTxn> = txns
+        .into_iter()
+        .enumerate()
+        .map(|(i, txn)| StreamTxn {
+            lsn: first + i as u64,
+            txn,
+        })
+        .collect();
+
     match &ctx.sink {
-        Some(sink) => sink.accept(shard, txns),
+        Some(sink) => sink.accept(shard, epoch, positioned),
         // Capture on with no sink: drop them, having proven they were captured. Only
         // sensible for measuring capture's cost, which is why `NullSink` is named as it is.
         None => Ok(()),

@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use meshdb::config::{CheckpointConfig, PragmaProfile};
 use meshdb::error::Error;
+use meshdb::replication::StreamTxn;
 use meshdb::replication::{FrameSink, MemorySink, NullSink};
 use meshdb::shard::writer_fleet::WriterFleet;
 use meshdb::shard::{ShardConfig, ShardId};
 use meshdb::storage::Value;
 use meshdb::storage::exec::{Executed, Outcome, Statement};
-use meshdb::vfs::{self, CommittedTxn};
+use meshdb::vfs;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -126,8 +127,9 @@ fn a_follower_is_reconstructed_from_what_the_sink_received() {
     w.execute_one(S0, "DELETE FROM t WHERE id % 3 = 0").unwrap();
     w.execute_one(S0, "CREATE INDEX idx_v ON t(v)").unwrap();
 
-    let txns: Vec<CommittedTxn> = sink.take(S0);
-    assert!(!txns.is_empty(), "sink should have received the changes");
+    let stream: Vec<StreamTxn> = sink.take(S0);
+    assert!(!stream.is_empty(), "sink should have received the changes");
+    let txns: Vec<_> = stream.into_iter().map(|s| s.txn).collect();
     vfs::apply_to_db_file(&follower, &txns).unwrap();
 
     // Fold the primary's WAL in so the two files are comparable.

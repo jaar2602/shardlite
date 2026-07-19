@@ -273,6 +273,16 @@ impl ShardManager {
         &self.manifest
     }
 
+    /// Snapshot `shard` to `dest`, returning the `(epoch, lsn)` it represents.
+    pub fn snapshot(&self, shard: ShardId, dest: &Path) -> crate::Result<(u64, u64)> {
+        self.writers.snapshot(shard, dest)
+    }
+
+    /// The primary's stream epoch, if capture is on.
+    pub fn epoch(&self) -> Option<u64> {
+        self.writers.positions().map(|p| p.epoch())
+    }
+
     /// Bring a shard's file into existence if it does not yet exist.
     pub fn ensure_open(&self, shard: ShardId) -> crate::Result<()> {
         self.writers.ensure_open(shard)

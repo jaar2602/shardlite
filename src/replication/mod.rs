@@ -14,11 +14,16 @@
 //! back to clients through the mechanism that already exists, rather than through a second
 //! one invented for replication.
 
+pub mod follower;
+pub mod stream;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use follower::{Follower, Need, Position};
+pub use stream::{Lsn, StreamPositions, StreamTxn};
+
 use crate::shard::ShardId;
-use crate::vfs::CommittedTxn;
 
 /// A destination for committed frames.
 ///
@@ -27,12 +32,13 @@ use crate::vfs::CommittedTxn;
 /// backpressure, but it means a network sink should hand off to its own thread rather than
 /// block on a round trip.
 pub trait FrameSink: Send + Sync {
-    /// Accept committed transactions for one shard, in commit order.
+    /// Accept committed transactions for one shard, in commit order, positioned within
+    /// `epoch`.
     ///
     /// Returning `Err` means the sink is unhealthy. The writer treats that as fatal for the
     /// node: the local database has committed data the sink never received, which is
     /// precisely the divergence physical replication exists to prevent.
-    fn accept(&self, shard: ShardId, txns: Vec<CommittedTxn>) -> crate::Result<()>;
+    fn accept(&self, shard: ShardId, epoch: u64, txns: Vec<StreamTxn>) -> crate::Result<()>;
 }
 
 /// Discards everything, counting as it goes.
@@ -62,11 +68,11 @@ impl NullSink {
 }
 
 impl FrameSink for NullSink {
-    fn accept(&self, _shard: ShardId, txns: Vec<CommittedTxn>) -> crate::Result<()> {
-        let frames: u64 = txns.iter().map(|t| t.frames.len() as u64).sum();
+    fn accept(&self, _shard: ShardId, _epoch: u64, txns: Vec<StreamTxn>) -> crate::Result<()> {
+        let frames: u64 = txns.iter().map(|t| t.txn.frames.len() as u64).sum();
         let bytes: u64 = txns
             .iter()
-            .flat_map(|t| t.frames.iter())
+            .flat_map(|t| t.txn.frames.iter())
             .map(|f| f.data.len() as u64)
             .sum();
         self.txns.fetch_add(txns.len() as u64, Ordering::Relaxed);
@@ -81,7 +87,7 @@ impl FrameSink for NullSink {
 /// Unbounded by construction — only for test workloads whose size is known.
 #[derive(Debug, Default)]
 pub struct MemorySink {
-    inner: Mutex<std::collections::BTreeMap<ShardId, Vec<CommittedTxn>>>,
+    inner: Mutex<std::collections::BTreeMap<ShardId, Vec<StreamTxn>>>,
 }
 
 impl MemorySink {
@@ -89,7 +95,7 @@ impl MemorySink {
         Self::default()
     }
 
-    pub fn take(&self, shard: ShardId) -> Vec<CommittedTxn> {
+    pub fn take(&self, shard: ShardId) -> Vec<StreamTxn> {
         self.inner
             .lock()
             .expect("sink mutex")
@@ -117,7 +123,7 @@ impl MemorySink {
 }
 
 impl FrameSink for MemorySink {
-    fn accept(&self, shard: ShardId, txns: Vec<CommittedTxn>) -> crate::Result<()> {
+    fn accept(&self, shard: ShardId, _epoch: u64, txns: Vec<StreamTxn>) -> crate::Result<()> {
         self.inner
             .lock()
             .expect("sink mutex")
@@ -125,5 +131,29 @@ impl FrameSink for MemorySink {
             .or_default()
             .extend(txns);
         Ok(())
+    }
+}
+
+/// Applies the stream directly to a local [`Follower`].
+///
+/// In-process replication: enough to prove the loop converges without a network in the way.
+/// A network sink replaces this without changing anything upstream of it.
+pub struct FollowerSink {
+    follower: std::sync::Arc<Follower>,
+}
+
+impl FollowerSink {
+    pub fn new(follower: std::sync::Arc<Follower>) -> Self {
+        Self { follower }
+    }
+
+    pub fn follower(&self) -> &std::sync::Arc<Follower> {
+        &self.follower
+    }
+}
+
+impl FrameSink for FollowerSink {
+    fn accept(&self, shard: ShardId, epoch: u64, txns: Vec<StreamTxn>) -> crate::Result<()> {
+        self.follower.apply(shard, epoch, &txns)
     }
 }

@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 8 of 12 · **Status:** sharded single-node engine with WAL capture wired to a sink; floor profile measured
+**Updated:** 2026-07-19 · **Steps complete:** 9 of 12 · **Status:** primary/follower replication converges in-process; no network transport yet
 
 ---
 
@@ -29,13 +29,13 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 5 | Shard manager (LRU, thread affinity) | **done** | `tests/shard.rs` (9) + `src/shard/` (6) |
 | 6 | Benchmarks + cgroup memory test | **done** | `benches/write_throughput.rs`, `src/bin/memcheck.rs`, `scripts/bench.sh` |
 | 7 | VFS capture productionized | **done** | `tests/capture_wiring.rs` (9) |
-| 8 | Replication + per-shard bootstrap | not started | **unblocked** |
+| 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | not started | |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**70 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
+**84 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,24 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Replication (`src/replication/`)
+A follower applies **pages, never SQL** — the reason physical replication was chosen, since
+nothing it does can be non-deterministic.
+
+Every transaction carries a position `(epoch, lsn)`. `lsn` is dense within an epoch, and
+density is what makes loss detectable: a jump means frames are missing, and the follower
+refuses rather than applying across the hole. `epoch` covers the case density cannot — a
+primary that restarts without knowing where it stopped bumps it, forcing re-bootstrap,
+because guessing at continuity risks undetectable corruption. A **clean** shutdown persists
+the position so the common restart continues the same epoch and no data is re-copied.
+
+Follower crash safety rests on idempotence: pages are fsynced, *then* the position is
+recorded. A crash between them replays transactions, which is harmless because writing the
+same page twice gives the same page. The reverse order would silently skip them.
+
+Bootstrap runs on the writer thread — ship pending frames, checkpoint, record the position,
+copy — so it is atomic with respect to writes and the follower resumes at exactly `lsn + 1`.
 
 ### Frame capture and sinks (`src/replication/`, wired in `shard/writer_fleet.rs`)
 Shard writer connections can be routed through the capture VFS, with committed frames
@@ -161,6 +179,13 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **Retention bounded by one batch** | `retention_stays_bounded_because_the_writer_drains_every_batch` |
 | Overflow fails writes, never drops frames | `overflow_fails_writes_rather_than_dropping_frames` |
 | Capture does not change the on-disk file | `captured_and_uncaptured_databases_are_identical_on_disk` |
+| **Follower converges byte-identically with its primary** | `a_follower_converges_with_its_primary` |
+| **A gap is refused, not applied across** | `a_gap_is_refused_rather_than_applied_across` |
+| Bootstrap then stream, resuming at exactly `lsn+1` | `a_follower_bootstraps_from_a_snapshot_and_then_streams` |
+| A clean restart continues the stream | `a_clean_restart_continues_the_stream_without_rebootstrap` |
+| An unclean restart bumps the epoch | `an_unclean_shutdown_bumps_the_epoch_and_forces_rebootstrap` |
+| An empty follower may join at LSN 1, but not mid-stream | `an_empty_follower_may_join_a_stream_at_its_beginning`, `an_empty_follower_cannot_join_mid_stream` |
+| Every shard is an independent stream | `every_shard_converges_independently` |
 
 ### Benchmarks — 1 CPU / 1 GB container, real fsync (~1.5 ms)
 
@@ -285,7 +310,10 @@ the trace comparison (`take_trace()`) before trusting capture.
 | `busy_timeout` ordering fix is unproven | Moving it before lock-taking statements is correct on its own merits, but neither test discriminates it — both pass with the bug reintroduced. The 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
 | Overflow is per-shard and sticky | Once raised the shard refuses writes until the process restarts; no recovery path yet |
-| No sink ships anywhere | `NullSink` discards and `MemorySink` is for tests; a network sink is step 8 |
+| **No network transport** | Replication is proven in-process only; `FollowerSink` applies locally. A real sink needs the server |
+| No follower-driven catch-up loop | The primary pushes; a follower that falls behind cannot ask for a range |
+| Bootstrap copies the whole shard file | No incremental or resumable copy; a large shard blocks its writer thread for the duration |
+| Snapshot blocks the writer thread | `take_snapshot` runs inline, so one shard's bootstrap stalls every shard on that thread |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 

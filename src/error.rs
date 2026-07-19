@@ -92,6 +92,20 @@ pub enum Error {
     #[error("{0}")]
     Manifest(String),
 
+    /// A follower was handed frames it cannot place in its stream.
+    #[error(
+        "replication gap on {shard}: expected LSN {expected}, got {got} ({detail}). \
+         Applying across a gap writes pages without their predecessors, which produces a \
+         database that is silently wrong rather than obviously broken, so the shard must be \
+         re-bootstrapped instead."
+    )]
+    ReplicationGap {
+        shard: String,
+        expected: u64,
+        got: u64,
+        detail: String,
+    },
+
     /// The replication stream is incomplete; the node must stop accepting writes.
     #[error(
         "capture for {shard} exceeded its retention limit with {retained} bytes unconsumed. \
