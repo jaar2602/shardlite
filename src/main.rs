@@ -131,13 +131,18 @@ fn repl(db: &Db) -> ExitCode {
                 continue;
             }
             ".stats" => {
-                let s = db.stats();
+                let w = db.writer_stats();
+                let r = db.reader_stats();
                 println!(
-                    "batches={} requests={} max_batch={} mean_batch={:.2}",
-                    s.batches,
-                    s.requests,
-                    s.max_batch,
-                    s.mean_batch()
+                    "writer: batches={} requests={} max_batch={} mean_batch={:.2}",
+                    w.batches,
+                    w.requests,
+                    w.max_batch,
+                    w.mean_batch()
+                );
+                println!(
+                    "reader: threads={} queries={} rejected_busy={} timed_out={}",
+                    r.threads, r.queries, r.rejected_busy, r.timed_out
                 );
                 continue;
             }

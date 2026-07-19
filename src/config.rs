@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 /// Which kind of connection a [`PragmaProfile`] configures.
 ///
@@ -39,6 +40,38 @@ impl Synchronous {
             Synchronous::Normal => "NORMAL",
             Synchronous::Full => "FULL",
             Synchronous::Extra => "EXTRA",
+        }
+    }
+}
+
+/// Sizing for the reader pool.
+#[derive(Debug, Clone)]
+pub struct ReaderPoolConfig {
+    /// Reader threads, each owning one connection.
+    ///
+    /// Not `num_cpus`: WAL reads are CPU and page-cache bound, so oversubscribing buys
+    /// context switches and multiplies `cache_size` by the thread count. On the floor
+    /// profile — one core shared by three containers — a floor of 4 would be pure churn.
+    pub threads: usize,
+
+    /// Bounded queue depth. When it fills, queries are **rejected** rather than queued,
+    /// so overload surfaces as a fast error instead of unbounded memory and latency.
+    pub queue_capacity: usize,
+
+    /// Per-query wall-clock cap.
+    ///
+    /// Bounding reader lifetime is not just about latency: a checkpoint cannot advance
+    /// past the end mark of any active reader, so a pathological query left running can
+    /// stall checkpointing and grow the WAL without limit (step 4).
+    pub query_timeout: Duration,
+}
+
+impl ReaderPoolConfig {
+    pub fn floor() -> Self {
+        Self {
+            threads: 2,
+            queue_capacity: 256,
+            query_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -95,6 +128,19 @@ impl PragmaProfile {
             foreign_keys: true,
             synchronous: Synchronous::Full,
             soft_heap_limit: 48 * 1024 * 1024,
+        }
+    }
+
+    /// Profile for the statement-classification connection.
+    ///
+    /// This connection only ever calls `prepare` to ask SQLite whether a statement is
+    /// read-only; it never steps a query. So it gets a deliberately tiny page cache —
+    /// paying a full reader's 4 MiB for something that never reads a data page would be
+    /// waste at a 150 MB budget.
+    pub fn classifier_floor() -> Self {
+        Self {
+            cache_size: -256, // 256 KiB
+            ..Self::reader_floor()
         }
     }
 

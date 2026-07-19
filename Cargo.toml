@@ -17,6 +17,11 @@ edition = "2024"
 rusqlite = { version = "=0.40.1", features = ["bundled", "hooks", "backup", "limits", "functions", "trace"] }
 libsqlite3-sys = "=0.38.1"
 thiserror = "2.0"
+# mpmc, so N reader threads can share one receiver and race to take work. `std::sync::mpsc`
+# receivers cannot be shared, and `Arc<Mutex<Receiver>>` deadlocks: a reader blocking in
+# `recv` while holding the lock starves every other reader. Default features off (drops
+# the async/select machinery); the async half is available when the network server needs it.
+flume = { version = "0.12.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

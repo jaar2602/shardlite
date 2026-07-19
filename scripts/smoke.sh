@@ -105,7 +105,11 @@ echo
 echo "interactive shell"
 assert_contains "repl runs sql"    "ada"      bash -c "printf 'SELECT name FROM users WHERE id=1\n.quit\n' | $BIN $DB"
 assert_contains "repl .tables"     "users"    bash -c "printf '.tables\n.quit\n' | $BIN $DB"
-assert_contains "repl .stats"      "mean_batch" bash -c "printf '.stats\n.quit\n' | $BIN $DB"
+assert_contains "repl .stats writer" "mean_batch" bash -c "printf '.stats\n.quit\n' | $BIN $DB"
+assert_contains "repl .stats reader" "threads=2"  bash -c "printf '.stats\n.quit\n' | $BIN $DB"
+# Reads must be served by the pool, not by the writer thread.
+assert_contains "select counted as a reader query" "queries=1" \
+    bash -c "printf 'SELECT 1\n.stats\n.quit\n' | $BIN $DB"
 
 echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"

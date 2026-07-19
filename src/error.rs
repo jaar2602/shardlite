@@ -48,4 +48,17 @@ pub enum Error {
 
     #[error("unsupported statement: {0}")]
     Unsupported(String),
+
+    /// Deliberate backpressure: the bounded read queue is full. Retry, or shed load.
+    #[error("reader pool is busy, the query queue is full")]
+    ReaderPoolBusy,
+
+    #[error("the reader pool is no longer running")]
+    ReaderPoolGone,
+
+    #[error("query exceeded the {timeout:?} time limit and was cancelled")]
+    QueryTimeout { timeout: std::time::Duration },
+
+    #[error("the statement classifier is poisoned; a previous caller panicked holding it")]
+    ClassifierPoisoned,
 }

@@ -1,32 +1,46 @@
-//! A single-database facade: routes each statement to the writer or to a reader.
-//!
-//! The reader here is one connection. The bounded reader *pool* is step 3; this is enough
-//! to run SQL end to end and to exercise the writer.
+//! A single-database facade: routes each statement to the writer or to the reader pool.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 
-use crate::config::PragmaProfile;
+use crate::config::{PragmaProfile, ReaderPoolConfig};
 use crate::error::{Error, Result};
-use crate::storage::exec::{self, Outcome, SqlError};
+use crate::storage::exec::Outcome;
 use crate::storage::open::open_reader;
+use crate::storage::reader::{ReaderPool, ReaderStats};
 use crate::storage::writer::{Writer, WriterHandle, WriterStats};
 
 pub struct Db {
     writer: Writer,
-    reader: Connection,
+    readers: ReaderPool,
+    /// Used only to ask SQLite whether a statement is read-only, never to run one.
+    ///
+    /// It cannot come from the pool: classification has to happen *before* routing, and
+    /// borrowing a pool connection to decide where to send the work would occupy a reader
+    /// for every write too. Behind a `Mutex` so `Db` stays `Sync` — `Connection` is not.
+    classifier: Mutex<Connection>,
     path: PathBuf,
 }
 
 impl Db {
-    /// Open `path`, starting its writer thread and one reader connection.
+    /// Open `path` with the floor profile: one writer thread and a small reader pool.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, &ReaderPoolConfig::floor())
+    }
+
+    pub fn open_with(path: &Path, pool: &ReaderPoolConfig) -> Result<Self> {
+        // Order matters and is enforced by the token: the writer materializes the
+        // -wal/-shm sidecars that read-only connections cannot create.
         let (writer, token) = Writer::spawn(path, &PragmaProfile::writer_floor())?;
-        let reader = open_reader(path, &PragmaProfile::reader_floor(), &token)?;
+        let readers = ReaderPool::spawn(path, &PragmaProfile::reader_floor(), pool, &token)?;
+        let classifier = open_reader(path, &PragmaProfile::classifier_floor(), &token)?;
+
         Ok(Self {
             writer,
-            reader,
+            readers,
+            classifier: Mutex::new(classifier),
             path: path.to_path_buf(),
         })
     }
@@ -35,8 +49,12 @@ impl Db {
         &self.path
     }
 
-    pub fn stats(&self) -> WriterStats {
+    pub fn writer_stats(&self) -> WriterStats {
         self.writer.stats()
+    }
+
+    pub fn reader_stats(&self) -> ReaderStats {
+        self.readers.stats()
     }
 
     pub fn handle(&self) -> WriterHandle {
@@ -47,36 +65,36 @@ impl Db {
     pub fn run(&self, sql: &str) -> Result<Outcome> {
         reject_unsupported(sql)?;
 
-        // PRAGMA reports as a write even when it only reads, so route it to the reader
+        // PRAGMA reports as a write even when it only reads, so route it to a reader
         // explicitly. `query_only = ON` there means a PRAGMA that tries to *set*
-        // something fails with a clear error instead of silently applying to a connection
-        // nobody else uses.
+        // something fails with a clear error rather than silently applying to one
+        // connection nobody else uses.
         if first_keyword(sql) == "PRAGMA" {
-            return self.read(sql);
+            return self.readers.query(sql);
         }
 
-        // Ask SQLite to classify rather than pattern-matching SQL text. A read-only
-        // connection can still *prepare* a write statement, which is what makes this
-        // possible before routing. A prepare failure is a real error (syntax, unknown
-        // table); let the writer path report it properly.
-        let readonly = match self.reader.prepare(sql) {
-            Ok(stmt) => stmt.readonly(),
-            Err(_) => false,
-        };
-
-        if readonly {
-            self.read(sql)
+        if self.is_readonly(sql)? {
+            self.readers.query(sql)
         } else {
             self.writer.handle().execute_one(sql)
         }
     }
 
-    fn read(&self, sql: &str) -> Result<Outcome> {
-        match exec::run(&self.reader, sql) {
-            Ok(executed) => Ok(Outcome::Ok(executed)),
-            Err(SqlError::Logic(msg)) => Ok(Outcome::Rejected(msg)),
-            Err(SqlError::Fatal(e)) => Err(Error::Sqlite(e)),
-        }
+    /// Ask SQLite to classify the statement rather than pattern-matching its text.
+    ///
+    /// A read-only connection can still *prepare* a write statement — `query_only` only
+    /// blocks execution — which is what makes classification-before-routing possible. A
+    /// prepare failure is a genuine error (syntax, unknown table); route it to the writer
+    /// so the failure is reported through the normal path with its real message.
+    fn is_readonly(&self, sql: &str) -> Result<bool> {
+        let conn = self
+            .classifier
+            .lock()
+            .map_err(|_| Error::ClassifierPoisoned)?;
+        Ok(match conn.prepare(sql) {
+            Ok(stmt) => stmt.readonly(),
+            Err(_) => false,
+        })
     }
 }
 
