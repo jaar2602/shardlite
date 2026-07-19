@@ -15,6 +15,7 @@ pub mod durability;
 pub mod election;
 pub mod fence;
 pub mod node;
+pub mod placement;
 pub mod promotion;
 pub mod term;
 
@@ -24,5 +25,6 @@ pub use election::{
 };
 pub use fence::{Fence, FenceStats, FenceToken};
 pub use node::{ClusterNode, ClusterStats, DurabilitySource};
+pub use placement::Placement;
 pub use promotion::Promotion;
 pub use term::{NodeId, Term, TermStore};

@@ -579,7 +579,7 @@ fn apply_shard_batch(
     // leader that discovers its state only afterwards has already written to a file another
     // node may now own.
     if let Some(gate) = &ctx.gate
-        && let Err(e) = gate.check_may_write()
+        && let Err(e) = gate.check_may_write(shard)
     {
         for p in group {
             let _ = p.reply.send(Err(e.clone_shallow()));

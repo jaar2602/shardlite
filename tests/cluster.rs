@@ -146,6 +146,9 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             Arc::clone(&fence),
             peers,
             Arc::clone(&manager) as Arc<dyn DurabilitySource>,
+            // Stage one of multi-write: a single leader takes every shard. Placement narrows
+            // this to a per-node assignment.
+            (0..2).map(ShardId).collect(),
         ));
 
         let server = Arc::new(
@@ -213,12 +216,12 @@ fn three_nodes_elect_exactly_one_leader() {
 
     // Only the leader may write.
     assert!(
-        leader.cluster.fence().is_open(),
+        leader.cluster.fence().is_open(ShardId(0)),
         "the leader's write gate must be open"
     );
     for f in &followers {
         assert!(
-            !f.cluster.fence().is_open(),
+            !f.cluster.fence().is_open(ShardId(0)),
             "follower {} must not be permitted to write",
             f.id
         );
@@ -258,7 +261,7 @@ fn killing_the_leader_elects_a_new_one_within_the_budget() {
         "a new leader must hold a later term: {} vs {first_term}",
         second.cluster.term()
     );
-    assert!(second.cluster.fence().is_open());
+    assert!(second.cluster.fence().is_open(ShardId(0)));
     println!(
         "failover in {took:?}, term {first_term} -> {}",
         second.cluster.term()
@@ -276,7 +279,7 @@ fn a_deposed_leader_is_fenced_and_stops_writing() {
     let nodes = cluster(3);
     let first = await_leader(&nodes, Duration::from_secs(5)).expect("no initial leader");
     let old_token = FenceToken::new(first.cluster.term(), first.id);
-    assert!(first.cluster.fence().is_open());
+    assert!(first.cluster.fence().is_open(ShardId(0)));
 
     first.stop();
     let survivors: Vec<Arc<Node>> = nodes
@@ -324,7 +327,7 @@ fn a_node_that_cannot_reach_a_quorum_does_not_lead() {
         "a minority of one must not lead a three-node cluster"
     );
     assert!(
-        !alone.cluster.fence().is_open(),
+        !alone.cluster.fence().is_open(ShardId(0)),
         "and its write gate must be shut"
     );
 
@@ -498,43 +501,6 @@ fn a_hung_peer_cannot_freeze_the_election_loop() {
 }
 
 #[test]
-fn only_the_leader_can_write() {
-    // The gate, wired end to end. For one commit this mechanism existed, was tested in
-    // isolation, and was consulted by nothing — a follower would happily have executed a
-    // write against a shard the leader owns.
-    let nodes = cluster(3);
-    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
-
-    // The leader may write.
-    leader
-        .manager
-        .execute_all_shards(meshdb::storage::exec::Statement::new(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
-        ))
-        .unwrap();
-
-    // A follower must not, even asked directly, bypassing the network entirely.
-    let follower = nodes.iter().find(|n| n.id != leader.id).unwrap();
-    assert!(!follower.cluster.fence().is_open());
-    let err = follower
-        .manager
-        .execute_one(
-            ShardId(0),
-            meshdb::storage::exec::Statement::new("INSERT INTO t VALUES (1)"),
-        )
-        .expect_err("a follower must refuse writes");
-    assert!(err.to_string().contains("not the leader"), "{err}");
-    assert!(
-        follower.cluster.fence().stats().gated_writes > 0,
-        "the refusal must be counted, not silently absorbed"
-    );
-
-    for n in &nodes {
-        n.stop();
-    }
-}
-
-#[test]
 fn a_deposed_leader_stops_writing() {
     // The self-fencing half. A deposed leader that keeps committing locally diverges its own
     // copy even if every follower refuses its frames — so the gate has to shut the writer
@@ -547,7 +513,7 @@ fn a_deposed_leader_stops_writing() {
             "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
         ))
         .unwrap();
-    assert!(leader.cluster.fence().is_open());
+    assert!(leader.cluster.fence().is_open(ShardId(0)));
 
     // Cut it off from the cluster; its lease expires and it must fence itself.
     for n in nodes.iter().filter(|n| n.id != leader.id) {
@@ -555,11 +521,11 @@ fn a_deposed_leader_stops_writing() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while leader.cluster.fence().is_open() && Instant::now() < deadline {
+    while leader.cluster.fence().is_open(ShardId(0)) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        !leader.cluster.fence().is_open(),
+        !leader.cluster.fence().is_open(ShardId(0)),
         "a leader that lost its quorum must shut its own write gate"
     );
 
@@ -571,6 +537,197 @@ fn a_deposed_leader_stops_writing() {
         )
         .expect_err("a deposed leader must refuse to write, even locally");
     assert!(err.to_string().contains("not the leader"), "{err}");
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+/// Wait until placement has spread shards over more than one node.
+fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<meshdb::cluster::Placement> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        for n in live {
+            let p = n.cluster.placement();
+            if p.leaders().len() > 1 {
+                return Some(p);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+#[test]
+fn shards_are_led_by_different_nodes() {
+    // The headline goal. Until now one leader owned every shard, so writes still serialised
+    // onto a single node however many nodes were running.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5))
+        .expect("placement never spread shards across nodes");
+
+    assert!(
+        placement.leaders().len() > 1,
+        "shards must be led by more than one node: {placement:?}"
+    );
+    for s in 0..2u32 {
+        assert!(
+            placement.owner(ShardId(s)).is_some(),
+            "shard {s} has no leader"
+        );
+    }
+    println!("{placement:?}");
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_node_writes_only_the_shards_placement_gave_it() {
+    // Two nodes both writing the same shard is the corruption everything else guards
+    // against, so the gate has to follow the map exactly.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+
+    // Let every node settle on the same map.
+    std::thread::sleep(Duration::from_millis(400));
+
+    for n in &nodes {
+        let mine = placement.shards_for(n.id);
+        for s in 0..2u32 {
+            let shard = ShardId(s);
+            let should_lead = mine.contains(&shard);
+            assert_eq!(
+                n.cluster.fence().is_open(shard),
+                should_lead,
+                "node {} gate for {shard} is wrong: placement says owner is {:?}",
+                n.id,
+                placement.owner(shard)
+            );
+        }
+    }
+
+    // And exactly one node accepts a write to any given shard.
+    for s in 0..2u32 {
+        let shard = ShardId(s);
+        let accepted = nodes
+            .iter()
+            .filter(|n| {
+                n.manager
+                    .execute_one(
+                        shard,
+                        meshdb::storage::exec::Statement::new(
+                            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
+                        ),
+                    )
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(
+            accepted, 1,
+            "exactly one node must accept a write to {shard}, {accepted} did"
+        );
+    }
+
+    let gated: u64 = nodes
+        .iter()
+        .map(|n| n.cluster.fence().stats().gated_writes)
+        .sum();
+    assert!(
+        gated > 0,
+        "refusing a write to an unowned shard must be counted, not silently absorbed"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn losing_a_node_reassigns_its_shards() {
+    // A shard whose owner is gone must be given to someone. Otherwise placement has traded a
+    // single point of failure for several.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Kill a node that is not the coordinator, so the coordinator survives to react.
+    let victim = nodes
+        .iter()
+        .find(|n| n.id != leader.id && !n.cluster.led_shards().is_empty())
+        .cloned();
+    let Some(victim) = victim else {
+        for n in &nodes {
+            n.stop();
+        }
+        return;
+    };
+    let orphaned = victim.cluster.led_shards();
+    victim.stop();
+
+    // The coordinator should notice and reassign.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut covered = false;
+    while Instant::now() < deadline && !covered {
+        let p = leader.cluster.placement();
+        covered = orphaned
+            .iter()
+            .all(|s| p.owner(*s).is_some_and(|o| o != victim.id));
+        if !covered {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        covered,
+        "shards {orphaned:?} were left with a dead owner: {:?}",
+        leader.cluster.placement()
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn cross_shard_ddl_is_broken_by_placement_and_this_records_it() {
+    // A real regression that multi-write introduced, asserted rather than left to be
+    // discovered. `execute_all_shards` is a *local* operation: it applies a statement to
+    // every shard this node holds. Once placement spreads shards across nodes, no node leads
+    // them all, so no node can apply DDL to them all — schema changes have no working path.
+    //
+    // The fix is fan-out to each shard's owner, which needs the placement map at the routing
+    // layer. This test fails the moment that lands, which is the intent: it is a marker, not
+    // an endorsement.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let results: Vec<(u64, bool)> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id,
+                n.manager
+                    .execute_all_shards(meshdb::storage::exec::Statement::new(
+                        "CREATE TABLE ddl (a INTEGER) STRICT",
+                    ))
+                    .is_ok(),
+            )
+        })
+        .collect();
+    println!("execute_all_shards per node: {results:?}");
+
+    assert!(
+        results.iter().all(|(_, ok)| !ok),
+        "a node applied DDL to every shard: {results:?}. If placement now routes DDL to \
+         each shard's owner, this test has served its purpose and should be replaced with \
+         one asserting that DDL succeeds."
+    );
 
     for n in &nodes {
         n.stop();

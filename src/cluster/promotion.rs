@@ -107,7 +107,7 @@ impl Promotion {
         }
 
         // Last: the gate opens only once every file is genuinely this node's.
-        self.fence.open(term);
+        self.fence.open_for(&self.shards, term);
         tracing::info!(term, shards = self.shards.len(), "promoted to leader");
         Ok(())
     }

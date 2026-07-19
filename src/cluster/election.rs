@@ -110,6 +110,11 @@ pub struct VoteReply {
 pub struct Heartbeat {
     pub term: Term,
     pub leader: NodeId,
+    /// Who leads which shard. Carried on the heartbeat rather than fetched separately: the
+    /// heartbeat already proves the sender is the current coordinator, so the map arrives
+    /// with its authority attached and there is no window where a node has one without the
+    /// other.
+    pub placement: super::placement::Placement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -654,8 +659,15 @@ mod tests {
 
         // A heartbeat from a newer leader ends this one, immediately.
         let reply =
-            n.e.on_heartbeat(&Heartbeat { term: 5, leader: 2 }, t0)
-                .unwrap();
+            n.e.on_heartbeat(
+                &Heartbeat {
+                    term: 5,
+                    leader: 2,
+                    placement: Default::default(),
+                },
+                t0,
+            )
+            .unwrap();
         assert!(reply.ok);
         assert_eq!(n.e.role(), Role::Follower);
         assert_eq!(n.e.term(), 5);
@@ -672,8 +684,15 @@ mod tests {
         n.e.tick(t0 + past_timeout() * 2, &d).unwrap(); // term 2
 
         let reply =
-            n.e.on_heartbeat(&Heartbeat { term: 1, leader: 9 }, t0)
-                .unwrap();
+            n.e.on_heartbeat(
+                &Heartbeat {
+                    term: 1,
+                    leader: 9,
+                    placement: Default::default(),
+                },
+                t0,
+            )
+            .unwrap();
         assert!(!reply.ok);
         assert_eq!(reply.term, 2, "the sender must learn the real term");
     }
@@ -782,8 +801,15 @@ mod tests {
         let mut t = t0;
         for _ in 0..10 {
             t += Duration::from_millis(400);
-            n.e.on_heartbeat(&Heartbeat { term: 1, leader: 2 }, t)
-                .unwrap();
+            n.e.on_heartbeat(
+                &Heartbeat {
+                    term: 1,
+                    leader: 2,
+                    placement: Default::default(),
+                },
+                t,
+            )
+            .unwrap();
             assert_eq!(n.e.tick(t, &d).unwrap(), None);
         }
         assert_eq!(n.e.role(), Role::Follower);

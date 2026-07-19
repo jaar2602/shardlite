@@ -44,8 +44,13 @@ pub use writer_fleet::{WriterFleet, WriterFleetStats};
 /// way only — cluster knows about shards, shards do not know about cluster. It also lets a
 /// standalone deployment pass nothing at all rather than construct a cluster it does not have.
 pub trait WriteGate: Send + Sync {
-    /// `Err` means this node may not write. Checked before the transaction, not after.
-    fn check_may_write(&self) -> crate::Result<()>;
+    /// `Err` means this node may not write **this shard**. Checked before the transaction,
+    /// not after.
+    ///
+    /// Per shard rather than per node because a node leads some shards and follows others —
+    /// that is what multi-write means. A node-wide answer would let a node that leads any
+    /// shard write every shard.
+    fn check_may_write(&self, shard: ShardId) -> crate::Result<()>;
 }
 
 /// Identifies one shard — one SQLite file, with one writer.

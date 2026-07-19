@@ -33,10 +33,10 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | **done** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `tests/promotion.rs` (5) + `src/cluster/` (44) |
-| 11 | Shard placement + move | not started | |
+| 11 | Shard placement + move | **multi-write delivered; DDL routing outstanding** | `tests/cluster.rs` (13) + `src/cluster/placement.rs` (7) |
 | 12 | Read consistency levels | not started | |
 
-**207 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**214 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -602,6 +602,47 @@ Three bugs found by testing, each verified non-vacuous by removing the fix:
 | A hung peer froze the election loop | Cluster RPCs inherited the client's 30 s read timeout. A peer that is *hung* rather than crashed — backlogged, paused, half-partitioned — accepts the connection and never answers, blocking the leader in a socket read for 30 s. A leader frozen that long never evaluates its lease, never steps down, and **keeps its write gate open the whole time** — the exact split-brain the lease exists to prevent. Peer round trips are now bounded at a third of the election timeout, on both connect and I/O. |
 | Adopting a higher term reset the election timer | A candidate that can never win, because the election restriction refuses it, would suppress the whole cluster forever: each time it stood it bumped the term, every peer reset its timer, and no qualified node ever got to stand. A leaderless cluster with no visible cause. |
 | A stopping node kept answering heartbeats | `stop()` ended a node's own loop but its server kept acknowledging leadership on connections already open, so a leader that had genuinely lost its cluster kept being told it still had one. Departure has to be visible to peers, not only to the departing node. |
+
+### Step 11: multi-write, and what it broke
+
+**The headline goal is delivered.** Shards are led by different nodes, so several nodes accept
+writes at once. Measured on a three-node cluster: `{shard_0: node_1, shard_1: node_2}`.
+
+Chosen shape: **one coordinator, not one Raft group per shard.** Per-shard groups would mean
+64 election state machines and 64x the heartbeat traffic on a third of a CPU. The single
+elected leader computes the map and publishes it on the heartbeat, so the map arrives with
+its authority already proven. The coordinator is **not in the write path** — clients reach a
+shard's primary directly, and if the coordinator dies existing primaries keep accepting
+writes while only *changes* to the map stall.
+
+The map is **derived, not stored**: recomputed from (live members, shard count, term) rather
+than replicated. That keeps the plan's promise that the Raft log carries only membership and
+leadership, and means a new coordinator computes a map rather than recovering one. The cost
+is that assignments move when the live set changes — recorded honestly in
+`losing_a_member_reassigns_its_shards_and_only_its_shards`, which measures the churn rather
+than asserting a stability the modulo scheme does not provide.
+
+The write gate became **per shard**. A node-wide flag cannot express "leads some, follows
+others", and would have let a node that led any shard write every shard.
+
+**What multi-write broke: cross-shard DDL.** `execute_all_shards` is a *local* operation —
+it applies a statement to every shard **this node holds**. Once shards are spread, no node
+holds them all, so schema changes have no working path. Measured: all three nodes fail.
+`cross_shard_ddl_is_broken_by_placement_and_this_records_it` asserts the breakage so it
+cannot be forgotten, and is written to fail the moment DDL routing lands.
+
+The fix is fan-out to each shard's owner, which needs the placement map at the routing layer.
+That is the next piece, and it is a prerequisite for calling step 11 done.
+
+**Also outstanding for step 11:** placement decides *ownership*, but nothing yet drives
+`Promotion` from it — a node told to lead a shard opens the gate without first checking its
+copy is current. Wiring placement to promotion closes that.
+
+### A correction
+
+Earlier revisions of this document, and commit `eedb82e`, said **207 tests**. The real figure
+at that commit was **202** — an `awk` miscount on my part, not a loss of tests. Counts here
+are now taken from summing `test result` lines directly.
 
 ### Known flaky test
 

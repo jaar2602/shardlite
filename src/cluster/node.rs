@@ -28,6 +28,7 @@ use crate::net::Client;
 use super::durability::Durability;
 use super::election::{Action, Election, Heartbeat, HeartbeatReply, Role, VoteReply, VoteRequest};
 use super::fence::Fence;
+use super::placement::Placement;
 use super::term::NodeId;
 
 /// Where this node's durability comes from.
@@ -74,6 +75,15 @@ pub struct ClusterNode {
     /// Cached connections, rebuilt on failure.
     links: Mutex<BTreeMap<NodeId, Client>>,
     durability: Arc<dyn DurabilitySource>,
+    /// Every shard in the cluster. The coordinator spreads these across live members; a
+    /// node opens write gates only for the ones assigned to it.
+    shards: Vec<crate::shard::ShardId>,
+    /// The assignment currently in force on this node.
+    placement: Mutex<Placement>,
+    /// Peers that answered the most recent heartbeat round. The coordinator assigns shards
+    /// only to members it can currently reach — a shard assigned to a node that is gone has
+    /// no leader at all, which is worse than an uneven spread.
+    live: Mutex<std::collections::BTreeSet<NodeId>>,
     /// Bound on every peer round trip. Deliberately a fraction of the election timeout: a
     /// peer that is hung rather than dead must look dead before the lease is due, or the
     /// leader is still blocked in a socket read at the moment it should be stepping down.
@@ -89,6 +99,7 @@ impl ClusterNode {
         fence: Arc<Fence>,
         peers: BTreeMap<NodeId, String>,
         durability: Arc<dyn DurabilitySource>,
+        shards: Vec<crate::shard::ShardId>,
     ) -> Self {
         // A third of the election timeout: long enough to survive ordinary scheduling noise,
         // short enough that both peers can be tried and the lease still evaluated on time.
@@ -100,6 +111,9 @@ impl ClusterNode {
             peers,
             links: Mutex::new(BTreeMap::new()),
             durability,
+            shards,
+            placement: Mutex::new(Placement::default()),
+            live: Mutex::new(std::collections::BTreeSet::new()),
             peer_timeout,
             counters: Counters::default(),
             stop: AtomicBool::new(false),
@@ -140,6 +154,56 @@ impl ClusterNode {
             votes_granted: self.counters.votes_granted.load(Ordering::Relaxed),
             votes_refused: self.counters.votes_refused.load(Ordering::Relaxed),
         }
+    }
+
+    /// The assignment this node is currently acting on.
+    pub fn placement(&self) -> Placement {
+        self.placement.lock().expect("placement mutex").clone()
+    }
+
+    /// Shards this node currently leads.
+    pub fn led_shards(&self) -> Vec<crate::shard::ShardId> {
+        self.fence.led_shards()
+    }
+
+    /// Adopt an assignment: open write gates for the shards it gives this node, and close
+    /// every other.
+    ///
+    /// [`Fence::open_for`] replaces the whole set, so a shard taken away is closed without
+    /// this having to compute the difference — the subtraction that would otherwise be easy
+    /// to miss, leaving this node writing a shard another node now owns.
+    fn apply_placement(&self, p: &Placement) {
+        let mine = p.shards_for(self.id);
+        {
+            let mut current = self.placement.lock().expect("placement mutex");
+            if *current == *p {
+                return;
+            }
+            *current = p.clone();
+        }
+        tracing::info!(
+            node = self.id,
+            term = p.term,
+            leads = mine.len(),
+            of = p.assignments.len(),
+            "applying placement"
+        );
+        self.fence.open_for(&mine, p.term);
+    }
+
+    /// Compute the assignment this node would publish as coordinator.
+    fn plan(&self, term: u64) -> Placement {
+        let mut members: Vec<NodeId> = self
+            .live
+            .lock()
+            .expect("live mutex")
+            .iter()
+            .copied()
+            .collect();
+        // Always include self: a coordinator is by definition reachable from itself, and a
+        // leader that excluded itself would assign away every shard on the first round.
+        members.push(self.id);
+        Placement::balanced(self.shards.len() as u32, &members, term)
     }
 
     pub fn stop(&self) {
@@ -187,9 +251,12 @@ impl ClusterNode {
             Action::Heartbeat(term) => self.beat(term, now)?,
             Action::BecameLeader(term) => {
                 self.counters.became_leader.fetch_add(1, Ordering::Relaxed);
-                // Open the gate only after the election is won. This is what makes this node
-                // able to write at all.
-                self.fence.open(term);
+                // A new coordinator publishes an assignment rather than seizing every shard.
+                // On the first round no peer has answered yet, so it takes everything and
+                // gives shards back as peers reply — which is safe, being the leader, and
+                // self-correcting within a heartbeat.
+                let plan = self.plan(term);
+                self.apply_placement(&plan);
                 // Beat immediately so followers learn who leads without waiting out a timeout.
                 self.beat(term, now)?;
             }
@@ -230,16 +297,27 @@ impl ClusterNode {
     }
 
     fn beat(&self, term: u64, now: Instant) -> Result<()> {
+        // Recompute before sending, so a member that appeared or vanished last round is
+        // reflected in the map this round.
+        let plan = self.plan(term);
+        self.apply_placement(&plan);
+
         let hb = Heartbeat {
             term,
             leader: self.id,
+            placement: plan,
         };
+
+        let mut answered = std::collections::BTreeSet::new();
         for (&peer, addr) in &self.peers {
             self.counters
                 .heartbeats_sent
                 .fetch_add(1, Ordering::Relaxed);
             let reply: Option<HeartbeatReply> = self.ask(peer, addr, |c| c.heartbeat(&hb));
             let Some(reply) = reply else { continue };
+            if reply.ok {
+                answered.insert(peer);
+            }
 
             let action = {
                 let mut e = self.election.lock().expect("election mutex");
@@ -251,6 +329,7 @@ impl ClusterNode {
                 return Ok(());
             }
         }
+        *self.live.lock().expect("live mutex") = answered;
         Ok(())
     }
 
@@ -339,6 +418,14 @@ impl ClusterNode {
     /// A peer claims leadership. Called by the server.
     pub fn handle_heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatReply> {
         self.check_participating()?;
+
+        // Adopt the assignment only from a coordinator that is at least as current as this
+        // node. A map from an older term comes from a coordinator that has been deposed, and
+        // its opinion about who owns what is exactly what fencing exists to reject.
+        if hb.term >= self.term() && hb.placement.term >= self.placement().term {
+            self.apply_placement(&hb.placement);
+        }
+
         let (reply, deposed) = {
             let mut e = self.election.lock().expect("election mutex");
             let was_leader = e.is_leader();

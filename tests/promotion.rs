@@ -214,7 +214,7 @@ fn a_promoted_follower_serves_writes_on_the_data_it_replicated() {
     // The primary is gone. This node takes over.
     r.promotion.promote(7).unwrap();
     assert_eq!(r.manager.mode(S0), ShardMode::Led);
-    assert!(r.fence.is_open());
+    assert!(r.fence.is_open(S0));
     assert!(!r.replica.is_running(), "the pull loop must have stopped");
     let _ = stop;
 
@@ -280,7 +280,10 @@ fn demotion_closes_connections_rather_than_merely_stopping_writes() {
             .is_err(),
         "a reader must not keep serving a followed shard from a cached connection"
     );
-    assert!(!r.fence.is_open(), "and writes must have been gated first");
+    assert!(
+        !r.fence.is_open(S0),
+        "and writes must have been gated first"
+    );
 }
 
 #[test]
@@ -342,7 +345,7 @@ fn promotion_refuses_rather_than_racing_a_running_pull_loop() {
         .expect_err("promotion must refuse while the pull loop is still running");
     assert!(err.to_string().contains("did not come to rest"), "{err}");
     assert!(
-        !r.fence.is_open(),
+        !r.fence.is_open(S0),
         "a refused promotion must not leave the write gate open"
     );
     assert_eq!(
