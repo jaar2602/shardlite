@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::storage::exec::{self, Outcome, SqlError};
+use crate::storage::exec::{self, Outcome, SqlError, Statement};
 
 /// Apply `groups` as a **single** transaction, isolating each group with a SAVEPOINT.
 ///
@@ -19,7 +19,7 @@ use crate::storage::exec::{self, Outcome, SqlError};
 /// continuing would commit a batch on a node that cannot be trusted.
 pub fn batch(
     conn: &mut Connection,
-    groups: &[Vec<String>],
+    groups: &[Vec<Statement>],
 ) -> std::result::Result<Vec<Vec<Outcome>>, String> {
     // IMMEDIATE takes the write lock at BEGIN rather than on first write, so a problem
     // surfaces before any work is done instead of midway through the batch.
@@ -32,10 +32,10 @@ pub fn batch(
     for group in groups {
         let mut outcomes = Vec::with_capacity(group.len());
 
-        for sql in group {
+        for statement in group {
             let sp = tx.savepoint().map_err(|e| e.to_string())?;
 
-            match exec::run(&sp, sql) {
+            match exec::run(&sp, statement) {
                 Ok(executed) => {
                     sp.commit().map_err(|e| e.to_string())?;
                     outcomes.push(Outcome::Ok(executed));

@@ -94,6 +94,19 @@ pub struct ShardConfig {
 
     /// Open reader connections **per thread**. Multiply by `reader_threads`.
     pub open_readers_per_thread: usize,
+
+    /// Depth of each writer thread's submission queue.
+    ///
+    /// Bounded for the same reason the read queue is: an unbounded channel does not remove
+    /// a backlog, it holds it in memory and turns overload into climbing latency and an
+    /// eventual OOM.
+    ///
+    /// Note what this does **not** currently protect against. Callers block until their
+    /// batch commits, so in-flight requests can never exceed the number of concurrent
+    /// callers — a 1024-deep queue cannot fill from 32 threads. The bound only starts
+    /// doing real work when callers stop blocking, which is what a network server will do.
+    /// It is here now because adding it later would change the API of every write path.
+    pub write_queue_depth: usize,
 }
 
 impl ShardConfig {
@@ -111,6 +124,7 @@ impl ShardConfig {
             open_writers_per_thread: 8,
             reader_threads: 2,
             open_readers_per_thread: 8,
+            write_queue_depth: 1024,
         }
     }
 
@@ -131,6 +145,11 @@ impl ShardConfig {
         if self.writer_threads == 0 || self.reader_threads == 0 {
             return Err(crate::Error::ShardConfig(
                 "writer_threads and reader_threads must be at least 1".into(),
+            ));
+        }
+        if self.write_queue_depth == 0 {
+            return Err(crate::Error::ShardConfig(
+                "write_queue_depth must be at least 1".into(),
             ));
         }
         if self.open_writers_per_thread == 0 || self.open_readers_per_thread == 0 {
@@ -216,20 +235,24 @@ impl ShardManager {
     pub fn execute(
         &self,
         shard: ShardId,
-        sqls: Vec<String>,
+        statements: Vec<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<crate::storage::exec::Outcome>> {
-        self.writers.execute(shard, sqls)
+        self.writers.execute(shard, statements)
     }
 
     pub fn execute_one(
         &self,
         shard: ShardId,
-        sql: &str,
+        sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<crate::storage::exec::Outcome> {
         self.writers.execute_one(shard, sql)
     }
 
-    pub fn query(&self, shard: ShardId, sql: &str) -> crate::Result<crate::storage::exec::Outcome> {
+    pub fn query(
+        &self,
+        shard: ShardId,
+        sql: impl Into<crate::storage::exec::Statement>,
+    ) -> crate::Result<crate::storage::exec::Outcome> {
         self.readers.query(shard, sql)
     }
 
@@ -240,12 +263,13 @@ impl ShardManager {
     /// must be reported, not swallowed.
     pub fn execute_all_shards(
         &self,
-        sql: &str,
+        sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<(ShardId, crate::storage::exec::Outcome)>> {
+        let statement = sql.into();
         let mut out = Vec::with_capacity(self.cfg.shard_count as usize);
         for s in 0..self.cfg.shard_count {
             let id = ShardId(s);
-            out.push((id, self.writers.execute_one(id, sql)?));
+            out.push((id, self.writers.execute_one(id, statement.clone())?));
         }
         Ok(out)
     }

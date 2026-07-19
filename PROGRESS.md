@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**54 Rust tests + 26 CLI assertions. Clippy clean, fmt clean.**
+**59 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,11 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Data-directory manifest (`src/shard/manifest.rs`)
+`shard_count` is immutable — changing it re-routes every key — so it is recorded at
+creation and any later disagreement is refused at open, naming both values. A boring
+line-based text file: readable with `cat`, no serialization dependency.
 
 ### Shard manager (`src/shard/`)
 Virtual shards fixed at creation (default 64, range 1–256), never split — rebalancing moves
@@ -134,6 +139,10 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | Routing hash is pinned against change | `routing_is_stable_and_spread` |
 | LRU never exceeds capacity; failed opens uncached | `never_exceeds_capacity`, `a_failed_open_is_not_cached` |
 | Untouched shards create no files | `only_touched_shards_create_files` |
+| **Manifest refuses a changed shard count** | `refuses_a_different_shard_count` |
+| **Parameters bind, never interpolate** | `parameters_are_bound_not_interpolated` |
+| Every `Value` kind round-trips | `every_value_kind_round_trips_through_binding` |
+| **Write queue sheds load when full** | `a_full_write_queue_sheds_load_instead_of_growing` |
 
 ### Measured, not assumed
 
@@ -162,6 +171,11 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 - **An LRU multiplies per-connection cache by its capacity.** 16 open writer connections at
   the single-database 8 MiB would be 128 MB — the whole container budget. Sharded profiles
   use 1 MiB writers and 512 KiB readers for this reason alone.
+- **A blocking request/reply API caps queue depth at the caller count.** The write queue
+  bound was initially untestable for this reason: 32 threads cannot fill a 1024-deep queue
+  when each blocks until its batch commits. The first version of the backpressure test
+  passed while shedding **zero** writes — it would have passed identically against an
+  unbounded channel. Caught only by printing the number rather than asserting on it.
 - **The VFS write pattern itself is clean**: header then page data, no odd-sized writes, in
   the workloads traced. `WalCapture::take_trace()` reproduces this analysis when the bundled
   SQLite version is bumped.
@@ -199,22 +213,25 @@ the trace comparison (`take_trace()`) before trusting capture.
 | Gap | Impact |
 |---|---|
 | No structured logging — `eprintln!` only | Not operable as a service |
-| No `Value` params; SQL is string-formatted | Injection-unsafe for untrusted callers; needed for determinism rewriting |
 | `first_keyword` guard cannot see past a leading comment | `-- x\nBEGIN` slips through. Real guard is the authorizer (step 8) |
 | No `VACUUM` path | Rejected outright; needs an out-of-transaction maintenance mode |
 | Checkpoint test suite takes ~20s | Real fsyncs; acceptable but the slowest thing in CI |
-| Writer has no backpressure | Unbounded `mpsc`; readers shed load but writers do not |
 | Capture holds an uncommitted txn fully in memory | A huge single transaction is unbounded; needs a spill or cap |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
-| CLI and `Db` still use the single-database path | `ShardManager` is not wired into the CLI yet; two code paths until it is |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
-| Shard count is not persisted in a manifest | Nothing yet refuses a config whose `shard_count` disagrees with existing data |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
+
+### Debt deliberately deferred
+
+These do not get harder with time, so they were left rather than done now: structured
+logging (still `eprintln!`), a `VACUUM` maintenance path, a cross-shard query planner, and
+the ~20s checkpoint test suite.
 
 ### Design decisions not yet made
 
-- **Shard count default** (64 proposed, 16–256). Immutable after cluster creation and caps
-  ultimate scale — the one number a user cannot revise.
+- **Shard count default.** Now enforced by the manifest, but the *default* is still open:
+  the CLI uses 1 for usability, `ShardConfig::floor()` uses 64. A user who accepts the CLI
+  default and later needs to scale must migrate.
 - **Single-node 3-container mode:** buys rolling upgrades, not availability. Does not
   survive host failure, disk failure, or OOM. At a few hundred GB it also costs 3× disk and
   3× write I/O. Needs an explicit decision on whether it is supported at scale.

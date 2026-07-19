@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use rusqlite::Connection;
@@ -20,7 +20,7 @@ use crate::config::{CheckpointConfig, PragmaProfile};
 use crate::error::{Error, Result};
 use crate::storage::apply;
 use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
-use crate::storage::exec::Outcome;
+use crate::storage::exec::{Outcome, Statement};
 use crate::storage::open::open_writer;
 
 /// Upper bound on statements merged into one shard's transaction.
@@ -28,7 +28,7 @@ const MAX_REQUESTS_PER_TXN: usize = 64;
 
 struct Pending {
     shard: ShardId,
-    sqls: Vec<String>,
+    statements: Vec<Statement>,
     reply: SyncSender<Result<Vec<Outcome>>>,
 }
 
@@ -94,7 +94,7 @@ impl WriterFleetStats {
 }
 
 pub struct WriterFleet {
-    senders: Vec<mpsc::Sender<Job>>,
+    senders: Vec<SyncSender<Job>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
@@ -119,7 +119,7 @@ impl WriterFleet {
         let mut threads = Vec::with_capacity(cfg.writer_threads);
 
         for i in 0..cfg.writer_threads {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = sync_channel(cfg.write_queue_depth);
             let ctx = ThreadCtx {
                 dir: dir.to_path_buf(),
                 profile: profile.clone(),
@@ -145,7 +145,7 @@ impl WriterFleet {
         })
     }
 
-    fn sender(&self, shard: ShardId) -> Result<&mpsc::Sender<Job>> {
+    fn sender(&self, shard: ShardId) -> Result<&SyncSender<Job>> {
         if shard.0 >= self.cfg.shard_count {
             return Err(Error::ShardConfig(format!(
                 "{shard} is outside the configured {} shards",
@@ -156,20 +156,26 @@ impl WriterFleet {
     }
 
     /// Submit statements to one shard and block until its batch commits.
-    pub fn execute(&self, shard: ShardId, sqls: Vec<String>) -> Result<Vec<Outcome>> {
+    ///
+    /// Returns [`Error::WriterBusy`] immediately if the queue is full, rather than blocking
+    /// — the same load-shedding contract the reader fleet offers.
+    pub fn execute(&self, shard: ShardId, statements: Vec<Statement>) -> Result<Vec<Outcome>> {
         let (reply_tx, reply_rx) = sync_channel(1);
         self.sender(shard)?
-            .send(Job::Write(Pending {
+            .try_send(Job::Write(Pending {
                 shard,
-                sqls,
+                statements,
                 reply: reply_tx,
             }))
-            .map_err(|_| Error::WriterGone)?;
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Error::WriterBusy,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Error::WriterGone,
+            })?;
         reply_rx.recv().map_err(|_| Error::WriterGone)?
     }
 
-    pub fn execute_one(&self, shard: ShardId, sql: &str) -> Result<Outcome> {
-        let mut out = self.execute(shard, vec![sql.to_string()])?;
+    pub fn execute_one(&self, shard: ShardId, sql: impl Into<Statement>) -> Result<Outcome> {
+        let mut out = self.execute(shard, vec![sql.into()])?;
         Ok(out.pop().expect("one request yields one outcome"))
     }
 
@@ -178,6 +184,8 @@ impl WriterFleet {
     /// Readers call this before opening their own connection for a cold shard.
     pub fn ensure_open(&self, shard: ShardId) -> Result<()> {
         let (reply_tx, reply_rx) = sync_channel(1);
+        // Blocking `send`, unlike a write: this is a rare cold-path call that must
+        // succeed, and the queue is bounded so waiting cannot grow memory.
         self.sender(shard)?
             .send(Job::EnsureOpen {
                 shard,
@@ -260,11 +268,11 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
 
         // Drain whatever else has already queued. This is what produces group commit:
         // everything that arrived while the previous COMMIT was fsyncing gets absorbed.
-        let mut requests = pending[0].sqls.len();
+        let mut requests = pending[0].statements.len();
         while requests < MAX_REQUESTS_PER_TXN {
             match rx.try_recv() {
                 Ok(Job::Write(p)) => {
-                    requests += p.sqls.len();
+                    requests += p.statements.len();
                     pending.push(p);
                 }
                 Ok(Job::EnsureOpen { shard, reply }) => {
@@ -327,7 +335,7 @@ fn apply_shard_batch(
         }
     };
 
-    let groups: Vec<Vec<String>> = group.iter().map(|p| p.sqls.clone()).collect();
+    let groups: Vec<Vec<Statement>> = group.iter().map(|p| p.statements.clone()).collect();
 
     match apply::batch(&mut entry.conn, &groups) {
         Ok(results) => {

@@ -36,6 +36,69 @@ impl Value {
     }
 }
 
+impl rusqlite::ToSql for Value {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::ToSqlOutput;
+        Ok(match self {
+            Value::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+            Value::Integer(i) => ToSqlOutput::Borrowed(ValueRef::Integer(*i)),
+            Value::Real(f) => ToSqlOutput::Borrowed(ValueRef::Real(*f)),
+            Value::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
+            Value::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
+        })
+    }
+}
+
+/// A statement and its bound parameters.
+///
+/// Parameters are **bound**, never interpolated into the SQL text. Two reasons, and the
+/// second is the one that is easy to overlook:
+///
+/// 1. String-formatted values are an injection hazard the moment any input is untrusted.
+/// 2. Replication needs to rewrite non-deterministic calls — `random()`, `datetime('now')`
+///    — into fixed values decided once by the primary. Binding is how those values travel
+///    without re-parsing or re-quoting the statement, so the parameter channel has to exist
+///    before that work can start.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Statement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+impl Statement {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    pub fn with_params(sql: impl Into<String>, params: Vec<Value>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
+impl From<&str> for Statement {
+    fn from(sql: &str) -> Self {
+        Self::new(sql)
+    }
+}
+
+impl From<String> for Statement {
+    fn from(sql: String) -> Self {
+        Self::new(sql)
+    }
+}
+
+impl From<&String> for Statement {
+    fn from(sql: &String) -> Self {
+        Self::new(sql.clone())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -134,11 +197,12 @@ pub fn classify(e: rusqlite::Error) -> SqlError {
 }
 
 /// Execute one statement, returning either its rows or its change counts.
-pub fn run(conn: &Connection, sql: &str) -> Result<Executed, SqlError> {
-    let mut stmt = conn.prepare(sql).map_err(classify)?;
+pub fn run(conn: &Connection, statement: &Statement) -> Result<Executed, SqlError> {
+    let mut stmt = conn.prepare(&statement.sql).map_err(classify)?;
+    let params = rusqlite::params_from_iter(statement.params.iter());
 
     if stmt.column_count() == 0 {
-        stmt.execute([]).map_err(classify)?;
+        stmt.execute(params).map_err(classify)?;
         return Ok(Executed::Changed(WriteOutcome {
             rows_affected: conn.changes(),
             last_insert_rowid: conn.last_insert_rowid(),
@@ -149,7 +213,7 @@ pub fn run(conn: &Connection, sql: &str) -> Result<Executed, SqlError> {
     let width = columns.len();
 
     let mut rows = Vec::new();
-    let mut cursor = stmt.query([]).map_err(classify)?;
+    let mut cursor = stmt.query(params).map_err(classify)?;
     while let Some(row) = cursor.next().map_err(classify)? {
         let mut out = Vec::with_capacity(width);
         for i in 0..width {

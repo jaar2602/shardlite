@@ -41,6 +41,10 @@ pub enum Error {
     #[error("the writer thread is no longer running")]
     WriterGone,
 
+    /// Deliberate backpressure: the bounded write queue is full. Retry, or shed load.
+    #[error("writer is busy, the submission queue is full")]
+    WriterBusy,
+
     /// The whole transaction was rolled back, so no request in the batch took effect —
     /// including requests that had already succeeded against their savepoints.
     #[error("transaction aborted, no writes in this batch were applied: {reason}")]

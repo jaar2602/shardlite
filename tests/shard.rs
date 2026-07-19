@@ -38,7 +38,7 @@ fn writes_and_reads_route_to_the_same_shard() {
     for i in 0..500 {
         let key = format!("key-{i}");
         let shard = m.route(key.as_bytes());
-        m.execute_one(shard, &format!("INSERT INTO t VALUES ('{key}', {i})"))
+        m.execute_one(shard, format!("INSERT INTO t VALUES ('{key}', {i})"))
             .unwrap();
     }
 
@@ -47,7 +47,7 @@ fn writes_and_reads_route_to_the_same_shard() {
         let key = format!("key-{i}");
         let shard = m.route(key.as_bytes());
         let out = m
-            .query(shard, &format!("SELECT v FROM t WHERE k = '{key}'"))
+            .query(shard, format!("SELECT v FROM t WHERE k = '{key}'"))
             .unwrap();
         assert_eq!(scalar(&out), i, "key {key} missing from {shard}");
     }
@@ -78,7 +78,7 @@ fn sixty_four_shards_are_served_by_a_bounded_number_of_connections() {
         for s in 0..cfg.shard_count {
             m.execute_one(
                 ShardId(s),
-                &format!("INSERT INTO t VALUES ('r{round}-s{s}', {s})"),
+                format!("INSERT INTO t VALUES ('r{round}-s{s}', {s})"),
             )
             .unwrap();
         }
@@ -145,19 +145,20 @@ fn a_reopened_shard_still_serves_readers() {
         open_writers_per_thread: 2, // tiny, to force constant eviction
         reader_threads: 1,
         open_readers_per_thread: 2,
+        write_queue_depth: 1024,
     };
     let dir = TempDir::new().unwrap();
     let m = manager(&dir, cfg.clone());
 
     for s in 0..cfg.shard_count {
-        m.execute_one(ShardId(s), &format!("INSERT INTO t VALUES ('k{s}', {s})"))
+        m.execute_one(ShardId(s), format!("INSERT INTO t VALUES ('k{s}', {s})"))
             .unwrap();
     }
 
     // Read them back in an order that guarantees each shard was long since evicted.
     for s in 0..cfg.shard_count {
         let out = m
-            .query(ShardId(s), &format!("SELECT v FROM t WHERE k = 'k{s}'"))
+            .query(ShardId(s), format!("SELECT v FROM t WHERE k = 'k{s}'"))
             .unwrap();
         assert_eq!(
             scalar(&out),
@@ -168,11 +169,8 @@ fn a_reopened_shard_still_serves_readers() {
 
     // And writes still work after all that reopening.
     for s in 0..cfg.shard_count {
-        m.execute_one(
-            ShardId(s),
-            &format!("INSERT INTO t VALUES ('late{s}', {s})"),
-        )
-        .unwrap();
+        m.execute_one(ShardId(s), format!("INSERT INTO t VALUES ('late{s}', {s})"))
+            .unwrap();
     }
     for s in 0..cfg.shard_count {
         assert_eq!(
@@ -208,7 +206,7 @@ fn concurrent_writers_across_shards() {
                     let key = format!("t{t}-i{i}");
                     let shard = m.route(key.as_bytes());
                     if !matches!(
-                        m.execute_one(shard, &format!("INSERT INTO t VALUES ('{key}', {i})")),
+                        m.execute_one(shard, format!("INSERT INTO t VALUES ('{key}', {i})")),
                         Ok(Outcome::Ok(_))
                     ) {
                         failures.fetch_add(1, Ordering::Relaxed);

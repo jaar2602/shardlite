@@ -20,6 +20,7 @@ fn one_shard() -> ShardConfig {
         open_writers_per_thread: 1,
         reader_threads: 1,
         open_readers_per_thread: 1,
+        write_queue_depth: 1024,
     }
 }
 
@@ -60,7 +61,8 @@ fn write_rows(h: &WriterFleet, start: i64, n: i64) {
         let stmts: Vec<String> = (chunk_start..chunk_end)
             .map(|i| format!("INSERT INTO t VALUES ({i}, '{pad}')"))
             .collect();
-        h.execute(S0, stmts).unwrap();
+        h.execute(S0, stmts.iter().map(Into::into).collect())
+            .unwrap();
     }
 }
 

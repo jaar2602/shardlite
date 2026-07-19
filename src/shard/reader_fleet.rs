@@ -20,12 +20,12 @@ use super::writer_fleet::WriterFleet;
 use super::{ShardConfig, ShardId};
 use crate::config::{PragmaProfile, ReaderPoolConfig};
 use crate::error::{Error, Result};
-use crate::storage::exec::{self, Outcome, SqlError};
+use crate::storage::exec::{self, Outcome, SqlError, Statement};
 use crate::storage::open::open_reader_existing;
 
 struct Job {
     shard: ShardId,
-    sql: String,
+    statement: Statement,
     reply: SyncSender<Result<Outcome>>,
 }
 
@@ -98,7 +98,7 @@ impl ReaderFleet {
     }
 
     /// Run a read-only statement against one shard on the next free reader.
-    pub fn query(&self, shard: ShardId, sql: &str) -> Result<Outcome> {
+    pub fn query(&self, shard: ShardId, sql: impl Into<Statement>) -> Result<Outcome> {
         let (reply_tx, reply_rx) = sync_channel(1);
         let tx = self.tx.as_ref().ok_or(Error::ReaderPoolGone)?;
 
@@ -106,7 +106,7 @@ impl ReaderFleet {
         // latency queue held in caller threads instead of in memory.
         tx.try_send(Job {
             shard,
-            sql: sql.to_string(),
+            statement: sql.into(),
             reply: reply_tx,
         })
         .map_err(|e| match e {
@@ -159,7 +159,7 @@ fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
         ctx.counters.queries.fetch_add(1, Ordering::Relaxed);
 
         let result = match ensure_shard(&mut open, &ctx, job.shard) {
-            Ok(conn) => run_with_deadline(conn, &job.sql, ctx.timeout, &ctx.counters),
+            Ok(conn) => run_with_deadline(conn, &job.statement, ctx.timeout, &ctx.counters),
             Err(e) => Err(e),
         };
         let _ = job.reply.send(result);
@@ -216,13 +216,13 @@ fn ensure_shard<'a>(
 
 fn run_with_deadline(
     conn: &Connection,
-    sql: &str,
+    statement: &Statement,
     timeout: Duration,
     counters: &Counters,
 ) -> Result<Outcome> {
     let start = Instant::now();
     conn.progress_handler(10_000, Some(move || start.elapsed() > timeout))?;
-    let result = exec::run(conn, sql);
+    let result = exec::run(conn, statement);
     conn.progress_handler(10_000, None::<fn() -> bool>)?;
 
     match result {
