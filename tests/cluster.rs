@@ -49,6 +49,7 @@ struct Pending {
     dir: TempDir,
     manager: Arc<ShardManager>,
     frames: Arc<FrameLog>,
+    fence: Arc<Fence>,
     probe: Arc<Server>,
     addr: String,
 }
@@ -65,8 +66,12 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             total_bytes: 4 * 1024 * 1024,
             shard_count: 2,
         }));
+        // The fence is built first so it can be handed to the manager as the write gate.
+        // Without that the gate is a mechanism nothing consults, and a deposed leader keeps
+        // writing.
+        let fence = Arc::new(Fence::new((i + 1) as NodeId, 0));
         let manager = Arc::new(
-            ShardManager::open_with_sink(
+            ShardManager::open_clustered(
                 dir.path(),
                 ShardConfig {
                     shard_count: 2,
@@ -74,15 +79,19 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
                     ..ShardConfig::floor()
                 },
                 Some(frames.clone()),
+                None,
+                Some(Arc::clone(&fence) as Arc<dyn meshdb::shard::WriteGate>),
             )
             .unwrap(),
         );
         // Bound to port 0 now; the cluster node is attached below, once every address exists.
         let server = Arc::new(
-            Server::bind_full(
+            Server::bind_with(
                 Arc::clone(&manager),
-                Some(Arc::clone(&frames)),
-                None,
+                meshdb::net::NodeServices {
+                    frames: Some(Arc::clone(&frames)),
+                    ..Default::default()
+                },
                 ServerConfig {
                     addr: "127.0.0.1:0".into(),
                     ..ServerConfig::default()
@@ -96,6 +105,7 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             dir,
             manager,
             frames,
+            fence,
             probe: server,
             addr,
         });
@@ -111,6 +121,7 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         dir,
         manager,
         frames,
+        fence,
         probe,
         addr,
     } in built
@@ -123,7 +134,6 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             .collect();
 
         let terms = TermStore::open(&dir.path().join("cluster")).unwrap();
-        let fence = Arc::new(Fence::new(id, 0));
         let election = Election::new(
             quick(id, peers.keys().copied().collect()),
             terms,
@@ -139,10 +149,13 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         ));
 
         let server = Arc::new(
-            Server::bind_full(
+            Server::bind_with(
                 Arc::clone(&manager),
-                Some(frames),
-                Some(Arc::clone(&cluster)),
+                meshdb::net::NodeServices {
+                    frames: Some(frames),
+                    cluster: Some(Arc::clone(&cluster)),
+                    ..Default::default()
+                },
                 ServerConfig {
                     addr: addr.clone(),
                     ..ServerConfig::default()
@@ -482,4 +495,84 @@ fn a_hung_peer_cannot_freeze_the_election_loop() {
          timeout; a leader would still be inside this read when it should be stepping down"
     );
     println!("hung peer gave up after {took:?}");
+}
+
+#[test]
+fn only_the_leader_can_write() {
+    // The gate, wired end to end. For one commit this mechanism existed, was tested in
+    // isolation, and was consulted by nothing — a follower would happily have executed a
+    // write against a shard the leader owns.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+
+    // The leader may write.
+    leader
+        .manager
+        .execute_all_shards(meshdb::storage::exec::Statement::new(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+        ))
+        .unwrap();
+
+    // A follower must not, even asked directly, bypassing the network entirely.
+    let follower = nodes.iter().find(|n| n.id != leader.id).unwrap();
+    assert!(!follower.cluster.fence().is_open());
+    let err = follower
+        .manager
+        .execute_one(
+            ShardId(0),
+            meshdb::storage::exec::Statement::new("INSERT INTO t VALUES (1)"),
+        )
+        .expect_err("a follower must refuse writes");
+    assert!(err.to_string().contains("not the leader"), "{err}");
+    assert!(
+        follower.cluster.fence().stats().gated_writes > 0,
+        "the refusal must be counted, not silently absorbed"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn a_deposed_leader_stops_writing() {
+    // The self-fencing half. A deposed leader that keeps committing locally diverges its own
+    // copy even if every follower refuses its frames — so the gate has to shut the writer
+    // down, not merely stop anyone listening.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    leader
+        .manager
+        .execute_all_shards(meshdb::storage::exec::Statement::new(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+        ))
+        .unwrap();
+    assert!(leader.cluster.fence().is_open());
+
+    // Cut it off from the cluster; its lease expires and it must fence itself.
+    for n in nodes.iter().filter(|n| n.id != leader.id) {
+        n.stop();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while leader.cluster.fence().is_open() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !leader.cluster.fence().is_open(),
+        "a leader that lost its quorum must shut its own write gate"
+    );
+
+    let err = leader
+        .manager
+        .execute_one(
+            ShardId(0),
+            meshdb::storage::exec::Statement::new("INSERT INTO t VALUES (99)"),
+        )
+        .expect_err("a deposed leader must refuse to write, even locally");
+    assert!(err.to_string().contains("not the leader"), "{err}");
+
+    for n in &nodes {
+        n.stop();
+    }
 }

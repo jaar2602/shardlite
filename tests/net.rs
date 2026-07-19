@@ -301,6 +301,7 @@ fn subscribing_without_capture_says_why() {
     write_message(
         &mut w,
         &Request::Subscribe {
+            node: 0,
             shard: 0,
             epoch: 1,
             from_lsn: 1,

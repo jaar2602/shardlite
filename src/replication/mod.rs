@@ -14,6 +14,7 @@
 //! back to clients through the mechanism that already exists, rather than through a second
 //! one invented for replication.
 
+pub mod ack;
 pub mod bootstrap;
 pub mod follower;
 pub mod log;
@@ -22,6 +23,7 @@ pub mod stream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use ack::{AckStats, AckTracker};
 pub use bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer};
 pub use follower::{Follower, Need, Position};
 pub use log::{FrameLog, FrameLogConfig, FrameLogStats, Served};

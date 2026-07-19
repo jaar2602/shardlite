@@ -12,6 +12,21 @@ impl Error {
                 shard: shard.clone(),
                 retained: *retained,
             },
+            // Must survive intact. Collapsing it into `BatchAborted` would tell the caller
+            // "no writes in this batch were applied" about data that *is* committed locally
+            // — and a caller that believes nothing was applied retries, applying it twice.
+            // The wrapper would contradict the very warning the message carries.
+            Error::NotReplicated {
+                shard,
+                lsn,
+                holders,
+                needed,
+            } => Error::NotReplicated {
+                shard: shard.clone(),
+                lsn: *lsn,
+                holders: *holders,
+                needed: *needed,
+            },
             other => Error::BatchAborted {
                 reason: other.to_string(),
             },
@@ -109,6 +124,18 @@ pub enum Error {
          shutting down"
     )]
     Departed,
+
+    #[error(
+        "{shard} LSN {lsn} is committed on this node but not confirmed by a quorum: {holders} \
+         of {needed} members hold it. The write is durable here and may yet replicate — it \
+         has NOT failed, so retrying it risks applying it twice"
+    )]
+    NotReplicated {
+        shard: String,
+        lsn: u64,
+        holders: usize,
+        needed: usize,
+    },
 
     #[error("{0}")]
     Manifest(String),

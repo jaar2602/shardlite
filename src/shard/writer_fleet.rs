@@ -18,7 +18,7 @@ use super::lru::Lru;
 use super::{ShardConfig, ShardId};
 use crate::config::{CheckpointConfig, PragmaProfile};
 use crate::error::{Error, Result};
-use crate::replication::{FrameSink, StreamPositions, StreamTxn};
+use crate::replication::{FrameSink, Lsn, StreamPositions, StreamTxn};
 use crate::storage::apply;
 use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
 use crate::storage::exec::{Outcome, Statement};
@@ -139,7 +139,7 @@ impl WriterFleet {
         profile: PragmaProfile,
         checkpoint: CheckpointConfig,
     ) -> Result<Self> {
-        Self::spawn_with_sink(dir, cfg, profile, checkpoint, None)
+        Self::spawn_with_sink(dir, cfg, profile, checkpoint, None, None, None)
     }
 
     /// Start the fleet, optionally streaming captured frames to `sink`.
@@ -148,12 +148,15 @@ impl WriterFleet {
     /// a slow sink slows the writer, the bounded write queue fills behind it, and callers
     /// get `WriterBusy`. Backpressure reaches clients through the mechanism that already
     /// exists rather than a second one built for replication.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_sink(
         dir: &Path,
         cfg: ShardConfig,
         profile: PragmaProfile,
         checkpoint: CheckpointConfig,
         sink: Option<Arc<dyn FrameSink>>,
+        acks: Option<Arc<crate::replication::AckTracker>>,
+        gate: Option<Arc<dyn crate::shard::WriteGate>>,
     ) -> Result<Self> {
         cfg.validate()?;
         let positions = if cfg.capture {
@@ -183,6 +186,8 @@ impl WriterFleet {
                 max_retained_bytes: cfg.max_retained_bytes,
                 snapshot_hold_max_wal: cfg.snapshot_hold_max_wal,
                 sink: sink.clone(),
+                acks: acks.clone(),
+                gate: gate.clone(),
                 positions: positions.clone(),
                 counters: Arc::clone(&counters),
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
@@ -400,6 +405,11 @@ struct ThreadCtx {
     max_retained_bytes: usize,
     snapshot_hold_max_wal: u64,
     sink: Option<Arc<dyn FrameSink>>,
+    /// Quorum confirmation. `None` on a standalone node, which must not wait for reports
+    /// that will never come.
+    acks: Option<Arc<crate::replication::AckTracker>>,
+    /// Leadership check. `None` on a standalone node, which always may write.
+    gate: Option<Arc<dyn crate::shard::WriteGate>>,
     positions: Option<Arc<StreamPositions>>,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
@@ -516,6 +526,18 @@ fn apply_shard_batch(
         }
     };
 
+    // Leadership is checked *before* the transaction opens, not after it commits. A deposed
+    // leader that discovers its state only afterwards has already written to a file another
+    // node may now own.
+    if let Some(gate) = &ctx.gate
+        && let Err(e) = gate.check_may_write()
+    {
+        for p in group {
+            let _ = p.reply.send(Err(e.clone_shallow()));
+        }
+        return;
+    }
+
     let groups: Vec<Vec<Statement>> = group.iter().map(|p| p.statements.clone()).collect();
 
     match apply::batch(&mut entry.conn, &groups) {
@@ -523,12 +545,32 @@ fn apply_shard_batch(
             // Drain to the sink BEFORE replying. A caller told its write succeeded must be
             // able to assume the frames reached the replication stream; replying first
             // would acknowledge data the sink may never receive.
-            if let Err(e) = drain_capture(entry, ctx, shard) {
+            let highest = match drain_capture(entry, ctx, shard) {
+                Ok(h) => h,
+                Err(e) => {
+                    for p in group {
+                        let _ = p.reply.send(Err(e.clone_shallow()));
+                    }
+                    return;
+                }
+            };
+
+            // And wait for a majority to hold it before replying. This is what makes the
+            // acknowledgement mean something a future leader will still have: without it a
+            // leader that dies in this window has acknowledged a write nobody else received,
+            // and no election can recover it.
+            //
+            // One wait per batch, not per write — group commit amortises the round trip
+            // across everything queued behind the running transaction.
+            if let (Some(acks), Some(lsn)) = (&ctx.acks, highest)
+                && let Err(e) = acks.wait_for_quorum(shard, lsn)
+            {
                 for p in group {
                     let _ = p.reply.send(Err(e.clone_shallow()));
                 }
                 return;
             }
+
             for (p, outcomes) in group.into_iter().zip(results) {
                 let _ = p.reply.send(Ok(outcomes));
             }
@@ -630,9 +672,9 @@ fn end_snapshot(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> R
 }
 
 /// Hand this shard's committed frames to the sink.
-fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Result<()> {
+fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Result<Option<Lsn>> {
     let Some(capture) = &entry.capture else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Drain first, then check. Frames are never dropped, so an overflow is a backlog rather
@@ -640,7 +682,7 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
     // shard permanently refusing writes even after its sink came back.
     let txns = capture.drain_committed();
     if txns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Positions are assigned here, on the writer thread, so they are dense and ordered by
@@ -710,7 +752,9 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
             retained: capture.retained_bytes(),
         });
     }
-    Ok(())
+    // The last position handed to the sink. What a quorum must hold before any caller in this
+    // batch is told its write succeeded.
+    Ok(Some(first + count as u64 - 1))
 }
 
 /// Get the shard's connection, opening it (and evicting a colder one) if needed.

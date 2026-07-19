@@ -173,6 +173,17 @@ impl Fence {
     }
 }
 
+/// Wiring the gate to the write path.
+///
+/// The trait lives in `shard` so the dependency points one way: cluster knows about shards,
+/// shards do not know about cluster. Without this impl the gate is a mechanism that nothing
+/// consults — which is exactly what it was for one commit.
+impl crate::shard::WriteGate for Fence {
+    fn check_may_write(&self) -> Result<()> {
+        self.check_may_write().map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

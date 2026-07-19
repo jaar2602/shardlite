@@ -38,6 +38,8 @@ fn fleet(dir: &TempDir, cfg: ShardConfig, sink: Option<Arc<dyn FrameSink>>) -> W
         PragmaProfile::writer_shard(),
         CheckpointConfig::floor(),
         sink,
+        None,
+        None,
     )
     .unwrap()
 }

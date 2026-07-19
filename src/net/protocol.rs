@@ -50,6 +50,11 @@ pub enum Request {
     /// A follower asks for what it needs rather than being pushed at, so a follower that
     /// falls behind can catch up instead of being stuck.
     Subscribe {
+        /// Which follower is asking. The request is also its acknowledgement — asking from
+        /// `from_lsn` is proof it holds everything below — so the leader needs to know whose
+        /// position this is. Zero means an anonymous reader that does not count toward any
+        /// quorum.
+        node: u64,
         shard: u32,
         epoch: u64,
         from_lsn: u64,

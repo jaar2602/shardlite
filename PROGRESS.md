@@ -32,11 +32,11 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
-| 10 | Cluster: election, fencing, failover | **incomplete — see below** | `tests/cluster.rs` (8) + `src/cluster/` (40) |
+| 10 | Cluster: election, fencing, failover | **quorum-ack + fencing done; promotion outstanding** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `src/cluster/` (40) |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**177 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**193 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -480,7 +480,48 @@ far enough behind is told `NeedsBootstrap` and takes a snapshot. It is counted, 
 bootstrapping *repeatedly* — meaning retention is too small for the write rate — is visible
 rather than merely slow.
 
-### Step 10 is NOT complete — three gaps against the agreed plan
+### Gaps 1 and 2 are now closed
+
+**Quorum-ack (was Gap 1) — done.** A write is not acknowledged until a majority holds it.
+`replication/ack.rs` tracks each follower's durable position; the writer waits after draining
+frames and before replying. A follower's next subscription *is* its acknowledgement — asking
+from `from_lsn` proves it holds everything below — so there is no separate ack message to
+lose or reorder. One wait per batch, so group commit amortises the round trip.
+
+**Measured, by removing the fix:** without quorum-ack, **35 of 60 acknowledged writes were
+lost** when the leader died. With it, all 60 survive on the follower.
+
+A timeout is reported as `NotReplicated`, which says the write **is** committed locally and
+must not be retried — distinct from a failure. A bug found while testing: `clone_shallow`
+collapsed it into `BatchAborted`, whose text is *"no writes in this batch were applied"* —
+contradicting the inner warning and inviting exactly the double-apply it cautions against.
+The kind is now preserved so a caller can branch on it rather than parse text.
+
+**Gate wiring (was Gap 2) — done.** `shard::WriteGate` is checked before the transaction
+opens, not after it commits: a deposed leader that finds out afterwards has already written
+to a file another node may own. `Fence` implements it, and the trait lives in `shard` so the
+dependency points one way. Verified by removing the check — both cluster tests then fail.
+
+### Gap 3 — data-plane promotion, and a corruption risk it exposes
+
+Still outstanding, and **larger than it looked**. Promotion means a follower's shard files
+become the ones its `ShardManager` writes to, so the two must address the same directory.
+Today they do not, and making them do so surfaces a hazard:
+
+- `Follower::apply` writes **raw pages**. `ShardManager` caches **open SQLite connections**
+  in an LRU and has no way to drop them.
+- A cached connection whose page cache is stale while the follower rewrites pages underneath
+  is silent corruption — and a read-only connection in that state can return wrong rows
+  rather than an error.
+
+So promotion needs two things before it is safe: a `quiesce()` that drops every cached
+connection for a shard, and an enforced invariant that a node is **either** following **or**
+leading a shard, never both. The invariant is the same one shard placement needs, which is
+why this lands with step 11 rather than being bolted on now.
+
+Recording it here rather than discovering it as corruption later.
+
+### Earlier: step 10 was reported complete when it was not
 
 Recorded plainly because an earlier version of this document, and the commit message for
 `59151f3`, claimed more than was built.

@@ -40,6 +40,9 @@ pub struct ReplicaConfig {
     pub snapshot_chunk: usize,
     /// Where partial snapshot transfers are staged.
     pub staging_dir: std::path::PathBuf,
+    /// This follower's cluster identity, sent with every subscription so the primary can
+    /// count it toward a quorum. Zero means an anonymous reader that confirms nothing.
+    pub node: u64,
 }
 
 #[derive(Debug, Default)]
@@ -142,7 +145,7 @@ impl Replica {
             let from = pos.applied_lsn + 1;
 
             self.counters.polls.fetch_add(1, Ordering::Relaxed);
-            match client.subscribe(shard.0, pos.epoch, from, self.cfg.batch)? {
+            match client.subscribe(self.cfg.node, shard.0, pos.epoch, from, self.cfg.batch)? {
                 Response::Frames { txns, .. } if txns.is_empty() => return Ok(()),
                 // The epoch recorded is the one the frames actually came from, not the one
                 // this follower asked with — those differ for a fresh follower, and
@@ -227,12 +230,14 @@ impl Replica {
 impl Client {
     pub(crate) fn subscribe(
         &mut self,
+        node: u64,
         shard: u32,
         epoch: u64,
         from_lsn: u64,
         max_txns: u32,
     ) -> Result<Response> {
         self.request(Request::Subscribe {
+            node,
             shard,
             epoch,
             from_lsn,

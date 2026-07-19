@@ -67,15 +67,27 @@ pub struct ServerStats {
     pub live: usize,
 }
 
+/// The optional capabilities a node may have beyond serving queries.
+///
+/// A struct rather than four `Option` parameters: they are independent, they are all absent
+/// on a standalone node, and a positional list of `None`s at every call site says nothing
+/// about which is which.
+#[derive(Default, Clone)]
+pub struct NodeServices {
+    /// Recent frames, so a follower that fell briefly behind can resume without a full
+    /// bootstrap. `None` when this node is not capturing.
+    pub frames: Option<Arc<FrameLog>>,
+    /// Election participation.
+    pub cluster: Option<Arc<ClusterNode>>,
+    /// Quorum confirmation. Independent of `cluster` because a follower's subscription is
+    /// what reports its position, and that works whether or not elections are running.
+    pub acks: Option<Arc<crate::replication::AckTracker>>,
+}
+
 pub struct Server {
     listener: TcpListener,
     shards: Arc<ShardManager>,
-    /// Recent frames, so a follower that fell briefly behind can resume without a full
-    /// bootstrap. `None` when this node is not capturing.
-    frames: Option<Arc<FrameLog>>,
-    /// Election participation. `None` on a standalone node, which then answers cluster
-    /// messages by saying plainly that it is not a member.
-    cluster: Option<Arc<ClusterNode>>,
+    services: NodeServices,
     cfg: ServerConfig,
     counters: Arc<Counters>,
     shutdown: Arc<AtomicBool>,
@@ -95,14 +107,20 @@ impl Server {
         frames: Option<Arc<FrameLog>>,
         cfg: ServerConfig,
     ) -> Result<Self> {
-        Self::bind_full(shards, frames, None, cfg)
+        Self::bind_with(
+            shards,
+            NodeServices {
+                frames,
+                ..Default::default()
+            },
+            cfg,
+        )
     }
 
-    /// Bind with a frame log and cluster membership — a full replica set member.
-    pub fn bind_full(
+    /// Bind with whatever this node is capable of — a full replica set member.
+    pub fn bind_with(
         shards: Arc<ShardManager>,
-        frames: Option<Arc<FrameLog>>,
-        cluster: Option<Arc<ClusterNode>>,
+        services: NodeServices,
         cfg: ServerConfig,
     ) -> Result<Self> {
         let listener = TcpListener::bind(&cfg.addr)
@@ -112,8 +130,7 @@ impl Server {
         Ok(Self {
             listener,
             shards,
-            frames,
-            cluster,
+            services,
             cfg,
             counters: Arc::new(Counters::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -187,8 +204,7 @@ impl Server {
             self.counters.accepted.fetch_add(1, Ordering::Relaxed);
 
             let shards = Arc::clone(&self.shards);
-            let frames = self.frames.clone();
-            let cluster = self.cluster.clone();
+            let services = self.services.clone();
             let counters = Arc::clone(&self.counters);
             let idle = self.cfg.idle_timeout;
             std::thread::Builder::new()
@@ -198,14 +214,7 @@ impl Server {
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
-                    if let Err(e) = serve_connection(
-                        stream,
-                        &shards,
-                        frames.as_deref(),
-                        cluster.as_deref(),
-                        &counters,
-                        idle,
-                    ) {
+                    if let Err(e) = serve_connection(stream, &shards, &services, &counters, idle) {
                         tracing::debug!(peer, error = %e, "connection ended");
                     }
                     counters.live.fetch_sub(1, Ordering::Relaxed);
@@ -219,8 +228,7 @@ impl Server {
 fn serve_connection(
     stream: TcpStream,
     shards: &ShardManager,
-    frames: Option<&FrameLog>,
-    cluster: Option<&ClusterNode>,
+    services: &NodeServices,
     counters: &Counters,
     idle: Duration,
 ) -> Result<()> {
@@ -257,7 +265,7 @@ fn serve_connection(
                 _ => None,
             };
 
-            let resp = handle(req, shards, frames, cluster);
+            let resp = handle(req, shards, services);
             match (freeze, &resp) {
                 (Some((shard, true)), Response::SnapshotInfo { .. }) => {
                     held.insert(shard);
@@ -292,12 +300,9 @@ fn serve_connection(
     result
 }
 
-fn handle(
-    req: Request,
-    shards: &ShardManager,
-    frames: Option<&FrameLog>,
-    cluster: Option<&ClusterNode>,
-) -> Response {
+fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
+    let frames = services.frames.as_deref();
+    let cluster = services.cluster.as_deref();
     match req {
         Request::Hello { version, client } => {
             if version != PROTOCOL_VERSION {
@@ -401,18 +406,31 @@ fn handle(
         },
 
         Request::Subscribe {
+            node,
             shard,
             epoch,
             from_lsn,
             max_txns,
-        } => serve_subscribe(
-            shards,
-            frames,
-            ShardId(shard),
-            epoch,
-            from_lsn,
-            max_txns as usize,
-        ),
+        } => {
+            // The request *is* the acknowledgement: asking from `from_lsn` is proof this
+            // follower holds everything below it. Recording it here, before serving, is what
+            // releases writers waiting for a quorum — there is no separate ack message to be
+            // lost, reordered, or forgotten.
+            if node != 0
+                && from_lsn > 0
+                && let Some(acks) = &services.acks
+            {
+                acks.record(node, ShardId(shard), from_lsn - 1);
+            }
+            serve_subscribe(
+                shards,
+                frames,
+                ShardId(shard),
+                epoch,
+                from_lsn,
+                max_txns as usize,
+            )
+        }
 
         Request::SnapshotBegin { shard } => match shards.begin_snapshot(ShardId(shard)) {
             Ok((epoch, lsn, path)) => match std::fs::metadata(&path) {

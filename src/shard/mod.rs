@@ -37,6 +37,16 @@ pub use manifest::Manifest;
 pub use reader_fleet::ReaderFleet;
 pub use writer_fleet::{WriterFleet, WriterFleetStats};
 
+/// Permission to write, checked before every batch commits.
+///
+/// A trait rather than a direct dependency on `cluster::Fence`, so the dependency points one
+/// way only — cluster knows about shards, shards do not know about cluster. It also lets a
+/// standalone deployment pass nothing at all rather than construct a cluster it does not have.
+pub trait WriteGate: Send + Sync {
+    /// `Err` means this node may not write. Checked before the transaction, not after.
+    fn check_may_write(&self) -> crate::Result<()>;
+}
+
 /// Identifies one shard — one SQLite file, with one writer.
 ///
 /// `transparent` so it is indistinguishable from a bare `u32` on the wire, matching the
@@ -238,6 +248,31 @@ impl ShardManager {
             crate::config::PragmaProfile::writer_shard(),
             crate::config::PragmaProfile::reader_shard(),
             sink,
+            None,
+            None,
+        )
+    }
+
+    /// Open as a cluster member: frames are captured, writes wait for a quorum to hold them,
+    /// and a write is refused outright unless this node currently holds leadership.
+    ///
+    /// Both are `Option` because a standalone deployment has neither, and must not be made to
+    /// wait for a quorum of one that never reports or consult a gate that nothing opens.
+    pub fn open_clustered(
+        dir: &Path,
+        cfg: ShardConfig,
+        sink: Option<std::sync::Arc<dyn crate::replication::FrameSink>>,
+        acks: Option<std::sync::Arc<crate::replication::AckTracker>>,
+        gate: Option<std::sync::Arc<dyn WriteGate>>,
+    ) -> crate::Result<Self> {
+        Self::open_full(
+            dir,
+            cfg,
+            crate::config::PragmaProfile::writer_shard(),
+            crate::config::PragmaProfile::reader_shard(),
+            sink,
+            acks,
+            gate,
         )
     }
 
@@ -247,15 +282,18 @@ impl ShardManager {
         writer: crate::config::PragmaProfile,
         reader: crate::config::PragmaProfile,
     ) -> crate::Result<Self> {
-        Self::open_full(dir, cfg, writer, reader, None)
+        Self::open_full(dir, cfg, writer, reader, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_full(
         dir: &Path,
         cfg: ShardConfig,
         writer: crate::config::PragmaProfile,
         reader: crate::config::PragmaProfile,
         sink: Option<std::sync::Arc<dyn crate::replication::FrameSink>>,
+        acks: Option<std::sync::Arc<crate::replication::AckTracker>>,
+        gate: Option<std::sync::Arc<dyn WriteGate>>,
     ) -> crate::Result<Self> {
         cfg.validate()?;
         // Before anything is opened: refuse a shard count that disagrees with the data
@@ -267,6 +305,8 @@ impl ShardManager {
             writer,
             crate::config::CheckpointConfig::floor(),
             sink,
+            acks,
+            gate,
         )?);
         let readers = ReaderFleet::spawn(
             dir,

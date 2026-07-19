@@ -74,6 +74,7 @@ fn replica(p: &Primary, dir: &TempDir, stage: &TempDir, shards: Vec<ShardId>) ->
             batch: 64,
             snapshot_chunk: 64 * 1024,
             staging_dir: stage.path().to_path_buf(),
+            node: 2,
         },
         Arc::new(Follower::open(dir.path()).unwrap()),
     )
@@ -300,6 +301,7 @@ fn a_follower_from_another_generation_is_refused() {
     let current = p.manager.epoch().unwrap();
     match c
         .request(Request::Subscribe {
+            node: 0,
             shard: 0,
             epoch: current + 1,
             from_lsn: 1,
@@ -317,6 +319,7 @@ fn a_follower_from_another_generation_is_refused() {
     // from retention rather than forced into a needless snapshot.
     match c
         .request(Request::Subscribe {
+            node: 0,
             shard: 0,
             epoch: 0,
             from_lsn: 1,
