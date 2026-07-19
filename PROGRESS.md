@@ -31,12 +31,12 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 7 | VFS capture productionized | **done** | `tests/capture_wiring.rs` (9) |
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
-| 9 | Per-shard merkle verification | not started | |
+| 9 | Divergence detection | **done (content hash; merkle deferred)** | `tests/verify.rs` (4) + `src/storage/verify.rs` (12) |
 | 10 | Cluster: election, fencing, failover | **done** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `tests/promotion.rs` (5) + `src/cluster/` (44) |
 | 11 | Shard placement + move | **done** | `tests/cluster.rs` (16) + `src/cluster/placement.rs` (7) + `src/net/forward.rs` |
 | 12 | Read consistency levels | not started | |
 
-**233 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**249 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -713,6 +713,47 @@ justifies it concludes — so the test now waits for the state it asserts about.
 Earlier revisions of this document, and commit `eedb82e`, said **207 tests**. The real figure
 at that commit was **202** — an `awk` miscount on my part, not a loss of tests. Counts here
 are now taken from summing `test result` lines directly.
+
+### Step 9: divergence detection
+
+**The failure this catches.** Replication is physical — a follower writes raw pages it never
+interprets. If the capturing VFS mis-reads a frame, or `apply` writes them out of order, the
+follower ends up holding *valid pages that are the wrong pages*. `PRAGMA integrity_check`
+passes, reads succeed, and they return wrong rows. The VFS is the highest-risk code in this
+project and this is its only detector.
+
+Demonstrated, not asserted: `a_follower_that_missed_frames_is_detected` shows the diverged
+follower passing `integrity_check` while its content hash differs.
+
+**Hashed logically, never as bytes.** Two nodes holding identical data legitimately differ in
+freelist layout, vacuum history, and checkpoint timing. Byte comparison would report
+divergence constantly and be ignored within a week — worse than no detector, because it would
+train everyone to dismiss the one real alarm.
+
+Verified by reverting to a byte hash: three of four tests fail, **including
+`a_correctly_replicated_shard_matches_its_primary`**. Primary and follower files are not
+byte-identical in practice, so the logical hash was necessary rather than merely tidier. It
+also means the older `assert_converged` byte comparison in `tests/replica_net.rs` only works
+under quiesced conditions and is not a model for production verification.
+
+Encoding is type-tagged and length-prefixed, so the integer `1` cannot hash like the text
+`'1'`, and `('ab','c')` cannot hash like `('a','bc')`.
+
+**Merkle deferred, deliberately.** The plan specified a per-shard merkle tree over row
+ranges. `content_hash` is what catches the bug and what serves as a real test oracle; the
+merkle is a *scale* device for when a full hash stops finishing. Building the incremental
+tree now would be speculative machinery for a scale nothing here can yet exercise. It should
+land when shard sizes make full hashing too slow to run — and the trigger is measurable, not
+a guess.
+
+### Step 11 also invalidated three older tests
+
+Worth recording as a pattern rather than three incidents. `only_the_leader_can_write`,
+`a_candidate_that_is_behind_cannot_win` and `a_deposed_leader_stops_writing` all assumed the
+coordinator owns every shard. Once placement spread them that stopped being true, and each
+kept passing **only by racing the first placement round** — so they surfaced as intermittent
+failures under parallel load, not as honest breakage. When an invariant changes, the tests
+that quietly still pass are the ones to go looking at.
 
 ### Known flaky test
 

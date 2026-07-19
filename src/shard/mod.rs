@@ -536,6 +536,20 @@ impl ShardManager {
         self.writers.schema(shard, None)
     }
 
+    /// Hash a shard's logical contents, for comparison against another node's copy.
+    ///
+    /// Refuses a shard being followed: the replication path rewrites those files behind
+    /// SQLite's back, and a hash taken across that describes a state that never existed.
+    /// Verify a follower by pausing its pull loop and using
+    /// [`crate::storage::verify::hash_file`].
+    pub fn content_hash(
+        &self,
+        shard: ShardId,
+    ) -> crate::Result<crate::storage::verify::ContentHash> {
+        self.modes.check_may_open(shard)?;
+        crate::storage::verify::hash_file(&shard.path(&self.dir))
+    }
+
     /// Apply a schema change to one shard.
     ///
     /// The unit a cluster-wide roll is built from: each shard's owner applies its own, so no

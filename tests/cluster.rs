@@ -207,6 +207,21 @@ fn await_leader(live: &[Arc<Node>], within: Duration) -> Option<Arc<Node>> {
     None
 }
 
+/// Wait until placement has spread shards over more than one node.
+fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<meshdb::cluster::Placement> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        for n in live {
+            let p = n.cluster.placement();
+            if p.leaders().len() > 1 {
+                return Some(p);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 #[test]
 fn three_nodes_elect_exactly_one_leader() {
     let nodes = cluster(3);
@@ -536,15 +551,31 @@ fn a_deposed_leader_stops_writing() {
     // The self-fencing half. A deposed leader that keeps committing locally diverges its own
     // copy even if every follower refuses its frames — so the gate has to shut the writer
     // down, not merely stop anyone listening.
+    //
+    // Placement-aware: the coordinator owns only some shards, so the test works through one
+    // it actually leads rather than assuming shard 0.
     let nodes = cluster(3);
     let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(400));
+
+    let owned = leader.cluster.led_shards();
+    let Some(&shard) = owned.first() else {
+        // A coordinator leading nothing has nothing to fence; not the case under test.
+        for n in &nodes {
+            n.stop();
+        }
+        return;
+    };
+
     leader
         .manager
-        .execute_all_shards(meshdb::storage::exec::Statement::new(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
-        ))
+        .execute_one(
+            shard,
+            meshdb::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+        )
         .unwrap();
-    assert!(leader.cluster.fence().is_open(ShardId(0)));
+    assert!(leader.cluster.fence().is_open(shard));
 
     // Cut it off from the cluster; its lease expires and it must fence itself.
     for n in nodes.iter().filter(|n| n.id != leader.id) {
@@ -552,18 +583,18 @@ fn a_deposed_leader_stops_writing() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while leader.cluster.fence().is_open(ShardId(0)) && Instant::now() < deadline {
+    while leader.cluster.fence().is_open(shard) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        !leader.cluster.fence().is_open(ShardId(0)),
+        !leader.cluster.fence().is_open(shard),
         "a leader that lost its quorum must shut its own write gate"
     );
 
     let err = leader
         .manager
         .execute_one(
-            ShardId(0),
+            shard,
             meshdb::storage::exec::Statement::new("INSERT INTO t VALUES (99)"),
         )
         .expect_err("a deposed leader must refuse to write, even locally");
@@ -572,21 +603,6 @@ fn a_deposed_leader_stops_writing() {
     for n in &nodes {
         n.stop();
     }
-}
-
-/// Wait until placement has spread shards over more than one node.
-fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<meshdb::cluster::Placement> {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        for n in live {
-            let p = n.cluster.placement();
-            if p.leaders().len() > 1 {
-                return Some(p);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    None
 }
 
 #[test]
