@@ -27,11 +27,13 @@
 //! much smaller per-connection caches; see [`crate::config::PragmaProfile::writer_shard`].
 
 pub mod lru;
+pub mod manifest;
 pub mod reader_fleet;
 pub mod writer_fleet;
 
 use std::path::{Path, PathBuf};
 
+pub use manifest::Manifest;
 pub use reader_fleet::ReaderFleet;
 pub use writer_fleet::{WriterFleet, WriterFleetStats};
 
@@ -146,11 +148,15 @@ pub struct ShardManager {
     readers: ReaderFleet,
     cfg: ShardConfig,
     dir: PathBuf,
+    manifest: Manifest,
 }
 
 impl ShardManager {
     pub fn open(dir: &Path, cfg: ShardConfig) -> crate::Result<Self> {
         cfg.validate()?;
+        // Before anything is opened: refuse a shard count that disagrees with the data
+        // already on disk. Discovering that later means rows silently unreachable.
+        let manifest = Manifest::open_or_create(dir, cfg.shard_count)?;
         let writers = std::sync::Arc::new(WriterFleet::spawn(
             dir,
             cfg.clone(),
@@ -169,7 +175,29 @@ impl ShardManager {
             readers,
             cfg,
             dir: dir.to_path_buf(),
+            manifest,
         })
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Bring a shard's file into existence if it does not yet exist.
+    pub fn ensure_open(&self, shard: ShardId) -> crate::Result<()> {
+        self.writers.ensure_open(shard)
+    }
+
+    pub fn checkpoint_stats(&self) -> crate::storage::CheckpointStats {
+        let c = self.writers.checkpoint_counters();
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::storage::CheckpointStats {
+            passive: c.passive.load(Relaxed),
+            truncated: c.truncated.load(Relaxed),
+            stalls: c.stalls.load(Relaxed),
+            failures: c.failures.load(Relaxed),
+            wal_bytes: c.wal_bytes.load(Relaxed),
+        }
     }
 
     pub fn config(&self) -> &ShardConfig {

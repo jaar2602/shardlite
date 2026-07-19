@@ -1,19 +1,36 @@
-//! meshdb CLI — open a database and run SQL against it.
-//!
-//! Usage:
-//!   meshdb <db-path>                 interactive shell
-//!   meshdb <db-path> -c "SQL"        run one statement and exit
-//!   meshdb <db-path> -f <file>       run statements from a file (one per line)
+//! meshdb CLI — open a data directory and run SQL against it.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use meshdb::db::Db;
+use meshdb::shard::ShardId;
 use meshdb::storage::exec::{Executed, Outcome, QueryResult};
+
+const USAGE: &str = "\
+meshdb — HA multi-write SQLite server (single-node)
+
+usage:
+  meshdb <data-dir> [--shards N]        interactive shell
+  meshdb <data-dir> -c \"SQL\"            run one statement and exit
+  meshdb <data-dir> -f <file>           run statements from a file, one per line
+
+--shards N applies only when creating a new directory. It is recorded in the
+manifest and IMMUTABLE: changing it re-routes every key.
+
+shell commands:
+  .help     show this message
+  .info     manifest and shard layout
+  .shard N  target shard N for subsequent statements (default 0)
+  .stats    writer, reader and WAL statistics
+  .tables   list tables on the current shard
+  .quit     exit
+
+DDL (CREATE / DROP / ALTER) is applied to every shard automatically. Other
+statements go to the current shard; there is no cross-shard query planner yet.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!("{USAGE}");
         return if args.is_empty() {
@@ -23,8 +40,30 @@ fn main() -> ExitCode {
         };
     }
 
-    let path = std::path::PathBuf::from(&args[0]);
-    let db = match Db::open(&path) {
+    let dir = std::path::PathBuf::from(&args[0]);
+    let mut shards = 1u32;
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shards" => match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                Some(n) => {
+                    shards = n;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("error: --shards needs a number\n{USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                rest.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    let db = match Db::open(&dir, shards) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("error: {e}");
@@ -32,10 +71,10 @@ fn main() -> ExitCode {
         }
     };
 
-    match args.get(1).map(String::as_str) {
-        Some("-c") => match args.get(2) {
+    match rest.first().copied() {
+        Some("-c") => match rest.get(1) {
             Some(sql) => {
-                if run_and_print(&db, sql) {
+                if run_and_print(&db, ShardId::FIRST, sql) {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::FAILURE
@@ -46,8 +85,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("-f") => match args.get(2) {
-            Some(file) => run_file(&db, file),
+        Some("-f") => match rest.get(1) {
+            Some(f) => run_file(&db, f),
             None => {
                 eprintln!("error: -f requires a file argument\n{USAGE}");
                 ExitCode::FAILURE
@@ -60,20 +99,6 @@ fn main() -> ExitCode {
         None => repl(&db),
     }
 }
-
-const USAGE: &str = "\
-meshdb — HA multi-write SQLite server (single-node, step 2)
-
-usage:
-  meshdb <db-path>              interactive shell
-  meshdb <db-path> -c \"SQL\"     run one statement and exit
-  meshdb <db-path> -f <file>    run statements from a file, one per line
-
-shell commands:
-  .help     show this message
-  .stats    writer batching statistics
-  .tables   list tables
-  .quit     exit";
 
 fn run_file(db: &Db, file: &str) -> ExitCode {
     let content = match std::fs::read_to_string(file) {
@@ -88,7 +113,7 @@ fn run_file(db: &Db, file: &str) -> ExitCode {
         if line.is_empty() || line.starts_with("--") {
             continue;
         }
-        if !run_and_print(db, line) {
+        if !run_and_print(db, ShardId::FIRST, line) {
             return ExitCode::FAILURE;
         }
     }
@@ -96,12 +121,17 @@ fn run_file(db: &Db, file: &str) -> ExitCode {
 }
 
 fn repl(db: &Db) -> ExitCode {
-    println!("meshdb — {}", db.path().display());
+    println!(
+        "meshdb — {} ({} shard(s))",
+        db.dir().display(),
+        db.shard_count()
+    );
     println!("type .help for commands, .quit to exit");
 
+    let mut current = ShardId::FIRST;
     let stdin = io::stdin();
     loop {
-        print!("meshdb> ");
+        print!("meshdb:{current}> ");
         if io::stdout().flush().is_err() {
             return ExitCode::FAILURE;
         }
@@ -130,21 +160,34 @@ fn repl(db: &Db) -> ExitCode {
                 println!("{USAGE}");
                 continue;
             }
+            ".info" => {
+                let m = db.manifest();
+                println!("dir           {}", db.dir().display());
+                println!("format        {}", m.format_version);
+                println!("shard_count   {} (immutable)", m.shard_count);
+                println!("sqlite        {}", m.sqlite_version);
+                continue;
+            }
             ".stats" => {
                 let w = db.writer_stats();
                 let r = db.reader_stats();
+                let c = db.shards().checkpoint_stats();
                 println!(
-                    "writer: batches={} requests={} max_batch={} mean_batch={:.2}",
+                    "writer: threads={} batches={} requests={} max_batch={} mean_batch={:.2}",
+                    w.threads,
                     w.batches,
                     w.requests,
                     w.max_batch,
                     w.mean_batch()
                 );
                 println!(
+                    "shards: open_now={} opens={} evictions={}",
+                    w.open_now, w.shard_opens, w.shard_evictions
+                );
+                println!(
                     "reader: threads={} queries={} rejected_busy={} timed_out={}",
                     r.threads, r.queries, r.rejected_busy, r.timed_out
                 );
-                let c = db.checkpoint_stats();
                 println!(
                     "wal:    bytes={} passive={} truncated={} stalls={} failures={}",
                     c.wal_bytes, c.passive, c.truncated, c.stalls, c.failures
@@ -154,21 +197,73 @@ fn repl(db: &Db) -> ExitCode {
             ".tables" => {
                 run_and_print(
                     db,
-                    "SELECT name FROM sqlite_schema WHERE type='table' \
-                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                    current,
+                    "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
                 );
                 continue;
             }
             _ => {}
         }
 
-        run_and_print(db, sql);
+        if let Some(n) = sql.strip_prefix(".shard ") {
+            match n.trim().parse::<u32>() {
+                Ok(n) if n < db.shard_count() => {
+                    current = ShardId(n);
+                    println!("targeting {current}");
+                }
+                Ok(n) => eprintln!(
+                    "error: shard {n} is outside the {} configured",
+                    db.shard_count()
+                ),
+                Err(_) => eprintln!("error: .shard needs a number"),
+            }
+            continue;
+        }
+        if sql.starts_with('.') {
+            eprintln!("error: unknown command {sql}");
+            continue;
+        }
+
+        run_and_print(db, current, sql);
     }
 }
 
 /// Returns false if the statement failed.
-fn run_and_print(db: &Db, sql: &str) -> bool {
-    match db.run(sql) {
+fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
+    // Schema changes must reach every shard, so they are never routed to just one.
+    if Db::is_ddl(sql) && db.shard_count() > 1 {
+        return match db.run_all(sql) {
+            Ok(results) => {
+                let failed: Vec<_> = results
+                    .iter()
+                    .filter(|(_, o)| matches!(o, Outcome::Rejected(_)))
+                    .collect();
+                if failed.is_empty() {
+                    println!("ok (applied to {} shards)", results.len());
+                    true
+                } else {
+                    // Not atomic across shards: say exactly which ones diverged.
+                    eprintln!(
+                        "PARTIAL: {} of {} shards rejected the statement; schemas now differ",
+                        failed.len(),
+                        results.len()
+                    );
+                    for (id, o) in failed.iter().take(5) {
+                        if let Outcome::Rejected(m) = o {
+                            eprintln!("  {id}: {m}");
+                        }
+                    }
+                    false
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                false
+            }
+        };
+    }
+
+    match db.run_on(shard, sql) {
         Ok(Outcome::Ok(Executed::Rows(result))) => {
             print_table(&result);
             true
@@ -197,13 +292,11 @@ fn print_table(r: &QueryResult) {
     if r.columns.is_empty() {
         return;
     }
-
     let cells: Vec<Vec<String>> = r
         .rows
         .iter()
         .map(|row| row.iter().map(|v| v.render()).collect())
         .collect();
-
     let widths: Vec<usize> = r
         .columns
         .iter()
@@ -233,7 +326,6 @@ fn print_table(r: &QueryResult) {
             .collect::<Vec<_>>()
             .join("  ")
     );
-
     for row in &cells {
         let line: Vec<String> = row
             .iter()

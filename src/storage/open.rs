@@ -1,13 +1,12 @@
 //! Opening connections, and the ordering invariant between them.
 //!
-//! A read-only connection cannot create the `-wal` and `-shm` sidecar files — only a
-//! writer can. So the writer must open a given database before any reader does. That is
-//! enforced structurally: [`open_reader`] takes a [`WriterOpened`] token that only
-//! [`open_writer`] can produce.
+//! A read-only connection cannot **create** a database file, so something must create it
+//! before a reader can open it. Across the shard fleets that ordering is established
+//! dynamically by `WriterFleet::ensure_open`, because the writer that created a shard lives
+//! on another thread and may evict it at any time.
 //!
-//! The invariant holds *per database on every open*, not once per process. When shard
-//! connections are pooled and cold shards are closed, reopening a shard must run the
-//! writer first again.
+//! The invariant holds *per database on every open*, not once per process: when cold shards
+//! are closed by the LRU, a shard that is reopened must be created by a writer first.
 
 use std::path::Path;
 
@@ -17,24 +16,8 @@ use crate::config::{PragmaProfile, Role};
 use crate::error::{Error, Result};
 use crate::storage::pragma;
 
-/// Proof that a writer has opened this database and materialized its WAL sidecars.
-///
-/// Not transferable between databases: it carries the path it was issued for.
-#[derive(Debug, Clone)]
-pub struct WriterOpened {
-    path: String,
-}
-
-impl WriterOpened {
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-}
-
 /// Open the single read-write connection for a database, creating it if absent.
-///
-/// Returns a [`WriterOpened`] token required by [`open_reader`].
-pub fn open_writer(path: &Path, p: &PragmaProfile) -> Result<(Connection, WriterOpened)> {
+pub fn open_writer(path: &Path, p: &PragmaProfile) -> Result<Connection> {
     assert_eq!(
         p.role,
         Role::Writer,
@@ -55,35 +38,27 @@ pub fn open_writer(path: &Path, p: &PragmaProfile) -> Result<(Connection, Writer
     pragma::verify(&conn, p)?;
     materialize_wal(&conn)?;
 
-    Ok((conn, WriterOpened { path: path_str }))
+    Ok(conn)
 }
 
-/// Open a read-only connection.
+/// Open a read-only connection to a database that is already known to exist.
 ///
-/// Requires a [`WriterOpened`] token for the same database, because a read-only
-/// connection cannot create the WAL sidecars it needs.
-pub fn open_reader(path: &Path, p: &PragmaProfile, opened: &WriterOpened) -> Result<Connection> {
+/// A read-only connection cannot create a database file, so callers must ensure the file
+/// exists first — `WriterFleet::ensure_open` is what does that in the fleets.
+pub fn open_reader_existing(path: &Path, p: &PragmaProfile) -> Result<Connection> {
     assert_eq!(
         p.role,
         Role::Reader,
-        "open_reader requires a reader profile"
+        "open_reader_existing requires a reader profile"
     );
     let path_str = path.display().to_string();
-    assert_eq!(
-        path_str, opened.path,
-        "WriterOpened token is for a different database"
-    );
-
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-
     let conn = Connection::open_with_flags(path, flags).map_err(|source| Error::Open {
         path: path_str.clone(),
         source,
     })?;
-
     pragma::apply(&conn, p, &path_str)?;
     pragma::verify(&conn, p)?;
-
     Ok(conn)
 }
 

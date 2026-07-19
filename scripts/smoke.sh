@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 BIN=target/debug/meshdb
 DB_DIR=$(mktemp -d)
-DB="$DB_DIR/shard_0.db"
+DB="$DB_DIR/data"
 trap 'rm -rf "$DB_DIR"' EXIT
 
 PASS=0
@@ -53,7 +53,7 @@ sql() { "$BIN" "$DB" -c "$1"; }
 echo "building..."
 cargo build --quiet 2>&1 | tail -5
 [[ -x "$BIN" ]] || { echo "build failed: $BIN not found"; exit 1; }
-echo "database: $DB"
+echo "data dir: $DB"
 echo
 
 echo "schema and writes"
@@ -107,10 +107,23 @@ assert_contains "repl runs sql"    "ada"      bash -c "printf 'SELECT name FROM 
 assert_contains "repl .tables"     "users"    bash -c "printf '.tables\n.quit\n' | $BIN $DB"
 assert_contains "repl .stats writer" "mean_batch" bash -c "printf '.stats\n.quit\n' | $BIN $DB"
 assert_contains "repl .stats reader" "threads=2"  bash -c "printf '.stats\n.quit\n' | $BIN $DB"
+assert_contains "repl .info"         "shard_count" bash -c "printf '.info\n.quit\n' | $BIN $DB"
 assert_contains "repl .stats wal"    "wal:"       bash -c "printf '.stats\n.quit\n' | $BIN $DB"
 # Reads must be served by the pool, not by the writer thread.
 assert_contains "select counted as a reader query" "queries=1" \
     bash -c "printf 'SELECT 1\n.stats\n.quit\n' | $BIN $DB"
+
+echo
+echo "manifest guards the immutable shard count"
+SH_DIR=$(mktemp -d); trap 'rm -rf "$DB_DIR" "$SH_DIR"' EXIT
+"$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
+assert_contains "manifest records shard count" "shard_count=8" cat "$SH_DIR/multi/meshdb.manifest"
+assert_fails "reopening with a different count is refused" "re-routes every key" \
+    "$BIN" "$SH_DIR/multi" --shards 4 -c "SELECT 1"
+assert_contains "reopening with the same count works" "1" "$BIN" "$SH_DIR/multi" --shards 8 -c "SELECT 1"
+# DDL must reach every shard, not just the one being targeted.
+assert_contains "ddl fans out to all shards" "applied to 8 shards" \
+    "$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE fanout (a INTEGER) STRICT"
 
 echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"

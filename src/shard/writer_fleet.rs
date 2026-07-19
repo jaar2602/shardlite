@@ -81,6 +81,18 @@ pub struct WriterFleetStats {
     pub threads: usize,
 }
 
+impl WriterFleetStats {
+    /// Statements per transaction. Above 1 under load is the signature of group commit
+    /// working; pinned at 1 means batching is not happening.
+    pub fn mean_batch(&self) -> f64 {
+        if self.batches == 0 {
+            0.0
+        } else {
+            self.requests as f64 / self.batches as f64
+        }
+    }
+}
+
 pub struct WriterFleet {
     senders: Vec<mpsc::Sender<Job>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -189,6 +201,17 @@ impl WriterFleet {
 
     pub fn checkpoint_counters(&self) -> &Arc<CheckpointCounters> {
         &self.checkpoint_counters
+    }
+
+    pub fn checkpoint_stats(&self) -> crate::storage::CheckpointStats {
+        let c = &self.checkpoint_counters;
+        crate::storage::CheckpointStats {
+            passive: c.passive.load(Ordering::Relaxed),
+            truncated: c.truncated.load(Ordering::Relaxed),
+            stalls: c.stalls.load(Ordering::Relaxed),
+            failures: c.failures.load(Ordering::Relaxed),
+            wal_bytes: c.wal_bytes.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -338,7 +361,7 @@ fn ensure_shard<'a>(
     let (entry, event) = open.get_or_open(shard, move || -> Result<OpenShard> {
         // `open_writer` materializes the -wal/-shm sidecars, which is what re-establishes
         // the writer-opens-first invariant on every reopen after an eviction.
-        let (conn, _token) = open_writer(&path, &profile)?;
+        let conn = open_writer(&path, &profile)?;
         let checkpointer = Checkpointer::new(&path, checkpoint, checkpoint_counters);
         Ok(OpenShard { conn, checkpointer })
     })?;

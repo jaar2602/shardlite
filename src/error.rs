@@ -67,4 +67,7 @@ pub enum Error {
 
     #[error("shard configuration: {0}")]
     ShardConfig(String),
+
+    #[error("{0}")]
+    Manifest(String),
 }

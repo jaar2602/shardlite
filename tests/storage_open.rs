@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use meshdb::config::{PragmaProfile, Role, Synchronous};
 use meshdb::error::Error;
-use meshdb::storage::{open_reader, open_writer, pragma};
+use meshdb::storage::{open_reader_existing, open_writer, pragma};
 use tempfile::TempDir;
 
 fn db_path(dir: &TempDir) -> PathBuf {
@@ -16,7 +16,7 @@ fn db_path(dir: &TempDir) -> PathBuf {
 fn writer_opens_in_wal_mode() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
-    let (conn, _token) = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
+    let conn = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
 
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -29,7 +29,7 @@ fn writer_pragmas_actually_take_effect() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
     let profile = PragmaProfile::writer_floor();
-    let (conn, _token) = open_writer(&path, &profile).unwrap();
+    let conn = open_writer(&path, &profile).unwrap();
 
     let read = |name: &str| -> i64 {
         conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
@@ -55,11 +55,11 @@ fn verify_passes_for_both_roles() {
     let path = db_path(&dir);
 
     let writer_profile = PragmaProfile::writer_floor();
-    let (writer, token) = open_writer(&path, &writer_profile).unwrap();
+    let writer = open_writer(&path, &writer_profile).unwrap();
     pragma::verify(&writer, &writer_profile).unwrap();
 
     let reader_profile = PragmaProfile::reader_floor();
-    let reader = open_reader(&path, &reader_profile, &token).unwrap();
+    let reader = open_reader_existing(&path, &reader_profile).unwrap();
     pragma::verify(&reader, &reader_profile).unwrap();
 }
 
@@ -70,7 +70,7 @@ fn verify_detects_a_setting_that_drifted() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
     let profile = PragmaProfile::writer_floor();
-    let (conn, _token) = open_writer(&path, &profile).unwrap();
+    let conn = open_writer(&path, &profile).unwrap();
 
     conn.execute_batch("PRAGMA cache_size = -1234;").unwrap();
 
@@ -95,12 +95,12 @@ fn reader_opens_after_writer_and_sees_committed_data() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
-    let (writer, token) = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
+    let writer = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
     writer
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT; INSERT INTO t VALUES (1, 'a');")
         .unwrap();
 
-    let reader = open_reader(&path, &PragmaProfile::reader_floor(), &token).unwrap();
+    let reader = open_reader_existing(&path, &PragmaProfile::reader_floor()).unwrap();
     let v: String = reader
         .query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0))
         .unwrap();
@@ -112,12 +112,12 @@ fn reader_cannot_write() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
-    let (writer, token) = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
+    let writer = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
     writer
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;")
         .unwrap();
 
-    let reader = open_reader(&path, &PragmaProfile::reader_floor(), &token).unwrap();
+    let reader = open_reader_existing(&path, &PragmaProfile::reader_floor()).unwrap();
     assert!(
         reader.execute_batch("INSERT INTO t VALUES (1);").is_err(),
         "read-only connection must reject writes"
@@ -126,8 +126,9 @@ fn reader_cannot_write() {
 
 #[test]
 fn reader_alone_cannot_open_a_fresh_database() {
-    // Documents *why* `open_reader` demands a `WriterOpened` token: a read-only
-    // connection cannot create the database or its WAL sidecars.
+    // Documents *why* something must create a shard before a reader touches it: a
+    // read-only connection cannot create the database file at all. This is what
+    // `WriterFleet::ensure_open` exists to guarantee.
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
@@ -143,7 +144,7 @@ fn wal_sidecars_exist_after_writer_open() {
     // Readers depend on these existing; `materialize_wal` is what guarantees it.
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
-    let (_writer, _token) = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
+    let _writer = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
 
     let wal = path.with_extension("db-wal");
     let shm = path.with_extension("db-shm");

@@ -21,6 +21,7 @@ use super::{ShardConfig, ShardId};
 use crate::config::{PragmaProfile, ReaderPoolConfig};
 use crate::error::{Error, Result};
 use crate::storage::exec::{self, Outcome, SqlError};
+use crate::storage::open::open_reader_existing;
 
 struct Job {
     shard: ShardId,
@@ -185,7 +186,7 @@ fn ensure_shard<'a>(
     let writers = ctx.writers.clone();
 
     let (conn, event) = open.get_or_open(shard, move || -> Result<Connection> {
-        match open_reader_unchecked(&path, &profile) {
+        match open_reader_existing(&path, &profile) {
             Ok(c) => Ok(c),
             Err(first) => {
                 // The shard may have gone away between `ensure_open` and here — another
@@ -196,7 +197,7 @@ fn ensure_shard<'a>(
                     return Err(first);
                 };
                 w.ensure_open(shard)?;
-                open_reader_unchecked(&path, &profile)
+                open_reader_existing(&path, &profile)
             }
         }
     })?;
@@ -210,27 +211,6 @@ fn ensure_shard<'a>(
             .fetch_add(event.evicted, Ordering::Relaxed);
     }
 
-    Ok(conn)
-}
-
-/// Open a reader without a [`crate::storage::open::WriterOpened`] token.
-///
-/// The token proves the writer opened this database, which is checked at the type level in
-/// the single-database path. Here the same guarantee is established dynamically by
-/// [`WriterFleet::ensure_open`] — a token cannot be threaded through, because the writer
-/// that opened the shard lives on another thread and may evict it at any time.
-fn open_reader_unchecked(path: &Path, profile: &PragmaProfile) -> Result<Connection> {
-    use crate::storage::pragma;
-    use rusqlite::OpenFlags;
-
-    let path_str = path.display().to_string();
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags).map_err(|source| Error::Open {
-        path: path_str.clone(),
-        source,
-    })?;
-    pragma::apply(&conn, profile, &path_str)?;
-    pragma::verify(&conn, profile)?;
     Ok(conn)
 }
 

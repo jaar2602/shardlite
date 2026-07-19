@@ -4,10 +4,33 @@
 use std::time::Duration;
 
 use meshdb::config::{CheckpointConfig, PragmaProfile};
+use meshdb::shard::writer_fleet::WriterFleet;
+use meshdb::shard::{ShardConfig, ShardId};
 use meshdb::storage::checkpoint::wal_path_for;
-use meshdb::storage::open::open_reader;
-use meshdb::storage::writer::Writer;
+use meshdb::storage::open::open_reader_existing;
 use tempfile::TempDir;
+
+const S0: ShardId = ShardId(0);
+
+/// One shard, one writer thread — the checkpointer is per shard, so this isolates it.
+fn one_shard() -> ShardConfig {
+    ShardConfig {
+        shard_count: 1,
+        writer_threads: 1,
+        open_writers_per_thread: 1,
+        reader_threads: 1,
+        open_readers_per_thread: 1,
+    }
+}
+
+fn spawn(dir: &TempDir, cp: CheckpointConfig) -> (WriterFleet, std::path::PathBuf) {
+    let fleet =
+        WriterFleet::spawn(dir.path(), one_shard(), PragmaProfile::writer_floor(), cp).unwrap();
+    // Bring the shard into existence so its path is valid for readers and wal_path_for.
+    fleet.ensure_open(S0).unwrap();
+    let path = S0.path(dir.path());
+    (fleet, path)
+}
 
 /// Small limits so the ladder is reachable in a test rather than after 128 MB of writes.
 fn tight() -> CheckpointConfig {
@@ -30,27 +53,29 @@ fn wal_len(db: &std::path::Path) -> u64 {
 ///
 /// Submitted in chunks rather than one statement at a time: `synchronous = FULL` means
 /// one fsync per *batch*, so row-at-a-time here would spend the whole test in fsync.
-fn write_rows(h: &meshdb::storage::WriterHandle, start: i64, n: i64) {
+fn write_rows(h: &WriterFleet, start: i64, n: i64) {
     let pad = "x".repeat(400);
     for chunk_start in (start..start + n).step_by(50) {
         let chunk_end = (chunk_start + 50).min(start + n);
         let stmts: Vec<String> = (chunk_start..chunk_end)
             .map(|i| format!("INSERT INTO t VALUES ({i}, '{pad}')"))
             .collect();
-        h.execute(stmts).unwrap();
+        h.execute(S0, stmts).unwrap();
     }
 }
 
 #[test]
 fn wal_stays_bounded_under_sustained_writes() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("shard_0.db");
-    let (w, _token) = Writer::spawn_with(&path, &PragmaProfile::writer_floor(), tight()).unwrap();
-    let h = w.handle();
+    let (w, _path) = spawn(&dir, tight());
+    let h = &w;
 
-    h.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT")
-        .unwrap();
-    write_rows(&h, 1, 700);
+    h.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
+    )
+    .unwrap();
+    write_rows(h, 1, 700);
 
     let stats = w.checkpoint_stats();
     println!(
@@ -75,15 +100,17 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
     // stops the checkpoint advancing, the WAL grows past its hard limit, and the ladder
     // escalates to TRUNCATE.
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("shard_0.db");
-    let (w, token) = Writer::spawn_with(&path, &PragmaProfile::writer_floor(), tight()).unwrap();
-    let h = w.handle();
+    let (w, path) = spawn(&dir, tight());
+    let h = &w;
 
-    h.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT")
-        .unwrap();
-    write_rows(&h, 1, 50);
+    h.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
+    )
+    .unwrap();
+    write_rows(h, 1, 50);
 
-    let reader = open_reader(&path, &PragmaProfile::reader_floor(), &token).unwrap();
+    let reader = open_reader_existing(&path, &PragmaProfile::reader_floor()).unwrap();
     {
         // Hold an open read transaction. The first read pins the snapshot, and the
         // checkpointer cannot copy frames past it.
@@ -92,7 +119,7 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
 
-        write_rows(&h, 100, 700);
+        write_rows(h, 100, 700);
 
         let during = w.checkpoint_stats();
         println!(
@@ -110,7 +137,7 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
     } // read transaction ends here
 
     // With the snapshot released, checkpointing can drain and reclaim.
-    write_rows(&h, 100_000, 200);
+    write_rows(h, 100_000, 200);
     let after = w.checkpoint_stats();
     println!(
         "after release: passive={} truncated={} stalls={} wal={}",
@@ -130,17 +157,19 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
     // mishandled, rows silently disappear — so verify every row survives, including
     // across a reopen that has to recover from whatever state the WAL was left in.
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("shard_0.db");
-
     {
-        let (w, _token) =
-            Writer::spawn_with(&path, &PragmaProfile::writer_floor(), tight()).unwrap();
-        let h = w.handle();
-        h.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT")
-            .unwrap();
-        write_rows(&h, 1, 600);
+        let (w, _path) = spawn(&dir, tight());
+        let h = &w;
+        h.execute_one(
+            S0,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
+        )
+        .unwrap();
+        write_rows(h, 1, 600);
 
-        let out = h.execute_one("SELECT count(*), sum(id) FROM t").unwrap();
+        let out = h
+            .execute_one(S0, "SELECT count(*), sum(id) FROM t")
+            .unwrap();
         match out {
             meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
                 assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(600));
@@ -150,10 +179,9 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
     } // writer dropped: thread joined, connection closed
 
     // Reopen and confirm the data is all still there.
-    let (w2, _token) = Writer::spawn_with(&path, &PragmaProfile::writer_floor(), tight()).unwrap();
+    let (w2, _path) = spawn(&dir, tight());
     let out = w2
-        .handle()
-        .execute_one("SELECT count(*), sum(id) FROM t")
+        .execute_one(S0, "SELECT count(*), sum(id) FROM t")
         .unwrap();
     match out {
         meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
@@ -169,18 +197,20 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
 fn checkpointing_is_skipped_below_the_soft_limit() {
     // Cheap in the common case: a small database should never pay for a checkpoint.
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("shard_0.db");
     let cfg = CheckpointConfig {
         soft_limit_bytes: 64 * 1024 * 1024,
         check_every_batches: 1,
         ..tight()
     };
-    let (w, _token) = Writer::spawn_with(&path, &PragmaProfile::writer_floor(), cfg).unwrap();
-    let h = w.handle();
+    let (w, _path) = spawn(&dir, cfg);
+    let h = &w;
 
-    h.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT")
-        .unwrap();
-    write_rows(&h, 1, 100);
+    h.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
+    )
+    .unwrap();
+    write_rows(h, 1, 100);
 
     let stats = w.checkpoint_stats();
     assert_eq!(
@@ -193,16 +223,18 @@ fn checkpointing_is_skipped_below_the_soft_limit() {
 #[test]
 fn readers_still_work_while_checkpointing_runs() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("shard_0.db");
-    let (w, token) = Writer::spawn_with(&path, &PragmaProfile::writer_floor(), tight()).unwrap();
-    let h = w.handle();
-    h.execute_one("CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT")
-        .unwrap();
+    let (w, path) = spawn(&dir, tight());
+    let h = &w;
+    h.execute_one(
+        S0,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pad TEXT) STRICT",
+    )
+    .unwrap();
 
-    let reader = open_reader(&path, &PragmaProfile::reader_floor(), &token).unwrap();
+    let reader = open_reader_existing(&path, &PragmaProfile::reader_floor()).unwrap();
 
     std::thread::scope(|s| {
-        s.spawn(|| write_rows(&h, 1, 1_500));
+        s.spawn(|| write_rows(h, 1, 1_500));
         // `Connection` is `Send` but not `Sync`, so the reader moves into its thread
         // rather than being borrowed by it.
         s.spawn(move || {

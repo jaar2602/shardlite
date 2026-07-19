@@ -1,88 +1,118 @@
-//! A single-database facade: routes each statement to the writer or to the reader pool.
+//! A facade over a sharded database: classify a statement, then route it.
+//!
+//! There is exactly one storage path — [`crate::shard::ShardManager`]. A single-database
+//! deployment is simply `shard_count = 1`, not a second implementation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::Connection;
 
-use crate::config::{PragmaProfile, ReaderPoolConfig};
+use crate::config::PragmaProfile;
 use crate::error::{Error, Result};
-use crate::storage::checkpoint::CheckpointStats;
+use crate::shard::manifest::Manifest;
+use crate::shard::reader_fleet::ReaderFleetStats;
+use crate::shard::writer_fleet::WriterFleetStats;
+use crate::shard::{ShardConfig, ShardId, ShardManager};
 use crate::storage::exec::Outcome;
-use crate::storage::open::open_reader;
-use crate::storage::reader::{ReaderPool, ReaderStats};
-use crate::storage::writer::{Writer, WriterHandle, WriterStats};
 
 pub struct Db {
-    writer: Writer,
-    readers: ReaderPool,
+    shards: ShardManager,
     /// Used only to ask SQLite whether a statement is read-only, never to run one.
     ///
-    /// It cannot come from the pool: classification has to happen *before* routing, and
-    /// borrowing a pool connection to decide where to send the work would occupy a reader
-    /// for every write too. Behind a `Mutex` so `Db` stays `Sync` — `Connection` is not.
+    /// Classification must happen *before* routing, so it cannot borrow a fleet connection
+    /// — that would occupy a reader for every write too. Points at shard 0, whose schema
+    /// matches every other shard because DDL is applied to all of them.
     classifier: Mutex<Connection>,
-    path: PathBuf,
+    dir: PathBuf,
 }
 
 impl Db {
-    /// Open `path` with the floor profile: one writer thread and a small reader pool.
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with(path, &ReaderPoolConfig::floor())
-    }
+    /// Open (or create) a meshdb data directory.
+    ///
+    /// `shard_count` is recorded in the manifest on creation and refused if it disagrees
+    /// with existing data.
+    pub fn open(dir: &Path, shard_count: u32) -> Result<Self> {
+        let cfg = ShardConfig {
+            shard_count,
+            ..ShardConfig::floor()
+        };
+        let shards = ShardManager::open(dir, cfg)?;
 
-    pub fn open_with(path: &Path, pool: &ReaderPoolConfig) -> Result<Self> {
-        // Order matters and is enforced by the token: the writer materializes the
-        // -wal/-shm sidecars that read-only connections cannot create.
-        let (writer, token) = Writer::spawn(path, &PragmaProfile::writer_floor())?;
-        let readers = ReaderPool::spawn(path, &PragmaProfile::reader_floor(), pool, &token)?;
-        let classifier = open_reader(path, &PragmaProfile::classifier_floor(), &token)?;
+        // The classifier is read-only and so cannot create its file; make sure shard 0
+        // exists first.
+        shards.ensure_open(ShardId::FIRST)?;
+        let path = ShardId::FIRST.path(dir);
+        let classifier =
+            crate::storage::open::open_reader_existing(&path, &PragmaProfile::classifier_floor())?;
 
         Ok(Self {
-            writer,
-            readers,
+            shards,
             classifier: Mutex::new(classifier),
-            path: path.to_path_buf(),
+            dir: dir.to_path_buf(),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
-    pub fn writer_stats(&self) -> WriterStats {
-        self.writer.stats()
+    pub fn manifest(&self) -> &Manifest {
+        self.shards.manifest()
     }
 
-    pub fn reader_stats(&self) -> ReaderStats {
-        self.readers.stats()
+    pub fn shard_count(&self) -> u32 {
+        self.shards.config().shard_count
     }
 
-    pub fn checkpoint_stats(&self) -> CheckpointStats {
-        self.writer.checkpoint_stats()
+    pub fn shards(&self) -> &ShardManager {
+        &self.shards
     }
 
-    pub fn handle(&self) -> WriterHandle {
-        self.writer.handle()
+    pub fn writer_stats(&self) -> WriterFleetStats {
+        self.shards.writer_stats()
     }
 
-    /// Execute one statement, routing it by whether SQLite considers it read-only.
-    pub fn run(&self, sql: &str) -> Result<Outcome> {
+    pub fn reader_stats(&self) -> ReaderFleetStats {
+        self.shards.reader_stats()
+    }
+
+    /// Execute one statement against `shard`, routed by whether SQLite considers it
+    /// read-only.
+    ///
+    /// DDL is **not** routed here — a schema change must reach every shard, so use
+    /// [`Self::run_all`].
+    pub fn run_on(&self, shard: ShardId, sql: &str) -> Result<Outcome> {
         reject_unsupported(sql)?;
 
         // PRAGMA reports as a write even when it only reads, so route it to a reader
-        // explicitly. `query_only = ON` there means a PRAGMA that tries to *set*
-        // something fails with a clear error rather than silently applying to one
-        // connection nobody else uses.
+        // explicitly. `query_only = ON` there means a PRAGMA that tries to *set* something
+        // fails with a clear error rather than silently applying to one connection nobody
+        // else uses.
         if first_keyword(sql) == "PRAGMA" {
-            return self.readers.query(sql);
+            return self.shards.query(shard, sql);
         }
 
         if self.is_readonly(sql)? {
-            self.readers.query(sql)
+            self.shards.query(shard, sql)
         } else {
-            self.writer.handle().execute_one(sql)
+            self.shards.execute_one(shard, sql)
         }
+    }
+
+    /// Apply a statement to **every** shard. This is how DDL is propagated.
+    ///
+    /// There is no atomicity across shards, so a partial failure leaves shards with
+    /// differing schemas. Per-shard outcomes are returned rather than collapsed for
+    /// exactly that reason.
+    pub fn run_all(&self, sql: &str) -> Result<Vec<(ShardId, Outcome)>> {
+        reject_unsupported(sql)?;
+        self.shards.execute_all_shards(sql)
+    }
+
+    /// True when a statement changes schema and therefore belongs on every shard.
+    pub fn is_ddl(sql: &str) -> bool {
+        matches!(first_keyword(sql).as_str(), "CREATE" | "DROP" | "ALTER")
     }
 
     /// Ask SQLite to classify the statement rather than pattern-matching its text.
@@ -105,11 +135,10 @@ impl Db {
 
 /// The leading keyword, upper-cased.
 ///
-/// Deliberately crude: this is a routing hint and a guard, not a parser. The real
-/// statement guard is an authorizer callback (step 8), which sees what SQLite actually
-/// resolved rather than what the text looks like. Notably this does not see past a
-/// leading comment.
-fn first_keyword(sql: &str) -> String {
+/// Deliberately crude: this is a routing hint and a guard, not a parser. The real statement
+/// guard is an authorizer callback (step 8), which sees what SQLite actually resolved
+/// rather than what the text looks like. Notably this does not see past a leading comment.
+pub fn first_keyword(sql: &str) -> String {
     sql.trim_start()
         .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
         .next()
