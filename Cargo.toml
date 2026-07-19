@@ -1,0 +1,22 @@
+[package]
+name = "meshdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# `bundled` is a correctness requirement, not a convenience: replication is byte-level,
+# so every node in a cluster must link the exact same SQLite. Linking the host distro's
+# libsqlite3 would let version skew across nodes become silent state divergence.
+#
+# Both are pinned exactly and must move together. This is a deliberate replication
+# requirement, not a workaround — the bundled SQLite version is not something to let cargo
+# drift, because it determines the on-disk WAL byte layout the VFS capture depends on.
+#
+# Bundled SQLite: 3.53.2. Requires Rust >= 1.94 (libsqlite3-sys 0.38.x build.rs uses
+# `cfg_select!`, stabilized after 1.93).
+rusqlite = { version = "=0.40.1", features = ["bundled", "hooks", "backup", "limits", "functions", "trace"] }
+libsqlite3-sys = "=0.38.1"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
