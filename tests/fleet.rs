@@ -267,6 +267,7 @@ fn a_full_read_queue_sheds_load_instead_of_growing() {
             &pool,
             PragmaProfile::reader_shard(),
             Arc::downgrade(&writers),
+            Arc::new(meshdb::shard::mode::ShardModes::new()),
         )
         .unwrap(),
     );
@@ -334,6 +335,7 @@ fn a_runaway_query_is_cancelled_at_the_deadline() {
         &pool,
         PragmaProfile::reader_shard(),
         Arc::downgrade(&writers),
+        Arc::new(meshdb::shard::mode::ShardModes::new()),
     )
     .unwrap();
 

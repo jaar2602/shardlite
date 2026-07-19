@@ -120,6 +120,20 @@ pub enum Error {
     NotLeader { highest_seen: u64 },
 
     #[error(
+        "promotion refused: the replication pull loop did not come to rest within {waited}. \
+         Opening SQLite on a file the replication path may still be rewriting is silent \
+         corruption, so this refuses instead"
+    )]
+    PromotionBlocked { waited: String },
+
+    #[error(
+        "{shard} is being followed on this node: the replication path owns the file and \
+         rewrites it behind SQLite's back, so no connection may be opened on it. Promote the \
+         shard first"
+    )]
+    ShardFollowed { shard: String },
+
+    #[error(
         "this node has left the cluster and no longer votes or acknowledges leaders; it is \
          shutting down"
     )]

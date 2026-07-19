@@ -32,11 +32,11 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 8 | Replication + per-shard bootstrap | **done** | `tests/replication.rs` (11) + `src/replication/` (3) |
 | 8b | Frame retention + networked follower | **done** | `tests/replica_net.rs` (8) + `src/replication/log.rs` (5) |
 | 9 | Per-shard merkle verification | not started | |
-| 10 | Cluster: election, fencing, failover | **quorum-ack + fencing done; promotion outstanding** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `src/cluster/` (40) |
+| 10 | Cluster: election, fencing, failover | **done** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `tests/promotion.rs` (5) + `src/cluster/` (44) |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**193 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**207 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -502,24 +502,41 @@ opens, not after it commits: a deposed leader that finds out afterwards has alre
 to a file another node may own. `Fence` implements it, and the trait lives in `shard` so the
 dependency points one way. Verified by removing the check — both cluster tests then fail.
 
-### Gap 3 — data-plane promotion, and a corruption risk it exposes
+### Gap 3 — data-plane promotion: closed, along with the corruption risk it exposed
 
-Still outstanding, and **larger than it looked**. Promotion means a follower's shard files
-become the ones its `ShardManager` writes to, so the two must address the same directory.
-Today they do not, and making them do so surfaces a hazard:
+A follower's `Follower` and `ShardManager` now address the **same directory**, so promotion
+is a handover rather than a copy. Making that safe required naming an invariant the design
+had never stated:
 
-- `Follower::apply` writes **raw pages**. `ShardManager` caches **open SQLite connections**
-  in an LRU and has no way to drop them.
-- A cached connection whose page cache is stale while the follower rewrites pages underneath
-  is silent corruption — and a read-only connection in that state can return wrong rows
-  rather than an error.
+> A shard is either **led** by this node — its `ShardManager` owns the file and SQLite has
+> exclusive charge of it — or **followed** — the replication path owns the file and no SQLite
+> connection may exist. Never both.
 
-So promotion needs two things before it is safe: a `quiesce()` that drops every cached
-connection for a shard, and an enforced invariant that a node is **either** following **or**
-leading a shard, never both. The invariant is the same one shard placement needs, which is
-why this lands with step 11 rather than being bolted on now.
+It is necessary because the follower bypasses SQLite entirely. `apply` writes raw pages;
+`install_snapshot` **renames a whole new file over the old one**. A connection open across
+either is broken in a way that never announces itself: after page writes it serves rows
+assembled from a stale cache, and after a rename it holds the **deleted inode** and reads a
+database frozen at the moment of replacement, forever. `PRAGMA integrity_check` passes in
+both cases, because the *file* is fine — it is the handle that is wrong.
 
-Recording it here rather than discovering it as corruption later.
+`shard::mode::ShardModes` enforces it where connections are opened, in both fleets, and
+defaults to `Led` so a standalone deployment pays nothing. `Promotion` owns the ordering,
+which is the whole correctness argument: demotion closes the write gate **first**, then hands
+over; promotion **waits for the pull loop to come to rest** and refuses if it does not,
+because a failed promotion is an outage while an optimistic one is corruption.
+
+**A bug found by testing this.** `ShardManager::follow` quiesced only the *writer* fleet, so
+cached **reader** connections survived the handover. The mode check hid it — a followed shard
+refuses opens, so nothing used them — until the shard was promoted again, at which point that
+stale handle became live and served the pre-rename inode. Fixed by quiescing both fleets.
+The test that should have caught it did not: it asserted the shard was refused, which the
+mode check alone satisfies. It now asserts on `closed_on_handover`, a count of connections
+actually closed, and fails at "closed 1 of them" when readers are skipped.
+
+**The cost, stated plainly:** a follower **cannot serve reads**. The original plan wanted
+follower reads for scale-out. Making that safe means applying frames through SQLite's own WAL
+so readers use ordinary WAL locking, rather than writing pages behind its back. That is a
+real change to the apply path, not a flag, and it is not done.
 
 ### Earlier: step 10 was reported complete when it was not
 
@@ -585,6 +602,15 @@ Three bugs found by testing, each verified non-vacuous by removing the fix:
 | A hung peer froze the election loop | Cluster RPCs inherited the client's 30 s read timeout. A peer that is *hung* rather than crashed — backlogged, paused, half-partitioned — accepts the connection and never answers, blocking the leader in a socket read for 30 s. A leader frozen that long never evaluates its lease, never steps down, and **keeps its write gate open the whole time** — the exact split-brain the lease exists to prevent. Peer round trips are now bounded at a third of the election timeout, on both connect and I/O. |
 | Adopting a higher term reset the election timer | A candidate that can never win, because the election restriction refuses it, would suppress the whole cluster forever: each time it stood it bumped the term, every peer reset its timer, and no qualified node ever got to stand. A leaderless cluster with no visible cause. |
 | A stopping node kept answering heartbeats | `stop()` ended a node's own loop but its server kept acknowledging leadership on connections already open, so a leader that had genuinely lost its cluster kept being told it still had one. Departure has to be visible to peers, not only to the departing node. |
+
+### Known flaky test
+
+`checkpoint::a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation` failed twice
+in three full-suite runs under heavy parallel load, then passed in six consecutive runs
+across both this branch and the tree without these changes. It is timing-sensitive — it
+races WAL growth against the escalation threshold — and nothing in this work touches
+checkpointing. Not attributed to these changes, but not dismissed either: it should be made
+deterministic rather than left to fail occasionally in CI.
 
 ### Debt deliberately deferred
 

@@ -49,6 +49,13 @@ enum Job {
         shard: ShardId,
         reply: SyncSender<Result<()>>,
     },
+    /// Close whatever is cached for a shard, so its file can be handed to the replication
+    /// path. A connection left open across raw page writes serves stale rows with no error,
+    /// so the handover must close it rather than merely stop using it.
+    Quiesce {
+        shard: ShardId,
+        reply: SyncSender<bool>,
+    },
     /// Freeze a shard's main file and report the position it represents.
     BeginSnapshot {
         shard: ShardId,
@@ -139,7 +146,16 @@ impl WriterFleet {
         profile: PragmaProfile,
         checkpoint: CheckpointConfig,
     ) -> Result<Self> {
-        Self::spawn_with_sink(dir, cfg, profile, checkpoint, None, None, None)
+        Self::spawn_with_sink(
+            dir,
+            cfg,
+            profile,
+            checkpoint,
+            None,
+            None,
+            None,
+            Arc::new(crate::shard::mode::ShardModes::new()),
+        )
     }
 
     /// Start the fleet, optionally streaming captured frames to `sink`.
@@ -157,6 +173,7 @@ impl WriterFleet {
         sink: Option<Arc<dyn FrameSink>>,
         acks: Option<Arc<crate::replication::AckTracker>>,
         gate: Option<Arc<dyn crate::shard::WriteGate>>,
+        modes: Arc<crate::shard::mode::ShardModes>,
     ) -> Result<Self> {
         cfg.validate()?;
         let positions = if cfg.capture {
@@ -188,6 +205,7 @@ impl WriterFleet {
                 sink: sink.clone(),
                 acks: acks.clone(),
                 gate: gate.clone(),
+                modes: modes.clone(),
                 positions: positions.clone(),
                 counters: Arc::clone(&counters),
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
@@ -284,6 +302,24 @@ impl WriterFleet {
     /// Expensive in two ways worth knowing before scheduling it: it needs roughly twice the
     /// shard's size in free disk, and it rewrites every page, so with capture on it
     /// produces a replication stream the size of the whole shard.
+    /// Close any cached connection for `shard` on every writer thread.
+    pub fn quiesce(&self, shard: ShardId) -> Result<usize> {
+        // Sent to every thread, not just the shard's owner: hash affinity decides which
+        // thread *serves* a shard, but an earlier configuration may have left an entry
+        // elsewhere, and a missed handle is exactly the one that corrupts.
+        let mut closed = 0;
+        for tx in &self.senders {
+            let (reply, rx) = std::sync::mpsc::sync_channel(1);
+            if tx.send(Job::Quiesce { shard, reply }).is_err() {
+                continue;
+            }
+            if rx.recv().map_err(|_| Error::WriterGone)? {
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
     pub fn vacuum(&self, shard: ShardId) -> Result<()> {
         let (reply_tx, reply_rx) = sync_channel(1);
         self.sender(shard)?
@@ -410,6 +446,8 @@ struct ThreadCtx {
     acks: Option<Arc<crate::replication::AckTracker>>,
     /// Leadership check. `None` on a standalone node, which always may write.
     gate: Option<Arc<dyn crate::shard::WriteGate>>,
+    /// Which shards this node owns the files of. Consulted before any connection is opened.
+    modes: Arc<crate::shard::mode::ShardModes>,
     positions: Option<Arc<StreamPositions>>,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
@@ -445,6 +483,13 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
                 continue;
             }
+            Job::Quiesce { shard, reply } => {
+                // Dropping the entry closes the connection. Nothing else is needed: the
+                // point is only that no handle survives into the replication path's writes.
+                let closed = open.remove(shard).is_some();
+                let _ = reply.send(closed);
+                continue;
+            }
             Job::Shutdown => return,
         }
 
@@ -468,6 +513,10 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 }
                 Ok(Job::Vacuum { shard, reply }) => {
                     let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
+                }
+                Ok(Job::Quiesce { shard, reply }) => {
+                    let closed = open.remove(shard).is_some();
+                    let _ = reply.send(closed);
                 }
                 Ok(Job::Shutdown) => {
                     // Honour it only after the batch in hand commits — dropping it would
@@ -763,6 +812,11 @@ fn ensure_shard<'a>(
     ctx: &ThreadCtx,
     shard: ShardId,
 ) -> Result<&'a mut OpenShard> {
+    // Checked before anything is opened. A followed shard's file is rewritten behind
+    // SQLite's back, so a connection on it serves stale rows with no error — the one failure
+    // mode that no later check can detect.
+    ctx.modes.check_may_open(shard)?;
+
     let path = shard.path(&ctx.dir);
     let profile = ctx.profile.clone();
     let checkpoint = ctx.checkpoint.clone();

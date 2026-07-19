@@ -96,6 +96,15 @@ impl<V> Lru<V> {
             .map(|(id, _)| *id)
     }
 
+    /// Drop a shard's entry, closing whatever it held.
+    ///
+    /// Used to hand a shard's file over to the replication path: a connection left open
+    /// across raw page writes serves stale data with no error, so the handover has to close
+    /// it rather than merely stop using it.
+    pub fn remove(&mut self, id: ShardId) -> Option<V> {
+        self.entries.remove(&id).map(|(_, v)| v)
+    }
+
     pub fn values_mut(&mut self) -> impl Iterator<Item = (ShardId, &mut V)> {
         self.entries.iter_mut().map(|(id, (_, v))| (*id, v))
     }

@@ -28,6 +28,7 @@
 
 pub mod lru;
 pub mod manifest;
+pub mod mode;
 pub mod reader_fleet;
 pub mod writer_fleet;
 
@@ -220,6 +221,7 @@ pub struct ShardManager {
     cfg: ShardConfig,
     dir: PathBuf,
     manifest: Manifest,
+    modes: std::sync::Arc<mode::ShardModes>,
 }
 
 impl ShardManager {
@@ -296,6 +298,7 @@ impl ShardManager {
         gate: Option<std::sync::Arc<dyn WriteGate>>,
     ) -> crate::Result<Self> {
         cfg.validate()?;
+        let modes = std::sync::Arc::new(mode::ShardModes::new());
         // Before anything is opened: refuse a shard count that disagrees with the data
         // already on disk. Discovering that later means rows silently unreachable.
         let manifest = Manifest::open_or_create(dir, cfg.shard_count)?;
@@ -307,6 +310,7 @@ impl ShardManager {
             sink,
             acks,
             gate,
+            std::sync::Arc::clone(&modes),
         )?);
         let readers = ReaderFleet::spawn(
             dir,
@@ -314,6 +318,7 @@ impl ShardManager {
             &crate::config::ReaderPoolConfig::floor(),
             reader,
             std::sync::Arc::downgrade(&writers),
+            std::sync::Arc::clone(&modes),
         )?;
         Ok(Self {
             writers,
@@ -321,7 +326,41 @@ impl ShardManager {
             cfg,
             dir: dir.to_path_buf(),
             manifest,
+            modes,
         })
+    }
+
+    /// Hand `shard`'s file to the replication path.
+    ///
+    /// Closes every cached connection **before** marking the shard followed, and in that
+    /// order: marking first would still leave live handles open, and it is the surviving
+    /// handle — not the mark — that corrupts.
+    pub fn follow(&self, shard: ShardId) -> crate::Result<()> {
+        self.modes.set(shard, mode::ShardMode::Followed);
+        // Both fleets. Readers especially: a read-only handle kept across the follower's
+        // file rename holds the deleted inode, and once the shard is promoted again that
+        // cached connection becomes usable and serves a database frozen at the moment of
+        // replacement.
+        let closed = self.writers.quiesce(shard)? + self.readers.quiesce(shard)?;
+        self.modes.record_handover(closed);
+        Ok(())
+    }
+
+    /// Take ownership of `shard`'s file back from the replication path.
+    ///
+    /// The caller must already have stopped replicating this shard. Nothing here can verify
+    /// that — a follower mid-apply holds no lock SQLite can see — so it is the promotion
+    /// sequence's job, not this method's.
+    pub fn lead(&self, shard: ShardId) {
+        self.modes.set(shard, mode::ShardMode::Led);
+    }
+
+    pub fn mode(&self, shard: ShardId) -> mode::ShardMode {
+        self.modes.mode(shard)
+    }
+
+    pub fn modes(&self) -> &std::sync::Arc<mode::ShardModes> {
+        &self.modes
     }
 
     pub fn manifest(&self) -> &Manifest {

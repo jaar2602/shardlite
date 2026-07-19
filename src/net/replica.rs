@@ -70,6 +70,11 @@ pub struct Replica {
     follower: Arc<Follower>,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
+    /// Whether [`Self::run`] is inside the loop. Promotion has to wait for this to clear:
+    /// asking the loop to stop is not the same as it having stopped, and a follower still
+    /// mid-apply while the manager opens connections is the corruption the mode invariant
+    /// exists to prevent.
+    running: Arc<AtomicBool>,
 }
 
 impl Replica {
@@ -79,6 +84,7 @@ impl Replica {
             follower,
             counters: Arc::new(Counters::default()),
             stop: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -113,7 +119,14 @@ impl Replica {
     }
 
     /// Follow until stopped.
+    /// Whether the pull loop is currently running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
     pub fn run(&self) -> Result<()> {
+        self.running.store(true, Ordering::Relaxed);
+        let _idle = IdleOnDrop(Arc::clone(&self.running));
         while !self.stop.load(Ordering::Relaxed) {
             match self.sync_once() {
                 Ok(()) => {}
@@ -224,6 +237,16 @@ impl Replica {
         result?;
         released?;
         Ok(())
+    }
+}
+
+/// Clears the running flag however `run` exits, including on a panic. A flag left set would
+/// make promotion wait forever for a loop that has already gone.
+struct IdleOnDrop(Arc<AtomicBool>);
+
+impl Drop for IdleOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 

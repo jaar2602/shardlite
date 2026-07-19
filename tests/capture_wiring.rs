@@ -40,6 +40,7 @@ fn fleet(dir: &TempDir, cfg: ShardConfig, sink: Option<Arc<dyn FrameSink>>) -> W
         sink,
         None,
         None,
+        std::sync::Arc::new(meshdb::shard::mode::ShardModes::new()),
     )
     .unwrap()
 }

@@ -23,10 +23,20 @@ use crate::error::{Error, Result};
 use crate::storage::exec::{self, Outcome, SqlError, Statement};
 use crate::storage::open::open_reader_existing;
 
-struct Job {
-    shard: ShardId,
-    statement: Statement,
-    reply: SyncSender<Result<Outcome>>,
+enum Job {
+    Query {
+        shard: ShardId,
+        statement: Statement,
+        reply: SyncSender<Result<Outcome>>,
+    },
+    /// Close any cached connection for a shard, so its file can be handed to the replication
+    /// path. Readers matter here more than writers: a read-only handle kept across a
+    /// follower's file rename holds the deleted inode and serves a frozen database forever,
+    /// with no error and a passing integrity check.
+    Quiesce {
+        shard: ShardId,
+        reply: SyncSender<bool>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +77,7 @@ impl ReaderFleet {
         pool: &ReaderPoolConfig,
         profile: PragmaProfile,
         writers: Weak<WriterFleet>,
+        modes: Arc<super::mode::ShardModes>,
     ) -> Result<Self> {
         let (tx, rx) = flume::bounded::<Job>(pool.queue_capacity);
         let counters = Arc::new(Counters::default());
@@ -80,6 +91,7 @@ impl ReaderFleet {
                 timeout: pool.query_timeout,
                 counters: Arc::clone(&counters),
                 writers: writers.clone(),
+                modes: Arc::clone(&modes),
             };
             let rx = rx.clone();
             let handle = std::thread::Builder::new()
@@ -97,6 +109,25 @@ impl ReaderFleet {
         })
     }
 
+    /// Close any cached connection for `shard` on every reader thread.
+    ///
+    /// Returns how many were closed. Sent to every thread because a shard may have been
+    /// served by more than one over its life, and a missed handle is exactly the one that
+    /// later serves stale rows.
+    pub fn quiesce(&self, shard: ShardId) -> Result<usize> {
+        let tx = self.tx.as_ref().ok_or(Error::ReaderPoolGone)?;
+        let mut closed = 0;
+        for _ in 0..self.n_threads {
+            let (reply, rx) = sync_channel(1);
+            tx.send(Job::Quiesce { shard, reply })
+                .map_err(|_| Error::ReaderPoolGone)?;
+            if rx.recv().map_err(|_| Error::ReaderPoolGone)? {
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
     /// Run a read-only statement against one shard on the next free reader.
     pub fn query(&self, shard: ShardId, sql: impl Into<Statement>) -> Result<Outcome> {
         let (reply_tx, reply_rx) = sync_channel(1);
@@ -104,7 +135,7 @@ impl ReaderFleet {
 
         // `try_send`, never `send`: blocking would convert backpressure into an unbounded
         // latency queue held in caller threads instead of in memory.
-        tx.try_send(Job {
+        tx.try_send(Job::Query {
             shard,
             statement: sql.into(),
             reply: reply_tx,
@@ -150,19 +181,34 @@ struct ThreadCtx {
     timeout: Duration,
     counters: Arc<Counters>,
     writers: Weak<WriterFleet>,
+    /// Readers are subject to the same invariant as writers, and for a sharper reason: a
+    /// read-only connection held across a follower's file rename keeps the deleted inode and
+    /// serves a frozen database forever, with no error anywhere.
+    modes: Arc<super::mode::ShardModes>,
 }
 
 fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
     let mut open: Lru<Connection> = Lru::new(ctx.capacity);
 
     while let Ok(job) = rx.recv() {
-        ctx.counters.queries.fetch_add(1, Ordering::Relaxed);
-
-        let result = match ensure_shard(&mut open, &ctx, job.shard) {
-            Ok(conn) => run_with_deadline(conn, &job.statement, ctx.timeout, &ctx.counters),
-            Err(e) => Err(e),
-        };
-        let _ = job.reply.send(result);
+        match job {
+            Job::Query {
+                shard,
+                statement,
+                reply,
+            } => {
+                ctx.counters.queries.fetch_add(1, Ordering::Relaxed);
+                let result = match ensure_shard(&mut open, &ctx, shard) {
+                    Ok(conn) => run_with_deadline(conn, &statement, ctx.timeout, &ctx.counters),
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(result);
+            }
+            Job::Quiesce { shard, reply } => {
+                let closed = open.remove(shard).is_some();
+                let _ = reply.send(closed);
+            }
+        }
     }
 }
 
@@ -171,6 +217,10 @@ fn ensure_shard<'a>(
     ctx: &ThreadCtx,
     shard: ShardId,
 ) -> Result<&'a mut Connection> {
+    // Before anything, including the round trip to the writer: a followed shard must not be
+    // opened, and asking the writer to create it would be the wrong move too.
+    ctx.modes.check_may_open(shard)?;
+
     if !open.contains(shard) {
         // Cold shard. A read-only connection cannot *create* the database file, so a shard
         // that has never been written to cannot be opened by a reader at all — ask the
