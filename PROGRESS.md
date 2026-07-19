@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**106 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**108 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -323,11 +323,23 @@ Capture's CPU cost, measured separately by `cargo run --example vfs_overhead`: *
   write never ran — a cross-shard `count(*)` returned 0 after three successful-looking
   inserts. The CLI now checks `Db::is_read` before fanning out. Caught only because the
   manual check printed the count; the smoke test had sent the inserts to `/dev/null`.
-- **The `SQLITE_BUSY`-at-open test is load-sensitive, not wrong.** It passes in isolation and
-  under its own suite, and failed only with the whole suite running in parallel. Asserting
-  zero failures made it flaky; it now asserts that no failure happened *immediately*, since
-  an unset timeout fails in microseconds while a genuine expiry takes seconds. The
-  underlying cause is still not root-caused.
+- **`PRAGMA journal_mode = WAL` does not honour `busy_timeout`.** Measured on 3.53.2: with a
+  5000 ms timeout set and another connection holding the write lock, it gives up after
+  **23 microseconds**, while an ordinary `INSERT` on the same connection waits the full
+  5.01 seconds. SQLite does not invoke the busy handler for a journal-mode change.
+  `open_writer` now retries the conversion explicitly with backoff, which terminates because
+  whoever holds the lock is either converting it themselves — after which the pragma is a
+  no-op returning `wal` — or committing a write, after which the lock frees. Reproduction:
+  1 to 3 failures per 720 concurrent opens without the retry, 0 in 2160 with it.
+- **An earlier diagnosis of that bug was wrong.** Moving `busy_timeout` ahead of
+  `journal_mode` was based on the theory that the timeout was unset. The ordering is still
+  right, but it was never the cause: the timeout was set and SQLite ignored it. The tests
+  written for that fix passed either way, which was the signal that the diagnosis was
+  unproven rather than merely untested.
+- **A stale binary made the fix look broken.** The reproduction harness linked the library
+  as an rlib, so rebuilding the library alone left it exercising the old code — showing
+  failures that were already fixed. Recompiling the harness with the library is part of the
+  check, not an afterthought.
 - **A blocking request/reply API caps queue depth at the caller count.** The write queue
   bound was initially untestable for this reason: 32 threads cannot fill a 1024-deep queue
   when each blocks until its batch commits. The first version of the backpressure test
@@ -409,7 +421,6 @@ the trace comparison (`take_trace()`) before trusting capture.
 
 | Gap | Note |
 |---|---|
-| `busy_timeout` ordering fix unproven | Correct on its own merits, but neither test discriminates it and the 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
 | `capture_for` must precede open | Registering later silently misses frames; enforced by convention, not types. |
 | No cross-shard atomicity, ever | WAL gives no atomic commit across ATTACHed databases. Permanent, and it shapes the user-facing API. |
 | Client-held transactions unsupported | A held `BEGIN` would pin the writer and defeat batching. Permanent. |

@@ -22,25 +22,12 @@ const TRUSTED_SCHEMA_OFF: i64 = 0;
 ///
 /// Does not verify — call [`verify`] afterwards. [`crate::storage::open`] does both.
 pub fn apply(conn: &Connection, p: &PragmaProfile, db_path: &str) -> Result<()> {
-    // FIRST, before anything that can take a database lock.
-    //
-    // This ordering is load-bearing, not cosmetic. `journal_mode = WAL` acquires a lock,
-    // and until `busy_timeout` is set SQLite uses its default of **zero** — so a contended
-    // open fails instantly with SQLITE_BUSY instead of waiting the configured timeout.
-    // Found by the 1-CPU benchmark: 16 threads opening the same database concurrently all
-    // failed here. It did not reproduce on a 32-core host, where the window is too narrow.
+    // First, so every later statement has it. Note that this does NOT protect the
+    // journal-mode change below — see `set_wal_mode`.
     set(conn, "busy_timeout", &p.busy_timeout_ms.to_string())?;
 
     if p.role == Role::Writer {
-        // Persistent (stored in the file), and the return value is the resulting mode
-        // rather than an error on failure — hence the explicit check.
-        let got: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        if !got.eq_ignore_ascii_case("wal") {
-            return Err(Error::WalUnavailable {
-                path: db_path.to_string(),
-                got,
-            });
-        }
+        set_wal_mode(conn, p, db_path)?;
 
         // Persistent. Keeps unpredictable page churn out of the write and replication path.
         set(conn, "auto_vacuum", "NONE")?;
@@ -112,6 +99,55 @@ pub fn verify(conn: &Connection, p: &PragmaProfile) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Convert the database to WAL mode, retrying while another connection holds the lock.
+///
+/// **`busy_timeout` does not apply to a journal-mode change.** Measured on 3.53.2: with a
+/// 5000 ms timeout set and another connection holding the write lock, this pragma gives up
+/// after **23 microseconds**, while an ordinary `INSERT` on the same connection waits the
+/// full 5.01 seconds. SQLite does not invoke the busy handler for this operation, so the
+/// retry has to be explicit.
+///
+/// (An earlier attempt moved `busy_timeout` ahead of this statement on the theory that the
+/// timeout was merely unset. That ordering is still right, but it was not the cause — the
+/// timeout was set and SQLite ignored it.)
+///
+/// Retrying is safe and terminates for a good reason: whoever holds the lock is either
+/// converting the database themselves, after which this pragma becomes a no-op that returns
+/// `wal`, or committing a write, after which the lock is free.
+fn set_wal_mode(conn: &Connection, p: &PragmaProfile, db_path: &str) -> Result<()> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(p.busy_timeout_ms.max(0) as u64);
+    let mut backoff = std::time::Duration::from_millis(1);
+
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(got) if got.eq_ignore_ascii_case("wal") => return Ok(()),
+            // A different mode came back, which is not contention — the filesystem cannot
+            // support WAL. Retrying would never help.
+            Ok(got) => {
+                return Err(Error::WalUnavailable {
+                    path: db_path.to_string(),
+                    got,
+                });
+            }
+            Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(Error::Sqlite(e)),
+        }
+    }
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ffi::ErrorCode::DatabaseBusy
+                || err.code == rusqlite::ffi::ErrorCode::DatabaseLocked
+    )
 }
 
 /// PRAGMA statements cannot take bound parameters, so they are formatted. Every caller

@@ -153,65 +153,74 @@ fn wal_sidecars_exist_after_writer_open() {
 }
 
 #[test]
-fn concurrent_opens_of_the_same_database_do_not_fail_busy() {
-    // Smoke test for concurrent opens.
+fn opening_while_another_connection_holds_the_write_lock_succeeds() {
+    // Deterministic version of a race that used to appear only under load.
     //
-    // Honest limitation: this does NOT reproduce the SQLITE_BUSY-at-open failure seen in
-    // the 1-CPU benchmark. It was written as a regression test for the `busy_timeout`
-    // ordering fix and then checked by reintroducing the bug — it passed either way, so it
-    // does not discriminate. It is kept because "many threads can open the same database"
-    // is worth holding, not because it guards that fix.
+    // The cause, measured on 3.53.2: `PRAGMA journal_mode = WAL` does **not** honour
+    // `busy_timeout`. With a 5000 ms timeout set and another connection holding the write
+    // lock, it gives up after 23 microseconds, while an ordinary INSERT on the same
+    // connection waits the full 5.01 seconds. SQLite does not invoke the busy handler for a
+    // journal-mode change, so `open_writer` retries it explicitly.
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
-    // A failure is only acceptable if it waited. Under heavy machine load a genuine
-    // busy-timeout expiry is possible, and asserting zero failures makes this test flaky
-    // rather than wrong — it failed only when the whole suite ran in parallel. What must
-    // never happen is an *immediate* failure, which is what an unset timeout looks like.
-    let quick_failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let timeout = PragmaProfile::writer_floor().busy_timeout_ms as u128;
+    // A holds the write lock on a database that is NOT yet in WAL mode, which is exactly
+    // the state a second opener has to convert.
+    let holder = meshdb::rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("CREATE TABLE t(x);").unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
+    let opener = {
+        let path = path.clone();
+        std::thread::spawn(move || open_writer(&path, &PragmaProfile::writer_floor()).is_ok())
+    };
+
+    // Hold it long enough that a non-retrying open would certainly have given up.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    holder.execute_batch("COMMIT;").unwrap();
+
+    assert!(
+        opener.join().unwrap(),
+        "open_writer gave up instead of retrying the WAL conversion"
+    );
+}
+
+#[test]
+fn many_concurrent_opens_of_a_fresh_database_all_succeed() {
+    // The shape that surfaced the bug: threads racing to convert the same fresh database.
+    // Some are mid-conversion while others already hold the write lock.
+    let dir = TempDir::new().unwrap();
+    let path = db_path(&dir);
+
+    let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::scope(|s| {
         for _ in 0..24 {
             let path = path.clone();
-            let quick = std::sync::Arc::clone(&quick_failures);
-            s.spawn(move || {
-                let t0 = std::time::Instant::now();
-                match open_writer(&path, &PragmaProfile::writer_floor()) {
+            let failures = std::sync::Arc::clone(&failures);
+            s.spawn(
+                move || match open_writer(&path, &PragmaProfile::writer_floor()) {
                     Ok(conn) => {
-                        // Hold it briefly so the opens genuinely overlap.
-                        let _ = conn.execute_batch("SELECT 1");
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        let _ = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;");
                     }
                     Err(_) => {
-                        // Half the configured timeout is generous; an unset timeout fails
-                        // in microseconds.
-                        if t0.elapsed().as_millis() < timeout / 2 {
-                            quick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-            });
+                },
+            );
         }
     });
 
     assert_eq!(
-        quick_failures.load(std::sync::atomic::Ordering::Relaxed),
+        failures.load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "an open failed without waiting for the busy timeout, which is what an unset \
-         timeout looks like"
+        "concurrent opens of a fresh database must all succeed"
     );
 }
 
 #[test]
 fn a_contended_open_waits_on_the_busy_timeout_instead_of_failing() {
-    // Verifies that a contended open waits for the lock rather than failing.
-    //
-    // Same honest caveat as above: this passes with and without the `busy_timeout`
-    // ordering fix, because by the time `materialize_wal` takes the write lock the timeout
-    // has been set in either ordering. The ordering fix is justified on its own merits —
-    // no statement that can take a lock should run before the timeout is configured — but
-    // it is NOT demonstrated by this test.
+    // Covers the ordinary-write half: once the database is already in WAL mode,
+    // `materialize_wal`'s BEGIN IMMEDIATE does honour `busy_timeout` and waits.
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
