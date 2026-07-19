@@ -23,5 +23,9 @@ thiserror = "2.0"
 # the async/select machinery); the async half is available when the network server needs it.
 flume = { version = "0.12.0", default-features = false }
 
+[[bench]]
+name = "write_throughput"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"

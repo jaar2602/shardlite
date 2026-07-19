@@ -22,6 +22,15 @@ const TRUSTED_SCHEMA_OFF: i64 = 0;
 ///
 /// Does not verify — call [`verify`] afterwards. [`crate::storage::open`] does both.
 pub fn apply(conn: &Connection, p: &PragmaProfile, db_path: &str) -> Result<()> {
+    // FIRST, before anything that can take a database lock.
+    //
+    // This ordering is load-bearing, not cosmetic. `journal_mode = WAL` acquires a lock,
+    // and until `busy_timeout` is set SQLite uses its default of **zero** — so a contended
+    // open fails instantly with SQLITE_BUSY instead of waiting the configured timeout.
+    // Found by the 1-CPU benchmark: 16 threads opening the same database concurrently all
+    // failed here. It did not reproduce on a 32-core host, where the window is too narrow.
+    set(conn, "busy_timeout", &p.busy_timeout_ms.to_string())?;
+
     if p.role == Role::Writer {
         // Persistent (stored in the file), and the return value is the resulting mode
         // rather than an error on failure — hence the explicit check.
@@ -52,7 +61,6 @@ pub fn apply(conn: &Connection, p: &PragmaProfile, db_path: &str) -> Result<()> 
     }
 
     set(conn, "synchronous", p.synchronous.as_keyword())?;
-    set(conn, "busy_timeout", &p.busy_timeout_ms.to_string())?;
     set(
         conn,
         "foreign_keys",

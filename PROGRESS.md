@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 6 of 12 · **Status:** sharded single-node engine; **VFS spike PASSED**
+**Updated:** 2026-07-19 · **Steps complete:** 7 of 12 · **Status:** sharded single-node engine; **VFS spike PASSED**; **floor profile measured**
 
 ---
 
@@ -27,7 +27,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 3 | Reader pool | **done** | `tests/reader_pool.rs` (5) |
 | 4 | WAL checkpointing | **done** | `tests/checkpoint.rs` (5) |
 | 5 | Shard manager (LRU, thread affinity) | **done** | `tests/shard.rs` (9) + `src/shard/` (6) |
-| 6 | Benchmarks + cgroup memory test | not started | |
+| 6 | Benchmarks + cgroup memory test | **done** | `benches/write_throughput.rs`, `src/bin/memcheck.rs`, `scripts/bench.sh` |
 | 7 | VFS capture productionized | not started | **unblocked** |
 | 8 | Replication + per-shard bootstrap | not started | **unblocked** |
 | 9 | Per-shard merkle verification | not started | |
@@ -35,7 +35,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**59 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
+**61 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -144,6 +144,34 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | Every `Value` kind round-trips | `every_value_kind_round_trips_through_binding` |
 | **Write queue sheds load when full** | `a_full_write_queue_sheds_load_instead_of_growing` |
 
+### Benchmarks — 1 CPU / 1 GB container, real fsync (~1.5 ms)
+
+Run with `./scripts/bench.sh`. 4000 writes per configuration.
+
+**`synchronous = FULL`** (durable):
+
+| C | A-contend | B-batched | B-nobatch | B/B-nb | mean batch |
+|---|---|---|---|---|---|
+| 1 | 631/s | 708/s | 725/s | 0.98x | 1.00 |
+| 4 | 609/s | 1,645/s | 727/s | 2.26x | 2.91 |
+| 16 | 674/s **(1000 errors)** | 7,353/s | 696/s | 10.6x | 14.8 |
+| 64 | 640/s **(2108 errors)** | **17,537/s** | 733/s | 23.9x | 60.1 |
+
+- **B-batched scales 24.8x** from C=1 to C=64. **B-nobatch is flat within 5%** (725 → 733).
+  Identical serialization, only batching differs — so the win is attributable to batching,
+  which is the entire reason the B-nobatch variant exists.
+- **A-contend does not merely degrade, it fails.** At C=64, 2108 of 3968 writes error out,
+  and p999 reaches **1755 ms** against 24 ms for B.
+
+**Peak RSS**, 64 shards, hard 150 MB cgroup cap (OOM-kill on breach):
+
+| On disk | Peak RSS |
+|---|---|
+| 344 MB | 46 MB |
+| 1371 MB | **47 MB** |
+
+Data grew 4x; RSS moved 1 MB. `open_now` sat at exactly 16 — the LRU ceiling.
+
 ### Measured, not assumed
 
 - **Group commit: 801 requests committed in 63 transactions** (16 threads × 50 inserts),
@@ -176,6 +204,21 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
   when each blocks until its batch commits. The first version of the backpressure test
   passed while shedding **zero** writes — it would have passed identically against an
   unbounded channel. Caught only by printing the number rather than asserting on it.
+- **This host's `/tmp` completes an fsync in 0.3 us** — it is not flushing to durable
+  media. A real fsync is 100 us to 10 ms. The first benchmark run was therefore measuring
+  CPU and lock overhead only, and the group-commit result was meaningless: FULL and NORMAL
+  were indistinguishable, and B/B-nobatch was 2.4x where the model predicted ~57x. The
+  container's overlay filesystem does a real ~1.5 ms fsync, which is why `scripts/bench.sh`
+  runs there. **Benchmark the storage, not just the code.**
+- **The B/B-nobatch ratio tracks mean batch size only insofar as fsync dominates.** At
+  `FULL`, C=64: ratio 23.9 against a mean batch of 60. At `NORMAL`, same batch size, ratio
+  only 6.75 — because batching amortizes the *fsync*, not the per-statement CPU (prepare,
+  bind, savepoint, b-tree insert). The original prediction of `ratio ~ mean_batch` was
+  wrong; this is the better model.
+- **The queue costs ~11x at a single client on fast storage.** `NORMAL`, C=1: raw SQLite
+  41,593/s versus 3,859/s through the writer thread — the channel round trip dominates when
+  there is no fsync to hide behind. The design is a *loss* for one client on cheap-sync
+  storage and a 24x win for concurrent clients on durable storage.
 - **The VFS write pattern itself is clean**: header then page data, no odd-sized writes, in
   the workloads traced. `WalCapture::take_trace()` reproduces this analysis when the bundled
   SQLite version is bumped.
@@ -216,6 +259,7 @@ the trace comparison (`take_trace()`) before trusting capture.
 | `first_keyword` guard cannot see past a leading comment | `-- x\nBEGIN` slips through. Real guard is the authorizer (step 8) |
 | No `VACUUM` path | Rejected outright; needs an out-of-transaction maintenance mode |
 | Checkpoint test suite takes ~20s | Real fsyncs; acceptable but the slowest thing in CI |
+| `busy_timeout` ordering fix is unproven | Moving it before lock-taking statements is correct on its own merits, but neither test discriminates it — both pass with the bug reintroduced. The 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
 | Capture holds an uncommitted txn fully in memory | A huge single transaction is unbounded; needs a spill or cap |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |

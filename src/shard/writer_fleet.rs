@@ -23,9 +23,6 @@ use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
 use crate::storage::exec::{Outcome, Statement};
 use crate::storage::open::open_writer;
 
-/// Upper bound on statements merged into one shard's transaction.
-const MAX_REQUESTS_PER_TXN: usize = 64;
-
 struct Pending {
     shard: ShardId,
     statements: Vec<Statement>,
@@ -125,6 +122,7 @@ impl WriterFleet {
                 profile: profile.clone(),
                 checkpoint: checkpoint.clone(),
                 capacity: cfg.open_writers_per_thread,
+                max_batch: cfg.max_batch,
                 counters: Arc::clone(&counters),
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
             };
@@ -241,6 +239,7 @@ struct ThreadCtx {
     profile: PragmaProfile,
     checkpoint: CheckpointConfig,
     capacity: usize,
+    max_batch: usize,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
 }
@@ -269,7 +268,7 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
         // Drain whatever else has already queued. This is what produces group commit:
         // everything that arrived while the previous COMMIT was fsyncing gets absorbed.
         let mut requests = pending[0].statements.len();
-        while requests < MAX_REQUESTS_PER_TXN {
+        while requests < ctx.max_batch {
             match rx.try_recv() {
                 Ok(Job::Write(p)) => {
                     requests += p.statements.len();

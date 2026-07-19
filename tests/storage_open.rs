@@ -151,3 +151,81 @@ fn wal_sidecars_exist_after_writer_open() {
     assert!(wal.exists(), "-wal should exist at {}", wal.display());
     assert!(shm.exists(), "-shm should exist at {}", shm.display());
 }
+
+#[test]
+fn concurrent_opens_of_the_same_database_do_not_fail_busy() {
+    // Smoke test for concurrent opens.
+    //
+    // Honest limitation: this does NOT reproduce the SQLITE_BUSY-at-open failure seen in
+    // the 1-CPU benchmark. It was written as a regression test for the `busy_timeout`
+    // ordering fix and then checked by reintroducing the bug — it passed either way, so it
+    // does not discriminate. It is kept because "many threads can open the same database"
+    // is worth holding, not because it guards that fix.
+    let dir = TempDir::new().unwrap();
+    let path = db_path(&dir);
+
+    let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|s| {
+        for _ in 0..24 {
+            let path = path.clone();
+            let failures = std::sync::Arc::clone(&failures);
+            s.spawn(move || {
+                match open_writer(&path, &PragmaProfile::writer_floor()) {
+                    Ok(conn) => {
+                        // Hold it briefly so the opens genuinely overlap.
+                        let _ = conn.execute_batch("SELECT 1");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        failures.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "concurrent opens must wait on the busy timeout, not fail immediately"
+    );
+}
+
+#[test]
+fn a_contended_open_waits_on_the_busy_timeout_instead_of_failing() {
+    // Verifies that a contended open waits for the lock rather than failing.
+    //
+    // Same honest caveat as above: this passes with and without the `busy_timeout`
+    // ordering fix, because by the time `materialize_wal` takes the write lock the timeout
+    // has been set in either ordering. The ordering fix is justified on its own merits —
+    // no statement that can take a lock should run before the timeout is configured — but
+    // it is NOT demonstrated by this test.
+    let dir = TempDir::new().unwrap();
+    let path = db_path(&dir);
+
+    let holder = open_writer(&path, &PragmaProfile::writer_floor()).unwrap();
+    holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let opener = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let r = open_writer(&path, &PragmaProfile::writer_floor());
+            (r.is_ok(), t0.elapsed())
+        })
+    };
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    holder.execute_batch("COMMIT").unwrap();
+
+    let (ok, waited) = opener.join().unwrap();
+    assert!(
+        ok,
+        "a contended open must succeed once the lock is released"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(200),
+        "the open returned in {waited:?}, so it did not wait for the lock — \
+         busy_timeout is not in effect when the lock is taken"
+    );
+}

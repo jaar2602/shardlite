@@ -107,6 +107,14 @@ pub struct ShardConfig {
     /// doing real work when callers stop blocking, which is what a network server will do.
     /// It is here now because adding it later would change the API of every write path.
     pub write_queue_depth: usize,
+
+    /// Upper bound on statements merged into one shard's transaction.
+    ///
+    /// Bounds memory and worst-case latency; it is **not** a throughput tuning knob — group
+    /// commit sizes itself against the fsync cost. Setting it to 1 disables batching, which
+    /// exists so a benchmark can attribute the win to batching rather than merely to
+    /// serializing writers.
+    pub max_batch: usize,
 }
 
 impl ShardConfig {
@@ -125,6 +133,7 @@ impl ShardConfig {
             reader_threads: 2,
             open_readers_per_thread: 8,
             write_queue_depth: 1024,
+            max_batch: 64,
         }
     }
 
@@ -145,6 +154,11 @@ impl ShardConfig {
         if self.writer_threads == 0 || self.reader_threads == 0 {
             return Err(crate::Error::ShardConfig(
                 "writer_threads and reader_threads must be at least 1".into(),
+            ));
+        }
+        if self.max_batch == 0 {
+            return Err(crate::Error::ShardConfig(
+                "max_batch must be at least 1".into(),
             ));
         }
         if self.write_queue_depth == 0 {
@@ -172,6 +186,24 @@ pub struct ShardManager {
 
 impl ShardManager {
     pub fn open(dir: &Path, cfg: ShardConfig) -> crate::Result<Self> {
+        Self::open_with_profiles(
+            dir,
+            cfg,
+            crate::config::PragmaProfile::writer_shard(),
+            crate::config::PragmaProfile::reader_shard(),
+        )
+    }
+
+    /// Open with explicit connection profiles.
+    ///
+    /// Exists so tuning knobs that live on the profile — `synchronous` above all — can be
+    /// varied without a second `ShardManager` constructor per experiment.
+    pub fn open_with_profiles(
+        dir: &Path,
+        cfg: ShardConfig,
+        writer: crate::config::PragmaProfile,
+        reader: crate::config::PragmaProfile,
+    ) -> crate::Result<Self> {
         cfg.validate()?;
         // Before anything is opened: refuse a shard count that disagrees with the data
         // already on disk. Discovering that later means rows silently unreachable.
@@ -179,14 +211,14 @@ impl ShardManager {
         let writers = std::sync::Arc::new(WriterFleet::spawn(
             dir,
             cfg.clone(),
-            crate::config::PragmaProfile::writer_shard(),
+            writer,
             crate::config::CheckpointConfig::floor(),
         )?);
         let readers = ReaderFleet::spawn(
             dir,
             &cfg,
             &crate::config::ReaderPoolConfig::floor(),
-            crate::config::PragmaProfile::reader_shard(),
+            reader,
             std::sync::Arc::downgrade(&writers),
         )?;
         Ok(Self {
