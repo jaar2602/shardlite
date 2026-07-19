@@ -127,6 +127,12 @@ struct State {
     trace: Vec<(u64, usize)>,
     trace_enabled: bool,
     header_rewrites: u64,
+    /// Bytes held across `slots` and `committed`.
+    retained_bytes: usize,
+    /// Set once retention passes its cap. Never cleared by draining, because the operator
+    /// needs to know the stream was compromised even if it later recovers.
+    overflowed: bool,
+    max_retained_bytes: usize,
 }
 
 /// Accumulates committed transactions observed on one database's WAL.
@@ -146,11 +152,43 @@ pub struct CaptureStats {
     pub resets: u64,
     pub truncations: u64,
     pub page_size: u32,
+    /// Bytes held that the sink has not yet consumed.
+    pub retained_bytes: usize,
+    pub overflowed: bool,
 }
+
+/// Default retention cap per shard.
+///
+/// The writer drains after every batch, so steady-state retention is one batch's frames —
+/// well under this. Reaching the cap means a single transaction is enormous or the sink has
+/// stopped consuming, and both need to be loud rather than absorbed.
+pub const DEFAULT_MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 impl WalCapture {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(DEFAULT_MAX_RETAINED_BYTES)
+    }
+
+    pub fn with_limit(max_retained_bytes: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(State {
+                max_retained_bytes,
+                ..State::default()
+            }),
+        }
+    }
+
+    /// True once retention exceeded the cap.
+    ///
+    /// Frames are never dropped to stay under it — dropping would silently truncate the
+    /// replication stream, which is the exact failure physical replication exists to avoid.
+    /// The flag is raised instead, and the writer turns it into a hard error.
+    pub fn overflowed(&self) -> bool {
+        self.state.lock().expect("capture mutex").overflowed
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.state.lock().expect("capture mutex").retained_bytes
     }
 
     /// Enable raw write tracing, and take whatever has accumulated.
@@ -198,6 +236,13 @@ impl WalCapture {
         }
 
         Self::consume(&mut st, offset, buf);
+
+        if st.max_retained_bytes > 0 && !st.overflowed {
+            let pending = Self::pending_bytes(&st);
+            if st.retained_bytes + pending > st.max_retained_bytes {
+                st.overflowed = true;
+            }
+        }
     }
 
     /// The WAL file was truncated — a `TRUNCATE` checkpoint. Everything not yet committed
@@ -321,6 +366,18 @@ impl WalCapture {
         if frames.is_empty() {
             return;
         }
+
+        // Retention is what the sink has not yet consumed. Two ways it can grow: a sink
+        // that stopped keeping up (`committed` piles up) and a single enormous transaction
+        // (`slots` piles up before any commit). Both are checked, and neither is resolved
+        // by dropping frames — a truncated stream is the exact divergence physical
+        // replication exists to prevent, so the flag is raised and the writer fails loudly.
+        let bytes: usize = frames.iter().map(|f| f.data.len()).sum();
+        st.retained_bytes += bytes;
+        if st.max_retained_bytes > 0 && st.retained_bytes > st.max_retained_bytes {
+            st.overflowed = true;
+        }
+
         st.committed.push(CommittedTxn {
             db_size_pages,
             page_size,
@@ -329,10 +386,25 @@ impl WalCapture {
         });
     }
 
+    /// Bytes held in not-yet-committed slots. Guards the single-huge-transaction case.
+    fn pending_bytes(st: &State) -> usize {
+        st.slots
+            .values()
+            .filter_map(|s| s.data.as_ref().map(|d| d.len()))
+            .sum()
+    }
+
     /// Remove and return every transaction committed so far.
     pub fn drain_committed(&self) -> Vec<CommittedTxn> {
         let mut st = self.state.lock().expect("capture mutex");
-        std::mem::take(&mut st.committed)
+        let taken = std::mem::take(&mut st.committed);
+        let freed: usize = taken
+            .iter()
+            .flat_map(|t| t.frames.iter())
+            .map(|f| f.data.len())
+            .sum();
+        st.retained_bytes = st.retained_bytes.saturating_sub(freed);
+        taken
     }
 
     pub fn stats(&self) -> CaptureStats {
@@ -345,6 +417,8 @@ impl WalCapture {
             resets: st.resets,
             truncations: st.truncations,
             page_size: st.header.map(|h| h.page_size).unwrap_or(0),
+            retained_bytes: st.retained_bytes,
+            overflowed: st.overflowed,
         }
     }
 }

@@ -108,6 +108,17 @@ pub struct ShardConfig {
     /// It is here now because adding it later would change the API of every write path.
     pub write_queue_depth: usize,
 
+    /// Capture committed WAL frames and hand them to a [`crate::replication::FrameSink`].
+    ///
+    /// **Off by default.** Capture costs ~2.7% throughput (measured) and, more importantly,
+    /// retains frames in memory until a sink consumes them — roughly 1.5x the data volume.
+    /// A single-node deployment with no replication target gains nothing and pays both, so
+    /// it stays off until there is something to replicate to.
+    pub capture: bool,
+
+    /// Per-shard cap on frames a sink has not yet consumed. 0 disables the cap.
+    pub max_retained_bytes: usize,
+
     /// Upper bound on statements merged into one shard's transaction.
     ///
     /// Bounds memory and worst-case latency; it is **not** a throughput tuning knob — group
@@ -134,6 +145,8 @@ impl ShardConfig {
             open_readers_per_thread: 8,
             write_queue_depth: 1024,
             max_batch: 64,
+            capture: false,
+            max_retained_bytes: crate::vfs::wal::DEFAULT_MAX_RETAINED_BYTES,
         }
     }
 
@@ -198,21 +211,47 @@ impl ShardManager {
     ///
     /// Exists so tuning knobs that live on the profile — `synchronous` above all — can be
     /// varied without a second `ShardManager` constructor per experiment.
+    /// Open with a replication sink for captured frames.
+    pub fn open_with_sink(
+        dir: &Path,
+        cfg: ShardConfig,
+        sink: Option<std::sync::Arc<dyn crate::replication::FrameSink>>,
+    ) -> crate::Result<Self> {
+        Self::open_full(
+            dir,
+            cfg,
+            crate::config::PragmaProfile::writer_shard(),
+            crate::config::PragmaProfile::reader_shard(),
+            sink,
+        )
+    }
+
     pub fn open_with_profiles(
         dir: &Path,
         cfg: ShardConfig,
         writer: crate::config::PragmaProfile,
         reader: crate::config::PragmaProfile,
     ) -> crate::Result<Self> {
+        Self::open_full(dir, cfg, writer, reader, None)
+    }
+
+    fn open_full(
+        dir: &Path,
+        cfg: ShardConfig,
+        writer: crate::config::PragmaProfile,
+        reader: crate::config::PragmaProfile,
+        sink: Option<std::sync::Arc<dyn crate::replication::FrameSink>>,
+    ) -> crate::Result<Self> {
         cfg.validate()?;
         // Before anything is opened: refuse a shard count that disagrees with the data
         // already on disk. Discovering that later means rows silently unreachable.
         let manifest = Manifest::open_or_create(dir, cfg.shard_count)?;
-        let writers = std::sync::Arc::new(WriterFleet::spawn(
+        let writers = std::sync::Arc::new(WriterFleet::spawn_with_sink(
             dir,
             cfg.clone(),
             writer,
             crate::config::CheckpointConfig::floor(),
+            sink,
         )?);
         let readers = ReaderFleet::spawn(
             dir,

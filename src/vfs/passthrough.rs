@@ -123,6 +123,14 @@ pub fn register() -> crate::Result<()> {
 /// Must be called **before** the database is opened — `xOpen` consults the registry when
 /// the `-wal` file is first opened, and a capture registered later would miss frames.
 pub fn capture_for(db_path: &Path) -> crate::Result<Arc<WalCapture>> {
+    capture_for_with_limit(db_path, super::wal::DEFAULT_MAX_RETAINED_BYTES)
+}
+
+/// As [`capture_for`], with an explicit retention cap.
+pub fn capture_for_with_limit(
+    db_path: &Path,
+    max_retained: usize,
+) -> crate::Result<Arc<WalCapture>> {
     register()?;
     let state = STATE.get().expect("registered above");
     // SQLite hands the VFS a full pathname, so the registry must key on one too.
@@ -131,10 +139,9 @@ pub fn capture_for(db_path: &Path) -> crate::Result<Arc<WalCapture>> {
     })?;
 
     let mut reg = state.registry.lock().expect("registry mutex");
-    Ok(Arc::clone(
-        reg.entry(key)
-            .or_insert_with(|| Arc::new(WalCapture::new())),
-    ))
+    Ok(Arc::clone(reg.entry(key).or_insert_with(|| {
+        Arc::new(WalCapture::with_limit(max_retained))
+    })))
 }
 
 fn state() -> &'static VfsState {

@@ -5,7 +5,7 @@
 //! number of connections are ever resident.
 //!
 //! Usage:
-//!   memcheck <dir> [shards] [mb_per_shard] [rss_limit_mb]
+//!   memcheck <dir> [shards] [mb_per_shard] [rss_limit_mb] [capture:0|1]
 //!
 //! Reports peak RSS (`VmHWM`, the kernel's high-water mark — not a sample, so a transient
 //! spike cannot be missed) and exits non-zero if it exceeds the limit.
@@ -17,6 +17,7 @@
 
 use std::process::ExitCode;
 
+use meshdb::replication::NullSink;
 use meshdb::shard::{ShardConfig, ShardId, ShardManager};
 use meshdb::storage::exec::{Statement, Value};
 
@@ -48,11 +49,13 @@ fn main() -> ExitCode {
     let shards: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(64);
     let mb_per_shard: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4);
     let limit_mb: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(150);
+    let capture: bool = args.get(4).map(|v| v == "1").unwrap_or(false);
 
     let _ = std::fs::remove_dir_all(&dir);
 
     let cfg = ShardConfig {
         shard_count: shards,
+        capture,
         ..ShardConfig::floor()
     };
     println!(
@@ -64,8 +67,10 @@ fn main() -> ExitCode {
         cfg.reader_threads,
         cfg.open_readers_per_thread,
     );
+    println!("capture={capture}");
 
-    let m = match ShardManager::open(&dir, cfg) {
+    let sink = std::sync::Arc::new(NullSink::new());
+    let m = match ShardManager::open_with_sink(&dir, cfg, Some(sink.clone())) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {e}");
@@ -134,6 +139,13 @@ fn main() -> ExitCode {
         "reader shards  opens={} evictions={}",
         rs.shard_opens, rs.shard_evictions
     );
+    if capture {
+        let (txns, frames, bytes) = sink.counts();
+        println!(
+            "captured       {txns} txns, {frames} frames, {} MB shipped to sink",
+            bytes / 1024 / 1024
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 

@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 7 of 12 · **Status:** sharded single-node engine; **VFS spike PASSED**; **floor profile measured**
+**Updated:** 2026-07-19 · **Steps complete:** 8 of 12 · **Status:** sharded single-node engine with WAL capture wired to a sink; floor profile measured
 
 ---
 
@@ -28,14 +28,14 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 4 | WAL checkpointing | **done** | `tests/checkpoint.rs` (5) |
 | 5 | Shard manager (LRU, thread affinity) | **done** | `tests/shard.rs` (9) + `src/shard/` (6) |
 | 6 | Benchmarks + cgroup memory test | **done** | `benches/write_throughput.rs`, `src/bin/memcheck.rs`, `scripts/bench.sh` |
-| 7 | VFS capture productionized | not started | **unblocked** |
+| 7 | VFS capture productionized | **done** | `tests/capture_wiring.rs` (9) |
 | 8 | Replication + per-shard bootstrap | not started | **unblocked** |
 | 9 | Per-shard merkle verification | not started | |
 | 10 | Cluster: election, fencing, failover | not started | |
 | 11 | Shard placement + move | not started | |
 | 12 | Read consistency levels | not started | |
 
-**61 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
+**70 Rust tests + 31 CLI assertions. Clippy clean, fmt clean.**
 
 ---
 
@@ -70,6 +70,18 @@ Runs on the writer thread **between** transactions. `wal_autocheckpoint` is disa
 because SQLite would otherwise do this work inside `COMMIT`, stalling a batch callers are
 blocked on. Escalation ladder: below soft limit do nothing → `PASSIVE` → after repeated
 stalls above the hard limit, a blocking `TRUNCATE` with a loud warning.
+
+### Frame capture and sinks (`src/replication/`, wired in `shard/writer_fleet.rs`)
+Shard writer connections can be routed through the capture VFS, with committed frames
+drained to a [`FrameSink`] **on the writer thread after every batch**. That placement is the
+whole design: retained memory is bounded by one batch rather than by the write rate, and a
+slow sink slows the writer, fills the bounded write queue, and surfaces to callers as
+`WriterBusy` — backpressure through the mechanism that already exists.
+
+**Capture defaults to off.** With no replication target it buys nothing and costs both
+throughput and memory. Frames are never dropped to stay under the retention cap; exceeding
+it raises `CaptureOverflow` and refuses further writes, because a silently truncated stream
+is the divergence physical replication exists to prevent.
 
 ### Data-directory manifest (`src/shard/manifest.rs`)
 `shard_count` is immutable — changing it re-routes every key — so it is recorded at
@@ -143,6 +155,12 @@ Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 | **Parameters bind, never interpolate** | `parameters_are_bound_not_interpolated` |
 | Every `Value` kind round-trips | `every_value_kind_round_trips_through_binding` |
 | **Write queue sheds load when full** | `a_full_write_queue_sheds_load_instead_of_growing` |
+| **Follower rebuilt from sink output, byte-identical** | `a_follower_is_reconstructed_from_what_the_sink_received` |
+| Capture is off by default | `capture_is_off_by_default_and_costs_nothing` |
+| Capture survives LRU eviction and reopen | `capture_survives_lru_eviction_and_reopen` |
+| **Retention bounded by one batch** | `retention_stays_bounded_because_the_writer_drains_every_batch` |
+| Overflow fails writes, never drops frames | `overflow_fails_writes_rather_than_dropping_frames` |
+| Capture does not change the on-disk file | `captured_and_uncaptured_databases_are_identical_on_disk` |
 
 ### Benchmarks — 1 CPU / 1 GB container, real fsync (~1.5 ms)
 
@@ -165,12 +183,17 @@ Run with `./scripts/bench.sh`. 4000 writes per configuration.
 
 **Peak RSS**, 64 shards, hard 150 MB cgroup cap (OOM-kill on breach):
 
-| On disk | Peak RSS |
-|---|---|
-| 344 MB | 46 MB |
-| 1371 MB | **47 MB** |
+| On disk | Capture | Peak RSS |
+|---|---|---|
+| 344 MB | off | 46 MB |
+| 1371 MB | off | **47 MB** |
+| 1371 MB | **on** (1577 MB streamed) | **47 MB** |
 
-Data grew 4x; RSS moved 1 MB. `open_now` sat at exactly 16 — the LRU ceiling.
+Data grew 4x; RSS moved 1 MB. Streaming 1577 MB through capture added **nothing**, because
+the writer drains every batch. `open_now` sat at exactly 16 — the LRU ceiling.
+
+Capture's CPU cost, measured separately by `cargo run --example vfs_overhead`: **2.7%**
+(33,832 → 32,921 writes/s at 1 CPU with real fsync).
 
 ### Measured, not assumed
 
@@ -260,8 +283,9 @@ the trace comparison (`take_trace()`) before trusting capture.
 | No `VACUUM` path | Rejected outright; needs an out-of-transaction maintenance mode |
 | Checkpoint test suite takes ~20s | Real fsyncs; acceptable but the slowest thing in CI |
 | `busy_timeout` ordering fix is unproven | Moving it before lock-taking statements is correct on its own merits, but neither test discriminates it — both pass with the bug reintroduced. The 1-CPU `SQLITE_BUSY`-at-open failure was never root-caused. |
-| Capture holds an uncommitted txn fully in memory | A huge single transaction is unbounded; needs a spill or cap |
 | `capture_for` must be called before open | Registering later silently misses frames; not enforced by types |
+| Overflow is per-shard and sticky | Once raised the shard refuses writes until the process restarts; no recovery path yet |
+| No sink ships anywhere | `NullSink` discards and `MemorySink` is for tests; a network sink is step 8 |
 | Cross-shard queries fan out in caller code | No query planner; `execute_all_shards` is the only helper, and it is not atomic |
 | No graceful shutdown for in-flight work | `Drop` joins, but a long batch delays exit |
 

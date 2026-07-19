@@ -2,6 +2,23 @@ use crate::config::Role;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// A cheap stand-in when one error must be reported to several waiting callers.
+    ///
+    /// `Error` is not `Clone` because `rusqlite::Error` is not; this preserves the message.
+    pub fn clone_shallow(&self) -> Error {
+        match self {
+            Error::CaptureOverflow { shard, retained } => Error::CaptureOverflow {
+                shard: shard.clone(),
+                retained: *retained,
+            },
+            other => Error::BatchAborted {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("sqlite: {0}")]
@@ -74,4 +91,13 @@ pub enum Error {
 
     #[error("{0}")]
     Manifest(String),
+
+    /// The replication stream is incomplete; the node must stop accepting writes.
+    #[error(
+        "capture for {shard} exceeded its retention limit with {retained} bytes unconsumed. \
+         Frames are never dropped, so the replication stream is now incomplete and this node \
+         would commit data no replica will receive. Writes are refused until the sink \
+         recovers and the shard is reopened."
+    )]
+    CaptureOverflow { shard: String, retained: usize },
 }

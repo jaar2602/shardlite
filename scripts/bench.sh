@@ -39,3 +39,8 @@ echo
 echo "-- 1.3 GB database across 64 shards (RSS must not track data size)"
 docker run --rm --cpus="$CPUS" --memory="$MEM_LIMIT" -v "$PWD":/w -w /w "$IMAGE" \
     ./target/release/memcheck /tmp/mc 64 16 150 || exit 1
+
+echo
+echo "-- same, with WAL capture on (RSS must not track captured volume either)"
+docker run --rm --cpus="$CPUS" --memory="$MEM_LIMIT" -v "$PWD":/w -w /w "$IMAGE" \
+    ./target/release/memcheck /tmp/mc 64 16 150 1 || exit 1

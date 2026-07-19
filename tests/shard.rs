@@ -145,8 +145,7 @@ fn a_reopened_shard_still_serves_readers() {
         open_writers_per_thread: 2, // tiny, to force constant eviction
         reader_threads: 1,
         open_readers_per_thread: 2,
-        write_queue_depth: 1024,
-        max_batch: 64,
+        ..ShardConfig::floor()
     };
     let dir = TempDir::new().unwrap();
     let m = manager(&dir, cfg.clone());

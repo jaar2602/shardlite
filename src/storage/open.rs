@@ -18,6 +18,15 @@ use crate::storage::pragma;
 
 /// Open the single read-write connection for a database, creating it if absent.
 pub fn open_writer(path: &Path, p: &PragmaProfile) -> Result<Connection> {
+    open_writer_vfs(path, p, None)
+}
+
+/// As [`open_writer`], but routed through a named VFS.
+///
+/// Used to put a database behind the WAL-capture VFS. The capture is a pass-through, so the
+/// resulting file is an ordinary SQLite database — nothing about durability or format
+/// changes, only that committed frames are also teed to a capture buffer.
+pub fn open_writer_vfs(path: &Path, p: &PragmaProfile, vfs: Option<&str>) -> Result<Connection> {
     assert_eq!(
         p.role,
         Role::Writer,
@@ -29,7 +38,11 @@ pub fn open_writer(path: &Path, p: &PragmaProfile) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
-    let conn = Connection::open_with_flags(path, flags).map_err(|source| Error::Open {
+    let conn = match vfs {
+        Some(name) => Connection::open_with_flags_and_vfs(path, flags, name),
+        None => Connection::open_with_flags(path, flags),
+    }
+    .map_err(|source| Error::Open {
         path: path_str.clone(),
         source,
     })?;

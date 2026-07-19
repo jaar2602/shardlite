@@ -18,10 +18,12 @@ use super::lru::Lru;
 use super::{ShardConfig, ShardId};
 use crate::config::{CheckpointConfig, PragmaProfile};
 use crate::error::{Error, Result};
+use crate::replication::FrameSink;
 use crate::storage::apply;
 use crate::storage::checkpoint::{Checkpointer, Counters as CheckpointCounters};
 use crate::storage::exec::{Outcome, Statement};
-use crate::storage::open::open_writer;
+use crate::storage::open::open_writer_vfs;
+use crate::vfs::WalCapture;
 
 struct Pending {
     shard: ShardId,
@@ -50,10 +52,16 @@ enum Job {
     Shutdown,
 }
 
-/// One open shard: its writer connection and its checkpointer.
+/// One open shard: its writer connection, its checkpointer, and its frame capture.
 struct OpenShard {
     conn: Connection,
     checkpointer: Checkpointer,
+    /// `None` when capture is disabled.
+    ///
+    /// Survives eviction: the capture registry is keyed by path, so reopening a shard
+    /// returns the same buffer. A WAL reset on reopen bumps the generation and discards
+    /// uncommitted frames, which is correct — they were never committed.
+    capture: Option<Arc<WalCapture>>,
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +113,26 @@ impl WriterFleet {
         profile: PragmaProfile,
         checkpoint: CheckpointConfig,
     ) -> Result<Self> {
+        Self::spawn_with_sink(dir, cfg, profile, checkpoint, None)
+    }
+
+    /// Start the fleet, optionally streaming captured frames to `sink`.
+    ///
+    /// The sink is called on the writer thread after each batch commits. That is deliberate:
+    /// a slow sink slows the writer, the bounded write queue fills behind it, and callers
+    /// get `WriterBusy`. Backpressure reaches clients through the mechanism that already
+    /// exists rather than a second one built for replication.
+    pub fn spawn_with_sink(
+        dir: &Path,
+        cfg: ShardConfig,
+        profile: PragmaProfile,
+        checkpoint: CheckpointConfig,
+        sink: Option<Arc<dyn FrameSink>>,
+    ) -> Result<Self> {
         cfg.validate()?;
+        if cfg.capture {
+            crate::vfs::register()?;
+        }
         std::fs::create_dir_all(dir).map_err(|e| {
             Error::ShardConfig(format!("creating data directory {}: {e}", dir.display()))
         })?;
@@ -123,6 +150,9 @@ impl WriterFleet {
                 checkpoint: checkpoint.clone(),
                 capacity: cfg.open_writers_per_thread,
                 max_batch: cfg.max_batch,
+                capture: cfg.capture,
+                max_retained_bytes: cfg.max_retained_bytes,
+                sink: sink.clone(),
                 counters: Arc::clone(&counters),
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
             };
@@ -240,6 +270,9 @@ struct ThreadCtx {
     checkpoint: CheckpointConfig,
     capacity: usize,
     max_batch: usize,
+    capture: bool,
+    max_retained_bytes: usize,
+    sink: Option<Arc<dyn FrameSink>>,
     counters: Arc<Counters>,
     checkpoint_counters: Arc<CheckpointCounters>,
 }
@@ -338,6 +371,15 @@ fn apply_shard_batch(
 
     match apply::batch(&mut entry.conn, &groups) {
         Ok(results) => {
+            // Drain to the sink BEFORE replying. A caller told its write succeeded must be
+            // able to assume the frames reached the replication stream; replying first
+            // would acknowledge data the sink may never receive.
+            if let Err(e) = drain_capture(entry, ctx, shard) {
+                for p in group {
+                    let _ = p.reply.send(Err(e.clone_shallow()));
+                }
+                return;
+            }
             for (p, outcomes) in group.into_iter().zip(results) {
                 let _ = p.reply.send(Ok(outcomes));
             }
@@ -354,6 +396,34 @@ fn apply_shard_batch(
     }
 }
 
+/// Hand this shard's committed frames to the sink.
+fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Result<()> {
+    let Some(capture) = &entry.capture else {
+        return Ok(());
+    };
+
+    if capture.overflowed() {
+        // Frames are never dropped to stay under the cap, so reaching it means the stream
+        // is already incomplete. Failing every write from here is the only honest response:
+        // continuing would commit locally what no replica will ever see.
+        return Err(Error::CaptureOverflow {
+            shard: shard.to_string(),
+            retained: capture.retained_bytes(),
+        });
+    }
+
+    let txns = capture.drain_committed();
+    if txns.is_empty() {
+        return Ok(());
+    }
+    match &ctx.sink {
+        Some(sink) => sink.accept(shard, txns),
+        // Capture on with no sink: drop them, having proven they were captured. Only
+        // sensible for measuring capture's cost, which is why `NullSink` is named as it is.
+        None => Ok(()),
+    }
+}
+
 /// Get the shard's connection, opening it (and evicting a colder one) if needed.
 fn ensure_shard<'a>(
     open: &'a mut Lru<OpenShard>,
@@ -365,12 +435,28 @@ fn ensure_shard<'a>(
     let checkpoint = ctx.checkpoint.clone();
     let checkpoint_counters = Arc::clone(&ctx.checkpoint_counters);
 
+    let use_capture = ctx.capture;
+    let max_retained = ctx.max_retained_bytes;
+
     let (entry, event) = open.get_or_open(shard, move || -> Result<OpenShard> {
-        // `open_writer` materializes the -wal/-shm sidecars, which is what re-establishes
+        // Registration must precede the open: the VFS consults the registry when the -wal
+        // file is first opened, so a capture registered afterwards would miss frames.
+        let capture = if use_capture {
+            Some(crate::vfs::capture_for_with_limit(&path, max_retained)?)
+        } else {
+            None
+        };
+        let vfs = use_capture.then_some(crate::vfs::VFS_NAME);
+
+        // `open_writer_vfs` materializes the -wal/-shm sidecars, which is what re-establishes
         // the writer-opens-first invariant on every reopen after an eviction.
-        let conn = open_writer(&path, &profile)?;
+        let conn = open_writer_vfs(&path, &profile, vfs)?;
         let checkpointer = Checkpointer::new(&path, checkpoint, checkpoint_counters);
-        Ok(OpenShard { conn, checkpointer })
+        Ok(OpenShard {
+            conn,
+            checkpointer,
+            capture,
+        })
     })?;
 
     if event.opened {

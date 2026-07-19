@@ -20,8 +20,7 @@ fn one_shard() -> ShardConfig {
         open_writers_per_thread: 1,
         reader_threads: 1,
         open_readers_per_thread: 1,
-        write_queue_depth: 1024,
-        max_batch: 64,
+        ..ShardConfig::floor()
     }
 }
 
