@@ -33,6 +33,7 @@ use crate::shard::reader_fleet::StreamMsg;
 use crate::storage::exec::{Statement, Value};
 
 use super::auth::{self, Requirement, Role};
+use super::json::{response_json_body, response_status, value_to_json};
 use super::server::NodeServices;
 
 /// How many rows the reader may run ahead of the socket. Small: memory stays tiny, the writer
@@ -650,38 +651,12 @@ impl StmtBody {
     }
 }
 
-/// JSON parameters → SQL values. Supports null, integers, floats, and strings — the ordinary
-/// bound-parameter kinds. Arrays and objects are refused with a clear message rather than
-/// guessed at.
+/// Adapt the shared param parser's error into an HTTP 400.
 fn json_params(vals: &[serde_json::Value]) -> std::result::Result<Vec<Value>, HttpError> {
-    vals.iter()
-        .map(|v| match v {
-            serde_json::Value::Null => Ok(Value::Null),
-            serde_json::Value::Bool(b) => Ok(Value::Integer(*b as i64)),
-            serde_json::Value::Number(n) if n.is_i64() => Ok(Value::Integer(n.as_i64().unwrap())),
-            serde_json::Value::Number(n) => Ok(Value::Real(n.as_f64().unwrap())),
-            serde_json::Value::String(s) => Ok(Value::Text(s.clone())),
-            other => Err(HttpError::new(
-                400,
-                &format!("unsupported parameter type: {other}"),
-            )),
-        })
-        .collect()
+    super::json::json_params(vals).map_err(|m| HttpError::new(400, &m))
 }
 
 // ---- value / response JSON ----
-
-/// One SQL value as clean JSON: null, number, string. A blob becomes an array of byte values
-/// — honest and lossless, if verbose; a base64 form could come later.
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Integer(i) => serde_json::json!(i),
-        Value::Real(f) => serde_json::json!(f),
-        Value::Text(s) => serde_json::json!(s),
-        Value::Blob(b) => serde_json::json!(b),
-    }
-}
 
 /// A WAL inspection report as JSON, matching the `meshdb frames` view.
 fn frames_json(report: &crate::vfs::WalReport) -> serde_json::Value {
@@ -703,60 +678,7 @@ fn frames_json(report: &crate::vfs::WalReport) -> serde_json::Value {
 /// A native `Response` → (HTTP status, JSON) for the bounded (non-streaming) endpoints. The
 /// status reflects the outcome: a rejected statement is a 400, not a 200 with an error body.
 fn response_to_http(resp: super::protocol::Response) -> (u16, serde_json::Value) {
-    use super::protocol::Response as R;
-    let status = match &resp {
-        R::Rejected { .. } => 400,
-        R::TooStale { .. } => 409,
-        R::Error {
-            retryable: true, ..
-        } => 503,
-        R::Error { message, .. } if message.contains("not the leader") => 409,
-        R::Error { message, .. } if message.contains("authentication") => 401,
-        R::Error { message, .. } if message.contains("not permitted") => 403,
-        R::Error { .. } => 400,
-        _ => 200,
-    };
-    (status, response_json_body(resp))
-}
-
-fn response_json_body(resp: super::protocol::Response) -> serde_json::Value {
-    use super::protocol::Response as R;
-    match resp {
-        R::Rows { columns, rows } => serde_json::json!({
-            "columns": columns,
-            "rows": rows.iter().map(|r| r.iter().map(value_to_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
-        }),
-        R::Changed {
-            rows_affected,
-            last_insert_rowid,
-        } => serde_json::json!({
-            "rows_affected": rows_affected,
-            "last_insert_rowid": last_insert_rowid,
-        }),
-        R::Ok => serde_json::json!({ "ok": true }),
-        R::AllShards { outcomes } => serde_json::json!({
-            "shards": outcomes.iter().map(|(s, o)| serde_json::json!({
-                "shard": s,
-                "ok": matches!(o, super::protocol::ShardOutcome::Ok),
-                "error": match o { super::protocol::ShardOutcome::Rejected(m) => Some(m.clone()), _ => None },
-            })).collect::<Vec<_>>(),
-        }),
-        R::Routed { shard } => serde_json::json!({ "shard": shard }),
-        R::SchemaVersion { shard, version } => {
-            serde_json::json!({ "shard": shard, "version": version })
-        }
-        R::TooStale { shard, have, need } => serde_json::json!({
-            "error": "too stale", "shard": shard, "have": have, "need": need,
-        }),
-        R::Users { users } => serde_json::json!({
-            "users": users.iter().map(|(n, r)| serde_json::json!({ "name": n, "role": r.to_string() })).collect::<Vec<_>>(),
-        }),
-        R::Rejected { message } => serde_json::json!({ "error": message, "rejected": true }),
-        R::Error { message, retryable } => {
-            serde_json::json!({ "error": message, "retryable": retryable })
-        }
-        other => serde_json::json!({ "error": format!("unexpected response: {other:?}") }),
-    }
+    (response_status(&resp), response_json_body(resp))
 }
 
 /// A materialised query `Response` rendered as the streaming NDJSON shape, so a remote query

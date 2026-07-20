@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-19 · **Steps complete:** 9 of 12 · **Status:** primary/follower replication converges in-process; no network transport yet
+**Updated:** 2026-07-21 · **Steps complete:** 9 of 12 · **Status:** replication converges; native TCP, HTTP, and JSON/TCP edges live; drivers in four languages (Phase 2 done); console is Phase 3
 
 ---
 
@@ -825,8 +825,53 @@ are revert-verified. Two credential schemes are accepted, the caller's choice: `
 what programmatic clients prefer).
 
 CLI: `meshdb serve <dir> --http ADDR [--http-insecure]` runs the gateway alongside the native
-TCP server on one core. Remaining for later phases: cross-language drivers and the standalone
-console (Phases 2-3).
+TCP server on one core. Remaining for a later phase: the standalone console (Phase 3).
+
+### JSON-over-TCP gateway (Phase 2) — `--features json-tcp`
+
+A second cross-language edge for clients that hold a connection open and issue many small
+calls, where HTTP's per-request header and connection overhead is pure waste. Same core, same
+`Request` mapping, same reader fleet and streaming path as HTTP — only the framing differs.
+Off by default, like HTTP; a native-only deployment compiles neither.
+
+**The wire.** Each frame is `[4-byte big-endian length][JSON]`, the length checked against a
+16 MB cap before allocating (a hostile header cannot make the server reserve gigabytes). A
+request is a JSON object with an `op`; bounded ops answer with one `{"result": …}` (or
+`{"error": …, "status": N}`) frame; `query` streams `{"columns":[…]}`, then a `{"row":[…]}`
+per row straight off the cursor, then `{"end":true}`. The stream is the same bounded-channel,
+nothing-materialises path HTTP uses — **100k rows streamed through the persistent socket** in
+the integration suite.
+
+**One socket, authenticated once.** Unlike HTTP's per-request `Authorization`, a JSON-TCP
+connection sends `{"op":"auth","name","secret"}` as its first frame and stays authenticated
+for its lifetime; a doorman refuses every other op until then. The same challenge-response
+verification and the same `Read`/`Write`/`Admin` roles apply. And the same startup refusal:
+auth enabled without transport security is rejected unless `--json-tcp-insecure` is passed,
+because the secret crosses the wire in clear.
+
+CLI: `meshdb serve <dir> --json-tcp ADDR [--json-tcp-insecure]`, alongside `--http` and the
+native server on one core. Verified by `tests/json_tcp.rs` (6): 100k-row streaming, a
+persistent connection carrying many ops, auth gating, role enforcement, and the insecure-refusal
+posture.
+
+### Cross-language drivers (Phase 2) — `drivers/`
+
+Clients in Python, JavaScript, Go, and Rust, each **dependency-free** (standard library; the
+Rust crate uses `ureq`) and each **streaming** — `query` yields one row at a time, so a
+million-row result costs the driver almost nothing, matching the gateway.
+
+Three transports, two of them cross-language. **HTTP/JSON** is the stable stateless edge every
+driver speaks. **JSON/TCP** is the persistent-socket edge — Python, JS, and Go each ship a
+`TcpClient` over it (manual `[len][JSON]` framing, auth-on-connect, streaming query). **Native
+bincode over TCP** is Rust-only and version-locked (a bincode bump breaks non-Rust clients), so
+the Rust crate re-exports `meshdb::net::Client` under `--features native` and the other
+languages deliberately use JSON/TCP instead — the stable contract without the fragility.
+
+Verified live by `scripts/driver_test.sh`, which runs each present driver against a gateway
+serving **both** HTTP and JSON/TCP and asserts a full 20k-row stream over each: Python and
+JavaScript pass over HTTP **and** JSON/TCP; Rust over HTTP; Go is exercised where a toolchain
+is present (its HTTP and TCP clients are written to the same contract but unrun in this
+environment, stated rather than implied).
 
 ### Frame inspection: `meshdb frames`
 

@@ -671,6 +671,35 @@ fn start_http(
     Err("this build has no HTTP support; rebuild with `--features http`".into())
 }
 
+#[cfg(feature = "json-tcp")]
+fn start_json_tcp(
+    server: &meshdb::net::Server,
+    addr: &str,
+    insecure: bool,
+) -> std::result::Result<(), String> {
+    let jt = meshdb::net::JsonTcpServer::bind(
+        server.shards_arc(),
+        server.services_clone(),
+        meshdb::net::JsonTcpConfig {
+            addr: addr.to_string(),
+            insecure,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!("meshdb JSON-TCP on {addr}");
+    std::thread::spawn(move || jt.serve());
+    Ok(())
+}
+
+#[cfg(not(feature = "json-tcp"))]
+fn start_json_tcp(
+    _server: &meshdb::net::Server,
+    _addr: &str,
+    _insecure: bool,
+) -> std::result::Result<(), String> {
+    Err("this build has no JSON-TCP support; rebuild with `--features json-tcp`".into())
+}
+
 fn serve_cmd(args: &[String]) -> ExitCode {
     // args[0] == "serve"; args[1] should be the data directory.
     let pos = positionals(&args[1..]);
@@ -753,6 +782,17 @@ fn serve_cmd(args: &[String]) -> ExitCode {
     // Optional HTTP gateway alongside the native TCP server.
     if let Some(http_addr) = flag(args, "--http") {
         match start_http(&server, http_addr, has_flag(args, "--http-insecure")) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // Optional JSON-over-TCP server — a persistent-socket protocol for cross-language drivers.
+    if let Some(jt_addr) = flag(args, "--json-tcp") {
+        match start_json_tcp(&server, jt_addr, has_flag(args, "--json-tcp-insecure")) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("error: {e}");

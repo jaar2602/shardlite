@@ -17,6 +17,10 @@ pub mod client;
 pub mod forward;
 #[cfg(feature = "http")]
 pub mod http_gateway;
+#[cfg(any(feature = "http", feature = "json-tcp"))]
+pub mod json;
+#[cfg(feature = "json-tcp")]
+pub mod json_tcp;
 pub mod protocol;
 pub mod replica;
 pub mod server;
@@ -27,6 +31,8 @@ pub use client::Client;
 pub use forward::{ForwardStats, Router};
 #[cfg(feature = "http")]
 pub use http_gateway::{HttpConfig, HttpGateway};
+#[cfg(feature = "json-tcp")]
+pub use json_tcp::{JsonTcpConfig, JsonTcpServer};
 pub use protocol::{ReadConsistency, Request, Response, ShardOutcome};
 pub use replica::{Replica, ReplicaConfig, ReplicaStats};
 pub use server::{NodeServices, Server, ServerConfig, ServerStats};

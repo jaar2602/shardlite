@@ -27,4 +27,19 @@ func main() {
 	}
 	info, _ := db.Info()
 	fmt.Println("info:", info)
+
+	if tcpPort := os.Getenv("MESHDB_TCP_PORT"); tcpPort != "" {
+		tc, err := meshdb.DialTCP("127.0.0.1:"+tcpPort, "", "")
+		if err != nil {
+			fmt.Println("tcp dial error:", err)
+			return
+		}
+		defer tc.Close()
+		trows, _ := tc.Query("SELECT id FROM t ORDER BY id")
+		m := 0
+		for trows.Next() {
+			m++
+		}
+		fmt.Println("tcp streamed rows:", m)
+	}
 }

@@ -134,3 +134,115 @@ export class Client {
     await this._fetch("DELETE", `/v1/users/${name}`);
   }
 }
+
+// -- Persistent TCP transport (JSON-over-TCP) --
+
+import net from "node:net";
+
+class FrameReader {
+  constructor(socket) {
+    this.buf = Buffer.alloc(0);
+    this.frames = [];
+    this.waiters = [];
+    this.err = null;
+    socket.on("data", (d) => {
+      this.buf = Buffer.concat([this.buf, d]);
+      while (this.buf.length >= 4) {
+        const n = this.buf.readUInt32BE(0);
+        if (this.buf.length < 4 + n) break;
+        const frame = JSON.parse(this.buf.subarray(4, 4 + n).toString());
+        this.buf = this.buf.subarray(4 + n);
+        if (this.waiters.length) this.waiters.shift().resolve(frame);
+        else this.frames.push(frame);
+      }
+    });
+    const fail = (e) => {
+      this.err = this.err || e || new Error("connection closed");
+      while (this.waiters.length) this.waiters.shift().reject(this.err);
+    };
+    socket.on("error", fail);
+    socket.on("close", () => fail(null));
+  }
+  nextFrame() {
+    if (this.frames.length) return Promise.resolve(this.frames.shift());
+    if (this.err) return Promise.reject(this.err);
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+}
+
+/// A persistent-connection client over meshdb's JSON-over-TCP protocol. Lower per-request
+/// overhead than HTTP; one request at a time per connection (not shared across concurrent
+/// callers). query() streams. Auth is sent once at connect; the secret crosses the wire, so
+/// use a trusted network or a TLS tunnel.
+///
+///     const db = await TcpClient.connect("127.0.0.1", 4620, { user: "app", secret: "s3cret" });
+///     for await (const row of db.query("SELECT id, v FROM t")) { ... }
+///     db.close();
+export class TcpClient {
+  static async connect(host, port, { user, secret } = {}) {
+    const socket = net.connect({ host, port });
+    socket.setNoDelay(true);
+    await new Promise((res, rej) => {
+      socket.once("connect", res);
+      socket.once("error", rej);
+    });
+    const c = new TcpClient(socket);
+    if (user != null && secret != null) {
+      const r = await c._call({ op: "auth", name: user, secret });
+      if (!r.ok) throw new MeshdbError(401, "authentication failed");
+    }
+    return c;
+  }
+
+  constructor(socket) {
+    this.socket = socket;
+    this.reader = new FrameReader(socket);
+  }
+
+  close() {
+    this.socket.end();
+  }
+
+  _send(frame) {
+    const body = Buffer.from(JSON.stringify(frame));
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(body.length, 0);
+    this.socket.write(Buffer.concat([header, body]));
+  }
+
+  async _call(frame) {
+    this._send(frame);
+    const r = await this.reader.nextFrame();
+    if (r.error) throw new MeshdbError(r.status ?? 0, r.error);
+    return r.result;
+  }
+
+  async *query(sql, { shard = 0, params = [], consistency = "linearizable" } = {}) {
+    this._send({ op: "query", shard, sql, params, consistency });
+    let columns = null;
+    for (;;) {
+      const f = await this.reader.nextFrame();
+      if (f.columns) columns = f.columns;
+      else if (f.row) yield columns ? Object.fromEntries(columns.map((c, i) => [c, f.row[i]])) : f.row;
+      else if (f.end) return;
+      else if (f.error) throw new MeshdbError(f.status ?? 200, f.error);
+    }
+  }
+
+  queryAll(sql) { return this._call({ op: "query_all", sql }); }
+  async route(key) { return (await this._call({ op: "route", key })).shard; }
+  execute(sql, { shard = 0, params = [] } = {}) { return this._call({ op: "execute", shard, sql, params }); }
+  tx(statements, { shard = 0 } = {}) {
+    const norm = statements.map((s) => (typeof s === "string" ? { sql: s } : s));
+    return this._call({ op: "tx", shard, statements: norm });
+  }
+  executeAll(sql) { return this._call({ op: "execute_all", sql }); }
+  info() { return this._call({ op: "info" }); }
+  cluster() { return this._call({ op: "cluster" }); }
+  stats() { return this._call({ op: "stats" }); }
+  schema(shard) { return this._call({ op: "schema", shard }); }
+  frames(shard) { return this._call({ op: "frames", shard }); }
+  async listUsers() { return (await this._call({ op: "list_users" })).users; }
+  createUser(name, secret, role) { return this._call({ op: "create_user", name, secret, role }); }
+  dropUser(name) { return this._call({ op: "drop_user", name }); }
+}

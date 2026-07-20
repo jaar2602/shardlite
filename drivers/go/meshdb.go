@@ -297,3 +297,193 @@ func (c *Client) DropUser(name string) error {
 	_, err := c.do("DELETE", "/v1/users/"+name, nil)
 	return err
 }
+
+// -- Persistent TCP transport (JSON-over-TCP) --
+
+import (
+	"encoding/binary"
+	"net"
+	"sync"
+)
+
+// TCPClient is a persistent-connection client over meshdb's JSON-over-TCP protocol. Lower
+// per-request overhead than HTTP. One request at a time per connection; guard with the mutex
+// if shared. Query streams. Auth is sent once at connect; the secret crosses the wire, so use
+// a trusted network or a TLS tunnel.
+//
+//	db, _ := meshdb.DialTCP("127.0.0.1:4620", "app", "s3cret")
+//	rows, _ := db.Query("SELECT id, v FROM t")
+//	for rows.Next() { fmt.Println(rows.Row()) }
+type TCPClient struct {
+	conn net.Conn
+	r    *bufio.Reader
+	mu   sync.Mutex
+}
+
+// DialTCP connects and, if user is non-empty, authenticates.
+func DialTCP(addr, user, secret string) (*TCPClient, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	c := &TCPClient{conn: conn, r: bufio.NewReader(conn)}
+	if user != "" {
+		r, err := c.call(map[string]any{"op": "auth", "name": user, "secret": secret})
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if ok, _ := r["ok"].(bool); !ok {
+			conn.Close()
+			return nil, &Error{Status: 401, Message: "authentication failed"}
+		}
+	}
+	return c, nil
+}
+
+func (c *TCPClient) Close() error { return c.conn.Close() }
+
+func (c *TCPClient) send(frame any) error {
+	body, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
+	if _, err := c.conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err = c.conn.Write(body)
+	return err
+}
+
+func (c *TCPClient) recv() (map[string]any, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(c.r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	body := make([]byte, n)
+	if _, err := io.ReadFull(c.r, body); err != nil {
+		return nil, err
+	}
+	var frame map[string]any
+	return frame, json.Unmarshal(body, &frame)
+}
+
+// call runs a bounded op: one request, one result frame.
+func (c *TCPClient) call(frame any) (map[string]any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.send(frame); err != nil {
+		return nil, err
+	}
+	r, err := c.recv()
+	if err != nil {
+		return nil, err
+	}
+	if e, ok := r["error"].(string); ok {
+		status := 0
+		if s, ok := r["status"].(float64); ok {
+			status = int(s)
+		}
+		return nil, &Error{Status: status, Message: e}
+	}
+	result, _ := r["result"].(map[string]any)
+	return result, nil
+}
+
+// TCPRows streams a JSON-TCP query result.
+type TCPRows struct {
+	c       *TCPClient
+	columns []string
+	current map[string]any
+	err     error
+	done    bool
+}
+
+func (c *TCPClient) Query(sql string, opts ...QueryOpt) (*TCPRows, error) {
+	q := queryReq{SQL: sql, Params: []any{}, Consistency: "linearizable"}
+	for _, o := range opts {
+		o(&q)
+	}
+	c.mu.Lock()
+	if err := c.send(map[string]any{
+		"op": "query", "shard": q.Shard, "sql": q.SQL,
+		"params": q.Params, "consistency": q.Consistency,
+	}); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	// The mutex is held for the whole stream; Close/Next release it at the terminal frame.
+	return &TCPRows{c: c}, nil
+}
+
+func (r *TCPRows) Next() bool {
+	if r.done {
+		return false
+	}
+	f, err := r.c.recv()
+	if err != nil {
+		r.finish(err)
+		return false
+	}
+	if cols, ok := f["columns"].([]any); ok {
+		r.columns = make([]string, len(cols))
+		for i, c := range cols {
+			r.columns[i], _ = c.(string)
+		}
+		return r.Next()
+	}
+	if row, ok := f["row"].([]any); ok {
+		m := make(map[string]any, len(row))
+		for i, v := range row {
+			if i < len(r.columns) {
+				m[r.columns[i]] = v
+			}
+		}
+		r.current = m
+		return true
+	}
+	if _, ok := f["end"]; ok {
+		r.finish(nil)
+		return false
+	}
+	if e, ok := f["error"].(string); ok {
+		r.finish(&Error{Status: 200, Message: e})
+		return false
+	}
+	r.finish(nil)
+	return false
+}
+
+func (r *TCPRows) finish(err error) {
+	if err != nil {
+		r.err = err
+	}
+	r.done = true
+	r.c.mu.Unlock()
+}
+
+func (r *TCPRows) Row() map[string]any { return r.current }
+func (r *TCPRows) Err() error          { return r.err }
+
+func (c *TCPClient) Execute(sql string, shard int, params ...any) (map[string]any, error) {
+	if params == nil {
+		params = []any{}
+	}
+	return c.call(map[string]any{"op": "execute", "shard": shard, "sql": sql, "params": params})
+}
+
+func (c *TCPClient) Tx(statements []Statement, shard int) (map[string]any, error) {
+	return c.call(map[string]any{"op": "tx", "shard": shard, "statements": statements})
+}
+
+func (c *TCPClient) Info() (map[string]any, error)    { return c.call(map[string]any{"op": "info"}) }
+func (c *TCPClient) Cluster() (map[string]any, error) { return c.call(map[string]any{"op": "cluster"}) }
+func (c *TCPClient) Frames(shard int) (map[string]any, error) {
+	return c.call(map[string]any{"op": "frames", "shard": shard})
+}
