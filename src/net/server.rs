@@ -817,6 +817,58 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             retryable: false,
         },
 
+        // User management. Reaching here means the connection is already an Admin (the
+        // requirement map guarantees it), so what remains is the store and the one extra rule.
+        Request::CreateUser { name, key, role } => match &services.auth {
+            None => Response::Error {
+                message: "authentication is not enabled on this server, so there are no users                           to manage"
+                    .into(),
+                retryable: false,
+            },
+            Some(auth) => {
+                // An admin is a client; the cluster role is for machines. Letting an admin
+                // mint a cluster credential would tunnel straight through the wall between the
+                // two — the whole point of keeping Cluster off the client ladder.
+                if role == super::auth::Role::Cluster {
+                    Response::Error {
+                        message: "an admin may not create a cluster user; cluster credentials                                   are provisioned at deploy time, not over the wire"
+                            .into(),
+                        retryable: false,
+                    }
+                } else {
+                    match auth.create(&name, key, role) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => error_response(e),
+                    }
+                }
+            }
+        },
+
+        Request::DropUser { name } => match &services.auth {
+            None => Response::Error {
+                message: "authentication is not enabled on this server".into(),
+                retryable: false,
+            },
+            Some(auth) => match auth.drop_user(&name) {
+                Ok(true) => Response::Ok,
+                Ok(false) => Response::Error {
+                    message: format!("no such user: {name}"),
+                    retryable: false,
+                },
+                Err(e) => error_response(e),
+            },
+        },
+
+        Request::ListUsers => match &services.auth {
+            None => Response::Error {
+                message: "authentication is not enabled on this server".into(),
+                retryable: false,
+            },
+            Some(auth) => Response::Users {
+                users: auth.list(),
+            },
+        },
+
         Request::Vote(req) => match cluster {
             Some(c) => match c.handle_vote_request(&req) {
                 Ok(reply) => Response::Voted(reply),

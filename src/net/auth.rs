@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 use super::protocol::Request;
 
 /// What an authenticated principal may do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     /// Queries only.
     Read,
@@ -79,6 +79,11 @@ pub fn required(req: &Request) -> Requirement {
 
         // Cluster-wide DDL reshapes every shard; that is an operator action, not a client one.
         Request::ExecuteAll { .. } | Request::SchemaApply { .. } => Requirement::Admin,
+
+        // User management is the most privileged client action there is.
+        Request::CreateUser { .. } | Request::DropUser { .. } | Request::ListUsers => {
+            Requirement::Admin
+        }
 
         // Subscription and snapshots hand out entire shards; votes and heartbeats steer the
         // cluster; Direct is how peers forward work they have already authorized.
@@ -119,6 +124,21 @@ impl std::fmt::Display for Role {
     }
 }
 
+impl std::str::FromStr for Role {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "read" => Ok(Role::Read),
+            "write" => Ok(Role::Write),
+            "admin" => Ok(Role::Admin),
+            "cluster" => Ok(Role::Cluster),
+            other => Err(Error::Protocol(format!(
+                "unknown role '{other}'; expected read, write, admin or cluster"
+            ))),
+        }
+    }
+}
+
 /// A key derived from a secret. This — not the secret — is what the server stores and what
 /// the MAC is keyed with.
 pub type Key = [u8; 32];
@@ -148,17 +168,35 @@ pub fn nonce() -> Result<[u8; 32]> {
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct User {
     key: Key,
     role: Role,
 }
 
-/// The users a server accepts. Empty means authentication is not configured and the server
-/// is open — which it announces loudly at startup rather than quietly being.
-#[derive(Debug, Clone, Default)]
+const USERS_HEADER: &str = "meshdb-users-v1";
+
+/// The users a server accepts, and — when opened from a file — the file it persists to.
+///
+/// Mutable at runtime behind an `RwLock`: an admin can create and drop users while the server
+/// runs, and every change is written back durably so it survives a restart. Empty means
+/// authentication is not configured and the server is open, which it announces loudly rather
+/// than quietly being.
+#[derive(Debug)]
 pub struct AuthConfig {
-    users: BTreeMap<String, User>,
+    users: std::sync::RwLock<BTreeMap<String, User>>,
+    /// Where mutations are persisted. `None` for an in-memory config (tests, or a server
+    /// whose users are fixed in code).
+    path: Option<std::path::PathBuf>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            users: std::sync::RwLock::new(BTreeMap::new()),
+            path: None,
+        }
+    }
 }
 
 impl AuthConfig {
@@ -166,10 +204,24 @@ impl AuthConfig {
         Self::default()
     }
 
-    /// Register `name` with `secret` and `role`. The secret is hashed immediately and never
-    /// stored.
-    pub fn user(mut self, name: &str, secret: &str, role: Role) -> Self {
-        self.users.insert(
+    /// Open a users file, creating an empty one if it does not exist, and persist every later
+    /// change back to it. This is how an operator provisions users outside of code.
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let users = if path.exists() {
+            Self::read(path)?
+        } else {
+            BTreeMap::new()
+        };
+        Ok(Self {
+            users: std::sync::RwLock::new(users),
+            path: Some(path.to_path_buf()),
+        })
+    }
+
+    /// Register `name` with `secret` and `role`, in memory. The builder form, for tests and
+    /// code-defined users; does not touch any file.
+    pub fn user(self, name: &str, secret: &str, role: Role) -> Self {
+        self.users.write().expect("users lock").insert(
             name.to_string(),
             User {
                 key: derive_key(secret),
@@ -179,15 +231,57 @@ impl AuthConfig {
         self
     }
 
+    /// Create a user from an already-derived key, persisting the change.
+    ///
+    /// Takes the key, not the secret: the key is what the wire carries and what the file
+    /// stores, so the plaintext secret never reaches the server at all.
+    pub fn create(&self, name: &str, key: Key, role: Role) -> Result<()> {
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err(Error::Protocol(
+                "a user name must be non-empty and contain no whitespace".into(),
+            ));
+        }
+        self.users
+            .write()
+            .expect("users lock")
+            .insert(name.to_string(), User { key, role });
+        self.save()
+    }
+
+    /// Remove a user, persisting the change. Returns whether the user existed.
+    pub fn drop_user(&self, name: &str) -> Result<bool> {
+        let existed = self
+            .users
+            .write()
+            .expect("users lock")
+            .remove(name)
+            .is_some();
+        if existed {
+            self.save()?;
+        }
+        Ok(existed)
+    }
+
+    /// Every user's name and role, sorted. Never returns keys — those do not leave the store.
+    pub fn list(&self) -> Vec<(String, Role)> {
+        self.users
+            .read()
+            .expect("users lock")
+            .iter()
+            .map(|(n, u)| (n.clone(), u.role))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.users.is_empty()
+        self.users.read().expect("users lock").is_empty()
     }
 
     /// Check a proof against a challenge. `None` means refused — and deliberately does not
     /// say whether the name or the proof was wrong, so the handshake cannot be used to
     /// enumerate valid names.
     pub fn verify(&self, name: &str, nonce: &[u8; 32], proof: &[u8; 32]) -> Option<Role> {
-        let user = self.users.get(name)?;
+        let users = self.users.read().expect("users lock");
+        let user = users.get(name)?;
         // Compared as `blake3::Hash`es, whose equality is constant-time — a byte-slice
         // compare would leak how many leading bytes matched through timing.
         let expected = blake3::keyed_hash(&user.key, nonce);
@@ -197,6 +291,94 @@ impl AuthConfig {
             None
         }
     }
+
+    /// Write the store durably: temp file, fsync, rename. A user database half-written by a
+    /// crash would lock people out or, worse, admit them; the same care the term store takes.
+    fn save(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let users = self.users.read().expect("users lock");
+        let mut body = format!(
+            "{USERS_HEADER}
+"
+        );
+        for (name, u) in users.iter() {
+            // `user <name> <role> <hex-key>` — the key, never the secret.
+            body.push_str(&format!(
+                "user {name} {} {}
+",
+                u.role,
+                u.key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ));
+        }
+
+        let tmp = path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| Error::Manifest(format!("creating {}: {e}", tmp.display())))?;
+            f.write_all(body.as_bytes())
+                .map_err(|e| Error::Manifest(format!("writing {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::Manifest(format!("fsyncing {}: {e}", tmp.display())))?;
+        }
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::Manifest(format!("renaming into {}: {e}", path.display())))?;
+        if let Some(dir) = path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    fn read(path: &std::path::Path) -> Result<BTreeMap<String, User>> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Manifest(format!("reading {}: {e}", path.display())))?;
+        let mut lines = text.lines();
+        if lines.next() != Some(USERS_HEADER) {
+            return Err(Error::Manifest(format!(
+                "{} is not a meshdb users file (missing the `{USERS_HEADER}` header)",
+                path.display()
+            )));
+        }
+        let mut users = BTreeMap::new();
+        for (n, line) in lines.enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // `user <name> <role> <hex-key>`. A malformed line is refused, not skipped: a
+            // silently dropped user is a lockout that looks like a typo.
+            if parts.len() != 4 || parts[0] != "user" {
+                return Err(Error::Manifest(format!(
+                    "{}: line {} is malformed",
+                    path.display(),
+                    n + 2
+                )));
+            }
+            let role: Role = parts[2].parse()?;
+            let key = parse_key(parts[3]).ok_or_else(|| {
+                Error::Manifest(format!("{}: line {} has a bad key", path.display(), n + 2))
+            })?;
+            users.insert(parts[1].to_string(), User { key, role });
+        }
+        Ok(users)
+    }
+}
+
+/// Parse a 64-char hex string into a 32-byte key.
+fn parse_key(hex: &str) -> Option<Key> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(key)
 }
 
 #[cfg(test)]

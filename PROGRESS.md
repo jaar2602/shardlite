@@ -791,6 +791,37 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### User management: a live store, a CLI, and runtime creation
+
+The auth layer's users were fixed in code — no way to add one without recompiling. Now they
+live in a file the server persists to, are managed by a CLI, and can be created **at runtime**
+against a running server.
+
+**A live, persisted store.** `AuthConfig` became an `RwLock` over the user map plus an
+optional file path. `AuthConfig::open(path)` loads a users file and persists every later
+change back to it durably (temp → fsync → rename, the term store's discipline) — a
+half-written user database is a lockout, or worse an admission. The file stores the *derived
+key* as hex, never the secret: reading it grants nothing a network capture would not.
+
+**Runtime verbs.** `CreateUser` / `DropUser` / `ListUsers`, all `Admin`-only. Two rules make
+them safe: an admin **cannot mint a `Cluster` credential** over the wire — that would tunnel
+through the wall between clients and cluster members, so cluster users are a deploy-time,
+file-only act; and the wire carries the derived key, not the secret, so the plaintext never
+leaves the operator's machine. The key still grants access, so runtime management belongs over
+TLS — documented at every entry point.
+
+**The CLI.** `meshdb serve <dir> --listen ADDR [--users FILE] [--tls-cert/-key]` runs a
+server; `meshdb user add|drop|list` manages users either offline (`--users FILE`, how the
+first admin is bootstrapped before any server exists) or at runtime (`--server ADDR --as ADMIN
+--admin-secret S`). Both paths converge on the same file. Existing invocations are untouched —
+`serve`/`user` are new leading subcommands, everything else still runs local SQL.
+
+Verified end to end (`scripts/auth_cli.sh`, 8 assertions): offline provisioning, secret absent
+from the file, runtime creation over the wire persisting back to the file, and the two
+refusals (runtime cluster grant, non-admin management). Both security rules revert-checked:
+removing the cluster wall or lowering the required role fails its test. A restart test proves
+a runtime-created user survives via the file.
+
 ### TLS, optional and behind a feature
 
 The auth layer authenticated without encrypting — stated as its own limit. TLS closes it,

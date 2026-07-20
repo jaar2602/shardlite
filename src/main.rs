@@ -61,6 +61,12 @@ fn main() -> ExitCode {
         };
     }
 
+    match args[0].as_str() {
+        "serve" => return serve_cmd(&args),
+        "user" => return user_cmd(&args),
+        _ => {}
+    }
+
     let dir = std::path::PathBuf::from(&args[0]);
     let mut requested: Option<u32> = None;
     let mut rest: Vec<&str> = Vec::new();
@@ -452,6 +458,328 @@ fn print_table(r: &QueryResult) {
 ///
 /// Defaults to warnings and above; `MESHDB_LOG=debug` (or any `RUST_LOG`-style filter)
 /// turns up the detail.
+/// The value after `--name`, if present.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Positional arguments — everything that is neither a `--flag` nor a flag's value.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with("--") {
+            // Assume every flag takes a value; the flags here all do.
+            i += 2;
+        } else {
+            out.push(a.as_str());
+            i += 1;
+        }
+    }
+    out
+}
+
+const SERVE_USAGE: &str = "usage: meshdb serve <data-dir> [options]
+
+  --listen ADDR      address to accept connections on (default 127.0.0.1:4600)
+  --shards N         required when creating a new data directory
+  --users FILE       enable authentication from this users file (see `meshdb user`)
+  --max-conn N       connection cap (default 256)
+  --tls-cert FILE    PEM certificate; enables TLS (requires the `tls` build feature)
+  --tls-key FILE     PEM private key for the certificate
+
+Without --users the server accepts any connection and warns that it is open.
+Without --tls-cert connections are plaintext.";
+
+fn serve_cmd(args: &[String]) -> ExitCode {
+    // args[0] == "serve"; args[1] should be the data directory.
+    let pos = positionals(&args[1..]);
+    let Some(dir) = pos.first().map(std::path::PathBuf::from) else {
+        eprintln!("{SERVE_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let listen = flag(args, "--listen")
+        .unwrap_or("127.0.0.1:4600")
+        .to_string();
+    let requested = flag(args, "--shards").and_then(|v| v.parse::<u32>().ok());
+
+    let shards = match resolve_shards(&dir, requested) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+
+    let manager = match meshdb::shard::ShardManager::open(
+        &dir,
+        meshdb::shard::ShardConfig {
+            shard_count: shards,
+            ..meshdb::shard::ShardConfig::floor()
+        },
+    ) {
+        Ok(m) => std::sync::Arc::new(m),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Authentication, if a users file was given.
+    let auth = match flag(args, "--users") {
+        Some(path) => match meshdb::net::AuthConfig::open(std::path::Path::new(path)) {
+            Ok(a) => Some(std::sync::Arc::new(a)),
+            Err(e) => {
+                eprintln!("error: reading users file: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    let mut cfg = meshdb::net::ServerConfig {
+        addr: listen.clone(),
+        ..meshdb::net::ServerConfig::default()
+    };
+    if let Some(n) = flag(args, "--max-conn").and_then(|v| v.parse::<usize>().ok()) {
+        cfg.max_connections = n;
+    }
+
+    let services = meshdb::net::NodeServices {
+        auth,
+        ..Default::default()
+    };
+    let server = match meshdb::net::Server::bind_with(manager, services, cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // TLS, if a certificate was given. Feature-gated; a clear message if the binary lacks it.
+    let server = match (flag(args, "--tls-cert"), flag(args, "--tls-key")) {
+        (Some(cert), Some(key)) => match enable_tls(server, cert, key) {
+            Ok(s) => s,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => server,
+        _ => {
+            eprintln!("error: --tls-cert and --tls-key must be given together");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("meshdb serving {shards} shards on {listen}");
+    match server.serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+fn enable_tls(
+    server: meshdb::net::Server,
+    cert: &str,
+    key: &str,
+) -> std::result::Result<meshdb::net::Server, String> {
+    let tls = meshdb::net::transport::TlsServerConfig::from_pem_files(
+        std::path::Path::new(cert),
+        std::path::Path::new(key),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(server.with_tls(tls))
+}
+
+#[cfg(not(feature = "tls"))]
+fn enable_tls(
+    _server: meshdb::net::Server,
+    _cert: &str,
+    _key: &str,
+) -> std::result::Result<meshdb::net::Server, String> {
+    Err("this build has no TLS support; rebuild with `--features tls`".into())
+}
+
+/// Resolve the shard count the same way the main path does: the manifest decides for an
+/// existing directory, and `--shards` is required to create one.
+fn resolve_shards(
+    dir: &std::path::Path,
+    requested: Option<u32>,
+) -> std::result::Result<u32, ExitCode> {
+    let manifest_path = Manifest::path(dir);
+    if manifest_path.exists() {
+        match Manifest::read(&manifest_path) {
+            Ok(m) => Ok(m.shard_count),
+            Err(e) => {
+                eprintln!("error: {e}");
+                Err(ExitCode::FAILURE)
+            }
+        }
+    } else {
+        match requested {
+            Some(n) => Ok(n),
+            None => {
+                eprintln!(
+                    "error: {} does not exist yet, so --shards N is required to create it.",
+                    dir.display()
+                );
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+const USER_USAGE: &str = "usage:
+  meshdb user add  <name> <secret> --role <read|write|admin> [target]
+  meshdb user drop <name>                                    [target]
+  meshdb user list                                           [target]
+
+target is one of:
+  --users FILE                          edit the users file directly (offline)
+  --server ADDR --as ADMIN --admin-secret S
+                                        change it on a running server (runtime)
+
+Offline is how you create the FIRST admin, before any server is running. Once a
+server is up with --users, use the runtime form to manage everyone else.
+
+The role `cluster` cannot be granted over the wire — cluster credentials are a
+deploy-time decision, not a runtime one. Set them in the users file directly.
+
+Runtime user management sends a derived key, not the secret, but that key still
+grants access: run it over TLS or a trusted network.";
+
+fn user_cmd(args: &[String]) -> ExitCode {
+    // args[0] == "user"; args[1] is the action.
+    let action = args.get(1).map(String::as_str).unwrap_or("");
+    let pos = positionals(&args[2..]);
+
+    // Offline (a file) or online (a running server)?
+    enum Target {
+        File(meshdb::net::AuthConfig),
+        Server(meshdb::net::Client),
+    }
+    let target = match (flag(args, "--users"), flag(args, "--server")) {
+        (Some(file), None) => match meshdb::net::AuthConfig::open(std::path::Path::new(file)) {
+            Ok(a) => Target::File(a),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, Some(addr)) => {
+            let (Some(admin), Some(secret)) = (flag(args, "--as"), flag(args, "--admin-secret"))
+            else {
+                eprintln!("error: --server needs --as ADMIN and --admin-secret S");
+                return ExitCode::FAILURE;
+            };
+            match meshdb::net::Client::connect_as(addr, admin, secret) {
+                Ok(c) => Target::Server(c),
+                Err(e) => {
+                    eprintln!("error: connecting as admin: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => {
+            eprintln!("{USER_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match action {
+        "add" => {
+            let (Some(name), Some(secret)) = (pos.first(), pos.get(1)) else {
+                eprintln!(
+                    "error: `user add` needs <name> <secret>
+
+{USER_USAGE}"
+                );
+                return ExitCode::FAILURE;
+            };
+            let role_str = flag(args, "--role").unwrap_or("");
+            let role: meshdb::net::Role = match role_str.parse() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = match target {
+                Target::File(auth) => {
+                    auth.create(name, meshdb::net::auth::derive_key(secret), role)
+                }
+                Target::Server(mut c) => c.create_user(name, secret, role),
+            };
+            match result {
+                Ok(()) => {
+                    println!("user '{name}' created with role {role}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "drop" => {
+            let Some(name) = pos.first() else {
+                eprintln!("error: `user drop` needs <name>");
+                return ExitCode::FAILURE;
+            };
+            let result = match target {
+                Target::File(auth) => auth.drop_user(name).map(|existed| {
+                    if !existed {
+                        eprintln!("warning: no such user '{name}'");
+                    }
+                }),
+                Target::Server(mut c) => c.drop_user(name),
+            };
+            match result {
+                Ok(()) => {
+                    println!("user '{name}' dropped");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => {
+            let users = match target {
+                Target::File(auth) => Ok(auth.list()),
+                Target::Server(mut c) => c.list_users(),
+            };
+            match users {
+                Ok(list) => {
+                    if list.is_empty() {
+                        println!("(no users)");
+                    }
+                    for (name, role) in list {
+                        println!("{name}	{role}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("{USER_USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("MESHDB_LOG")

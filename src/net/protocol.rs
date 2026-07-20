@@ -101,6 +101,18 @@ pub enum Request {
     /// The answer to a [`Response::Challenge`]: `proof = blake3::keyed_hash(key, nonce)`.
     /// The secret itself never crosses the wire.
     Auth { name: String, proof: [u8; 32] },
+    /// Create or replace a user, at runtime. Carries the *derived key*, not the secret — the
+    /// plaintext never leaves the operator's machine. Admin-only, and an admin may not mint a
+    /// `Cluster` user.
+    CreateUser {
+        name: String,
+        key: [u8; 32],
+        role: crate::net::auth::Role,
+    },
+    /// Remove a user. Admin-only.
+    DropUser { name: String },
+    /// List users (names and roles, never keys). Admin-only.
+    ListUsers,
     /// A peer is standing for election.
     Vote(crate::cluster::VoteRequest),
     /// A peer claims leadership and is renewing its lease.
@@ -176,6 +188,10 @@ pub enum Response {
     /// Fresh per connection, so a recorded handshake replays as nothing.
     Challenge {
         nonce: [u8; 32],
+    },
+    /// The users on a server: names and roles, never keys.
+    Users {
+        users: Vec<(String, crate::net::auth::Role)>,
     },
     SchemaVersion {
         shard: u32,

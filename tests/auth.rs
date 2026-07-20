@@ -360,3 +360,157 @@ fn an_authenticated_replica_pulls_frames_from_an_authenticated_primary() {
         .expect_err("an unauthenticated replica must be refused");
     assert!(err.to_string().contains("authentication"), "{err}");
 }
+
+#[test]
+fn an_admin_creates_a_user_at_runtime_who_can_then_log_in() {
+    // The point of runtime management: no restart, no config edit, and the new user works
+    // immediately with exactly the role granted.
+    let n = serve(Some(full_auth()));
+
+    let mut ops = Client::connect_as(&n.addr, "ops", "admin-secret").unwrap();
+    ops.create_user("newbie", "newbie-secret", Role::Write)
+        .unwrap();
+
+    // The new user logs in and does write-role things — reads and single-shard writes.
+    let mut newbie = Client::connect_as(&n.addr, "newbie", "newbie-secret").unwrap();
+    newbie
+        .execute(0, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    newbie.execute(0, "INSERT INTO t VALUES (1)").unwrap();
+
+    // ...but not admin things.
+    assert!(
+        newbie.execute_all("CREATE TABLE nope (a INTEGER)").is_err(),
+        "a runtime-created write user must not have admin powers"
+    );
+
+    // The admin can see them listed.
+    let users = ops.list_users().unwrap();
+    assert!(
+        users
+            .iter()
+            .any(|(name, role)| name == "newbie" && *role == Role::Write),
+        "the new user should appear in the list: {users:?}"
+    );
+}
+
+#[test]
+fn an_admin_cannot_mint_a_cluster_credential_over_the_wire() {
+    // The wall between clients and cluster members, enforced at the one place it could be
+    // tunnelled: an admin creating users. A cluster credential is a deploy-time decision.
+    let n = serve(Some(full_auth()));
+    let mut ops = Client::connect_as(&n.addr, "ops", "admin-secret").unwrap();
+
+    let err = ops
+        .create_user("sneaky-node", "secret", Role::Cluster)
+        .expect_err("an admin must not be able to create a cluster user at runtime");
+    assert!(err.to_string().contains("cluster"), "{err}");
+
+    // And the user was not created — a rejected grant must leave no trace.
+    let users = ops.list_users().unwrap();
+    assert!(!users.iter().any(|(name, _)| name == "sneaky-node"));
+}
+
+#[test]
+fn a_non_admin_cannot_manage_users() {
+    // User management is the most privileged client action; a write or read role must be
+    // refused, and the refusal counted like any other authorization failure.
+    let n = serve(Some(full_auth()));
+    let mut app = Client::connect_as(&n.addr, "app", "write-secret").unwrap();
+
+    assert!(
+        app.create_user("x", "y", Role::Read).is_err(),
+        "the write role must not create users"
+    );
+    assert!(app.drop_user("reader").is_err(), "nor drop them");
+    assert!(app.list_users().is_err(), "nor list them");
+    assert!(n.server.stats().authz_refused >= 3);
+}
+
+#[test]
+fn dropping_a_user_denies_them_immediately() {
+    let n = serve(Some(full_auth()));
+    let mut ops = Client::connect_as(&n.addr, "ops", "admin-secret").unwrap();
+
+    // The reader works, then is dropped, then cannot connect.
+    assert!(Client::connect_as(&n.addr, "reader", "read-secret").is_ok());
+    ops.drop_user("reader").unwrap();
+    assert!(
+        Client::connect_as(&n.addr, "reader", "read-secret").is_err(),
+        "a dropped user must not be able to authenticate"
+    );
+}
+
+#[test]
+fn runtime_changes_survive_a_restart_through_the_users_file() {
+    // Runtime management would be a foot-gun if it were only in memory: create a user, the
+    // server restarts, the user is gone, and nobody knows why. The change must be durable.
+    let dir = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let users_file = dir.path().join("users.db");
+
+    // Bootstrap an admin offline, exactly as the CLI's `user add --users` does.
+    {
+        let auth = AuthConfig::open(&users_file).unwrap();
+        auth.create(
+            "boss",
+            meshdb::net::auth::derive_key("boss-pw"),
+            Role::Admin,
+        )
+        .unwrap();
+    }
+
+    let boot = |data_path: &std::path::Path| -> (String, Arc<Server>) {
+        let manager = Arc::new(
+            ShardManager::open(
+                data_path,
+                ShardConfig {
+                    shard_count: 1,
+                    ..ShardConfig::floor()
+                },
+            )
+            .unwrap(),
+        );
+        let auth = Arc::new(AuthConfig::open(&users_file).unwrap());
+        let server = Arc::new(
+            Server::bind_with(
+                manager,
+                NodeServices {
+                    auth: Some(auth),
+                    ..Default::default()
+                },
+                ServerConfig {
+                    addr: "127.0.0.1:0".into(),
+                    ..ServerConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let addr = server.local_addr().unwrap().to_string();
+        let s = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let _ = s.serve();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (addr, server)
+    };
+
+    // First run: the admin creates a user at runtime.
+    {
+        let (addr, server) = boot(data.path());
+        let mut boss = Client::connect_as(&addr, "boss", "boss-pw").unwrap();
+        boss.create_user("survivor", "surv-pw", Role::Write)
+            .unwrap();
+        server
+            .shutdown_handle()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Second run: a fresh server, same file. The runtime-created user is still there.
+    let data2 = TempDir::new().unwrap();
+    let (addr, _server) = boot(data2.path());
+    assert!(
+        Client::connect_as(&addr, "survivor", "surv-pw").is_ok(),
+        "a user created at runtime must survive a restart via the users file"
+    );
+}

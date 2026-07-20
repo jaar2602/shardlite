@@ -262,6 +262,43 @@ impl Client {
         self.execute(shard, Statement::with_params(sql, params))
     }
 
+    /// Create or replace a user at runtime. The secret is hashed here — only the derived key
+    /// crosses the wire, so the plaintext never leaves this machine. Requires admin
+    /// credentials on this connection.
+    ///
+    /// The key still grants access, so run user management over TLS or a trusted network.
+    pub fn create_user(&mut self, name: &str, secret: &str, role: super::auth::Role) -> Result<()> {
+        match self.round_trip(Request::CreateUser {
+            name: name.to_string(),
+            key: super::auth::derive_key(secret),
+            role,
+        })? {
+            Response::Ok => Ok(()),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Remove a user at runtime. Requires admin credentials.
+    pub fn drop_user(&mut self, name: &str) -> Result<()> {
+        match self.round_trip(Request::DropUser {
+            name: name.to_string(),
+        })? {
+            Response::Ok => Ok(()),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// List users (names and roles, never keys). Requires admin credentials.
+    pub fn list_users(&mut self) -> Result<Vec<(String, super::auth::Role)>> {
+        match self.round_trip(Request::ListUsers)? {
+            Response::Users { users } => Ok(users),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Send a request and return the raw response.
     ///
     /// The escape hatch for verbs outside the ordinary client surface — subscription and
