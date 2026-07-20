@@ -40,6 +40,12 @@ bincode = { version = "2", features = ["serde"] }
 # nothing for it, in binary size or build time.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+# HTTP gateway: a synchronous, thread-per-connection HTTP/1.1 server (matches the existing TCP
+# server's model) plus JSON. Optional, behind the `http` feature — a deployment that only
+# speaks the native protocol compiles none of it. tiny_http over async frameworks keeps the
+# core tokio-free; the gateway calls the same handle() the TCP server does.
+tiny_http = { version = "0.12", optional = true }
+serde_json = { version = "1", optional = true }
 
 [[bench]]
 name = "write_throughput"
@@ -50,6 +56,9 @@ tempfile = "3"
 # Self-signed certs for the TLS tests, generated in-process so nothing is checked in to
 # expire. Only compiled when the tls tests run.
 rcgen = "0.13"
+# A synchronous HTTP client for the gateway tests. default-features off keeps it TLS-free
+# and light; the tests hit plaintext http://.
+ureq = { version = "2", default-features = false }
 
 # Model-checks the fence and the read/apply coordination by exhaustively exploring thread
 # interleavings — the races fixed here were found probabilistically (one failure in eighteen
@@ -68,3 +77,4 @@ default = ["cli"]
 # which case the macros compile to near-nothing.
 cli = ["dep:tracing-subscriber"]
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+http = ["dep:tiny_http", "dep:serde_json"]

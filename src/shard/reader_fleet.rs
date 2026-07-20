@@ -23,11 +23,29 @@ use crate::error::{Error, Result};
 use crate::storage::exec::{self, Outcome, SqlError, Statement};
 use crate::storage::open::open_reader_existing;
 
+/// One message in a streamed query. Columns arrive once, then rows, then a terminator.
+pub enum StreamMsg {
+    Columns(Vec<String>),
+    Row(Vec<crate::storage::exec::Value>),
+    /// The stream finished cleanly.
+    Done,
+    /// The query failed or timed out mid-stream. Carries the reason.
+    Failed(String),
+}
+
 enum Job {
     Query {
         shard: ShardId,
         statement: Statement,
         reply: SyncSender<Result<Outcome>>,
+    },
+    /// A streaming read: rows are pushed onto `tx` as they are produced, so an arbitrarily
+    /// large result never materialises in memory. The bounded channel is the backpressure —
+    /// a slow consumer blocks the reader thread here rather than piling rows up.
+    Stream {
+        shard: ShardId,
+        statement: Statement,
+        tx: SyncSender<StreamMsg>,
     },
     /// Close any cached connection for a shard, so its file can be handed to the replication
     /// path. Readers matter here more than writers: a read-only handle kept across a
@@ -151,6 +169,35 @@ impl ReaderFleet {
         reply_rx.recv().map_err(|_| Error::ReaderPoolGone)?
     }
 
+    /// Start a streaming read. Returns a receiver the caller drains: `Columns`, then `Row`s,
+    /// then `Done` or `Failed`. The channel is bounded, so draining slowly throttles the
+    /// reader thread rather than buffering the whole result.
+    ///
+    /// `depth` is the row-buffer bound. A few hundred keeps memory tiny while giving the
+    /// socket writer something to work ahead on.
+    pub fn stream(
+        &self,
+        shard: ShardId,
+        sql: impl Into<Statement>,
+        depth: usize,
+    ) -> Result<std::sync::mpsc::Receiver<StreamMsg>> {
+        let (row_tx, row_rx) = sync_channel(depth.max(1));
+        let tx = self.tx.as_ref().ok_or(Error::ReaderPoolGone)?;
+        tx.try_send(Job::Stream {
+            shard,
+            statement: sql.into(),
+            tx: row_tx,
+        })
+        .map_err(|e| match e {
+            flume::TrySendError::Full(_) => {
+                self.counters.rejected_busy.fetch_add(1, Ordering::Relaxed);
+                Error::ReaderPoolBusy
+            }
+            flume::TrySendError::Disconnected(_) => Error::ReaderPoolGone,
+        })?;
+        Ok(row_rx)
+    }
+
     pub fn stats(&self) -> ReaderFleetStats {
         ReaderFleetStats {
             queries: self.counters.queries.load(Ordering::Relaxed),
@@ -209,6 +256,30 @@ fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
                 };
                 drop(guard);
                 let _ = reply.send(result);
+            }
+            Job::Stream {
+                shard,
+                statement,
+                tx,
+            } => {
+                ctx.counters.queries.fetch_add(1, Ordering::Relaxed);
+                // Same discipline as a plain query: the access guard is held for the whole
+                // stream so no apply can land mid-read, and the deadline still bounds a
+                // runaway. A long stream holds a reader thread for its duration, which the
+                // deadline caps.
+                let access = ctx.modes.access(shard);
+                let guard = access.read();
+                let outcome = match ensure_shard(&mut open, &ctx, shard) {
+                    Ok(conn) => {
+                        stream_with_deadline(conn, &statement, ctx.timeout, &ctx.counters, &tx)
+                    }
+                    Err(e) => Err(e),
+                };
+                drop(guard);
+                let _ = match outcome {
+                    Ok(()) => tx.send(StreamMsg::Done),
+                    Err(e) => tx.send(StreamMsg::Failed(e.to_string())),
+                };
             }
             Job::Quiesce { shard, reply } => {
                 let closed = open.remove(shard).is_some();
@@ -279,6 +350,46 @@ fn ensure_shard<'a>(
     }
 
     Ok(&mut entry.0)
+}
+
+/// Run a streaming read, pushing rows onto `tx`, under the same deadline as a plain query.
+fn stream_with_deadline(
+    conn: &Connection,
+    statement: &Statement,
+    timeout: Duration,
+    counters: &Counters,
+    tx: &SyncSender<StreamMsg>,
+) -> Result<()> {
+    use crate::storage::exec::StreamItem;
+    let start = Instant::now();
+    conn.progress_handler(10_000, Some(move || start.elapsed() > timeout))?;
+
+    let result = exec::run_stream(conn, statement, |item| {
+        let msg = match item {
+            StreamItem::Columns(c) => StreamMsg::Columns(c),
+            StreamItem::Row(r) => StreamMsg::Row(r),
+        };
+        // A send failure means the consumer dropped the receiver — stop reading.
+        tx.send(msg).is_ok()
+    });
+
+    conn.progress_handler(10_000, None::<fn() -> bool>)?;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(SqlError::Logic(msg)) => {
+            let _ = tx.send(StreamMsg::Failed(msg));
+            Ok(())
+        }
+        Err(SqlError::Fatal(e)) => {
+            if start.elapsed() >= timeout {
+                counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                Err(Error::QueryTimeout { timeout })
+            } else {
+                Err(Error::Sqlite(e))
+            }
+        }
+    }
 }
 
 fn run_with_deadline(

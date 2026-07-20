@@ -15,6 +15,8 @@
 pub mod auth;
 pub mod client;
 pub mod forward;
+#[cfg(feature = "http")]
+pub mod http_gateway;
 pub mod protocol;
 pub mod replica;
 pub mod server;
@@ -23,6 +25,8 @@ pub mod transport;
 pub use auth::{AuthConfig, Role};
 pub use client::Client;
 pub use forward::{ForwardStats, Router};
+#[cfg(feature = "http")]
+pub use http_gateway::{HttpConfig, HttpGateway};
 pub use protocol::{ReadConsistency, Request, Response, ShardOutcome};
 pub use replica::{Replica, ReplicaConfig, ReplicaStats};
 pub use server::{NodeServices, Server, ServerConfig, ServerStats};

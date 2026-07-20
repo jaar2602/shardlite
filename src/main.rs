@@ -635,6 +635,42 @@ const SERVE_USAGE: &str = "usage: meshdb serve <data-dir> [options]
 Without --users the server accepts any connection and warns that it is open.
 Without --tls-cert connections are plaintext.";
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+#[cfg(feature = "http")]
+fn start_http(
+    server: &meshdb::net::Server,
+    addr: &str,
+    insecure: bool,
+) -> std::result::Result<(), String> {
+    // The gateway shares the same shards and services as the TCP server, so both speak to one
+    // core. It runs on its own threads; the TCP server keeps the main thread.
+    let gateway = meshdb::net::HttpGateway::bind(
+        server.shards_arc(),
+        server.services_clone(),
+        meshdb::net::HttpConfig {
+            addr: addr.to_string(),
+            insecure,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!("meshdb HTTP gateway on {addr}");
+    std::thread::spawn(move || gateway.serve());
+    Ok(())
+}
+
+#[cfg(not(feature = "http"))]
+fn start_http(
+    _server: &meshdb::net::Server,
+    _addr: &str,
+    _insecure: bool,
+) -> std::result::Result<(), String> {
+    Err("this build has no HTTP support; rebuild with `--features http`".into())
+}
+
 fn serve_cmd(args: &[String]) -> ExitCode {
     // args[0] == "serve"; args[1] should be the data directory.
     let pos = positionals(&args[1..]);
@@ -713,6 +749,17 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Optional HTTP gateway alongside the native TCP server.
+    if let Some(http_addr) = flag(args, "--http") {
+        match start_http(&server, http_addr, has_flag(args, "--http-insecure")) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     eprintln!("meshdb serving {shards} shards on {listen}");
     match server.serve() {

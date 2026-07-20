@@ -790,6 +790,39 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### HTTP/JSON gateway (Phase 1) — `--features http`
+
+An optional HTTP edge over the same core the TCP server drives, so any language with an HTTP
+client — and a browser — can talk to meshdb. Off by default: a native-only deployment compiles
+none of it. Sync (`tiny_http`, thread-per-connection), matching the TCP server and keeping the
+core tokio-free; the async variant is a documented future drop-in behind the same `handle()`
+boundary.
+
+**Large results stream — the robustness requirement, met and measured.** `exec::run_stream`
+plus a reader-fleet `Job::Stream` push rows onto a **bounded** channel; `POST /v1/query` on a
+locally-held shard emits them as newline-delimited JSON straight from the cursor. Nothing
+materialises. Proven: a **300,000-row query streamed while the server held ~11.5 MB RSS**, and
+`tests/streaming.rs` streams 200k rows through a 64-row buffer with backpressure, stopping the
+reader early when the consumer drops. The bounded channel *is* the backpressure — a slow
+client throttles the reader rather than filling memory. (This also gave the core a streaming
+read it never had; even the native path materialised and was capped at the 16 MB frame limit.)
+
+Endpoints: `/v1/info`, `/v1/query` (streaming), `/v1/query_all`, `/v1/execute`, `/v1/tx`
+(atomic, durable). Each maps to the existing `Request` and reuses routing, forwarding, and the
+reader fleet unchanged. Native `Response` maps to a faithful HTTP status (a rejected statement
+is 400, not 200 — caught by a test).
+
+**Security posture enforced at startup, not documented and hoped for:** HTTP Basic →
+the same challenge-response verification the native handshake uses (secret → keyed proof
+against a fresh nonce; byte-identical). Roles apply unchanged (`Read`/`Write`/`Admin`). And the
+gateway **refuses to start with auth enabled but no transport security** unless `--http-insecure`
+is passed — because Basic over plaintext leaks secrets. Both the posture and the status mapping
+are revert-verified.
+
+CLI: `meshdb serve <dir> --http ADDR [--http-insecure]` runs the gateway alongside the native
+TCP server on one core. Remaining for later phases: `/v1/cluster`, `/v1/users`, `/v1/frames`,
+cross-language drivers, and the standalone console.
+
 ### Frame inspection: `meshdb frames`
 
 Physical replication ships WAL frames, not SQL — the honest cost of deterministic

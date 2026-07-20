@@ -224,3 +224,53 @@ pub fn run(conn: &Connection, statement: &Statement) -> Result<Executed, SqlErro
 
     Ok(Executed::Rows(QueryResult { columns, rows }))
 }
+
+/// One item in a streamed query: the column names once, then each row.
+#[derive(Debug, Clone)]
+pub enum StreamItem {
+    Columns(Vec<String>),
+    Row(Vec<Value>),
+}
+
+/// Run a read query, handing each row to `sink` as it is produced rather than collecting the
+/// whole result in memory.
+///
+/// This is the memory-safe path for large results: nothing but the current row is held here,
+/// so a query returning a million rows costs the same as one returning ten. `sink` returns
+/// `false` to stop early — when the consumer (an HTTP client) has gone away, there is no
+/// point reading the rest.
+///
+/// Only read queries stream. A statement with no result columns is a write, and is refused
+/// here rather than silently doing nothing — writes go through the writer, not this path.
+pub fn run_stream(
+    conn: &Connection,
+    statement: &Statement,
+    mut sink: impl FnMut(StreamItem) -> bool,
+) -> Result<(), SqlError> {
+    let mut stmt = conn.prepare(&statement.sql).map_err(classify)?;
+    if stmt.column_count() == 0 {
+        return Err(SqlError::Logic(
+            "this is a streaming read endpoint; the statement returned no columns (it is a              write). Use the execute endpoint for writes."
+                .into(),
+        ));
+    }
+
+    let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let width = columns.len();
+    if !sink(StreamItem::Columns(columns)) {
+        return Ok(());
+    }
+
+    let params = rusqlite::params_from_iter(statement.params.iter());
+    let mut cursor = stmt.query(params).map_err(classify)?;
+    while let Some(row) = cursor.next().map_err(classify)? {
+        let mut out = Vec::with_capacity(width);
+        for i in 0..width {
+            out.push(Value::from_ref(row.get_ref(i).map_err(classify)?));
+        }
+        if !sink(StreamItem::Row(out)) {
+            break;
+        }
+    }
+    Ok(())
+}

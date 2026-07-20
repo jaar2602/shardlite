@@ -199,6 +199,16 @@ impl Server {
         self
     }
 
+    /// Share this server's shard manager, e.g. with an HTTP gateway on the same node.
+    pub fn shards_arc(&self) -> Arc<ShardManager> {
+        Arc::clone(&self.shards)
+    }
+
+    /// A clone of this server's node services, for a co-located gateway.
+    pub fn services_clone(&self) -> NodeServices {
+        self.services.clone()
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener
             .local_addr()
@@ -513,7 +523,7 @@ fn serve_connection(
     result
 }
 
-fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
+pub(crate) fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
     // A request that arrived already forwarded is handled here or refused, never passed on
     // again — that is what stops two nodes with briefly different maps bouncing it forever.
     if let Request::Direct(inner) = req {

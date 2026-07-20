@@ -1,7 +1,8 @@
 # Design: HTTP gateway, cross-language drivers, and a web console
 
-> Status: **plan only.** No code, no dependencies added. This document is the deliverable of
-> a planning step, to be reviewed before any implementation.
+> Status: **Phase 1 implemented** (core endpoints streaming query/execute/tx/info, auth, TLS
+> posture) behind `--features http`. Phases 2-3 (drivers, standalone console) remain planned.
+> Remaining Phase 1 endpoints: /v1/cluster, /v1/users, /v1/frames.
 
 ## Why the order is HTTP first, not last
 

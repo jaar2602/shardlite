@@ -462,6 +462,20 @@ impl ShardManager {
         self.writers.execute_atomic(shard, statements)
     }
 
+    /// Stream a read query's rows without materialising the whole result.
+    ///
+    /// Returns a receiver yielding [`reader_fleet::StreamMsg`]. The memory-safe path for large
+    /// results — the caller drains rows as they arrive, and the bounded channel throttles the
+    /// reader to match.
+    pub fn query_stream(
+        &self,
+        shard: ShardId,
+        sql: impl Into<crate::storage::exec::Statement>,
+        depth: usize,
+    ) -> crate::Result<std::sync::mpsc::Receiver<reader_fleet::StreamMsg>> {
+        self.readers.stream(shard, sql, depth)
+    }
+
     pub fn execute_one(
         &self,
         shard: ShardId,

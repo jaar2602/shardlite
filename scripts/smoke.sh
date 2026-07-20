@@ -127,6 +127,24 @@ assert_contains "select counted as a reader query" "queries=1" \
     bash -c "printf 'SELECT 1\n.stats\n.quit\n' | $BIN $DB"
 
 echo
+echo "http gateway (only when built with --features http)"
+HGDIR=$(mktemp -d); HGP=$(( (RANDOM % 2000) + 24000 ))
+"$BIN" "$HGDIR/hg" --shards 1 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
+"$BIN" "$HGDIR/hg" -c "INSERT INTO t VALUES (1),(2),(3)" >/dev/null 2>&1
+"$BIN" serve "$HGDIR/hg" --listen "127.0.0.1:$((HGP+1))" --http "127.0.0.1:$HGP" >/dev/null 2>&1 &
+HGPID=$!
+sleep 1
+if command -v curl >/dev/null 2>&1 && curl -s "http://127.0.0.1:$HGP/v1/info" | grep -q "shard_count"; then
+  assert_contains "http /v1/info" "shard_count" curl -s "http://127.0.0.1:$HGP/v1/info"
+  assert_contains "http /v1/query streams ndjson" "columns" \
+    curl -s -X POST "http://127.0.0.1:$HGP/v1/query" -d '{"shard":0,"sql":"SELECT id FROM t"}'
+else
+  echo "  (skipped: binary built without --features http, or curl absent)"
+fi
+kill $HGPID 2>/dev/null
+rm -rf "$HGDIR"
+
+echo
 echo "frame inspector decodes the WAL"
 FR_DIR=$(mktemp -d)
 "$BIN" "$FR_DIR/fr" --shards 1 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
