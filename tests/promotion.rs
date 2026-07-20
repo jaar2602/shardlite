@@ -286,9 +286,11 @@ fn a_read_never_sees_a_follower_mid_apply() {
         seen.last()
     );
     println!(
-        "{} reads, values progressed to {:?}",
+        "{} reads, values progressed to {:?}, generation={} reopens={}",
         seen.len(),
-        seen.last()
+        seen.last(),
+        r.manager.modes().access(S0).generation(),
+        r.manager.modes().access(S0).reopens()
     );
 }
 
