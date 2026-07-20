@@ -790,6 +790,26 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### Frame inspection: `meshdb frames`
+
+Physical replication ships WAL frames, not SQL — the honest cost of deterministic
+replication is an opaque stream. This is the observability answer: `vfs::inspect_wal` decodes
+a WAL file offline into a `WalReport` (header, per-frame page/commit/salt, transaction
+grouping), and `meshdb frames <dir> --shard N` (or `--file PATH`, `--all`) renders it.
+
+Read-only and offline by construction: it reads a file at rest and never touches the live
+capture path, so inspecting a shard can never disturb replication. It reports what is
+*physically* present — a frame past the last commit is shown, not hidden — and flags frames
+whose salt does not match the header as **leftover** from before the last checkpoint, which
+SQLite ignores. Honestly labelled: `current` is a salt match, not a full checksum-validity
+proof, which is stated rather than implied.
+
+Verified against real shard WALs (`tests/frames.rs`, 5): a CREATE plus five INSERTs read back
+as six committed transactions; commit frames carry a non-zero db-size marker; a non-WAL file
+has no header; and a rotated header salt makes every frame read as leftover and count zero
+transactions — revert-checked (removing the salt comparison fails that test). Three CLI
+assertions in the smoke script.
+
 ### Client transactions: BEGIN/COMMIT, buffered and durable
 
 `BEGIN` used to be refused, with a documented reason: a client-held transaction pins the

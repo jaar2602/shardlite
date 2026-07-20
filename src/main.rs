@@ -64,6 +64,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "serve" => return serve_cmd(&args),
         "user" => return user_cmd(&args),
+        "frames" => return frames_cmd(&args),
         _ => {}
     }
 
@@ -481,6 +482,145 @@ fn positionals(args: &[String]) -> Vec<&str> {
         }
     }
     out
+}
+
+const FRAMES_USAGE: &str = "\
+usage:
+  meshdb frames <data-dir> --shard N     inspect one shard's WAL
+  meshdb frames --file <path-to-wal>     inspect a WAL file directly
+
+  --all      show every frame, including uncommitted and leftover ones
+             (default: a summary plus per-transaction commit frames)
+
+Physical replication ships WAL frames, which are not human-readable SQL. This decodes the
+frame stream a shard emits: the WAL header, each frame's page number and commit marker, and
+how the frames group into transactions. Read-only.
+
+A frame with a non-zero db-size field is a COMMIT (it ends a transaction). A frame whose salt
+does not match the header is a leftover from before the last checkpoint, which SQLite ignores.";
+
+/// Inspect a shard's WAL frame stream.
+fn frames_cmd(args: &[String]) -> ExitCode {
+    let path = match flag(args, "--file") {
+        Some(f) => std::path::PathBuf::from(f),
+        None => {
+            let pos = positionals(&args[1..]);
+            let (Some(dir), Some(shard)) = (
+                pos.first(),
+                flag(args, "--shard").and_then(|v| v.parse::<u32>().ok()),
+            ) else {
+                eprintln!("{FRAMES_USAGE}");
+                return ExitCode::FAILURE;
+            };
+            let db = std::path::Path::new(dir).join(format!("shard_{shard}.db"));
+            meshdb::storage::checkpoint::wal_path_for(&db)
+        }
+    };
+
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "no WAL at {} - the shard has been checkpointed and holds no pending frames",
+                path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("error: reading {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = meshdb::vfs::inspect_wal(&bytes);
+    render_frames(&report, &path, args.iter().any(|a| a == "--all"));
+    ExitCode::SUCCESS
+}
+
+fn render_frames(report: &meshdb::vfs::WalReport, path: &std::path::Path, all: bool) {
+    println!("WAL: {}", path.display());
+    println!("  file size:      {} bytes", report.file_bytes);
+
+    let Some(header) = &report.header else {
+        println!("  not a WAL file (no valid header)");
+        return;
+    };
+
+    println!("  page size:      {} bytes", header.page_size);
+    println!("  checkpoint seq: {}", header.checkpoint_seq);
+    println!(
+        "  salt:           {}",
+        header
+            .salt
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    println!("  frames:         {} total", report.frames.len());
+    println!("  transactions:   {} committed", report.transactions());
+    let uncommitted = report.uncommitted_frames();
+    if uncommitted > 0 {
+        println!("  uncommitted:    {uncommitted} frame(s) past the last commit");
+    }
+    let leftover = report.frames.iter().filter(|f| !f.current).count();
+    if leftover > 0 {
+        println!("  leftover:       {leftover} frame(s) from before the last checkpoint");
+    }
+    if report.trailing_bytes > 0 {
+        println!(
+            "  trailing:       {} bytes after the last whole frame (partial write?)",
+            report.trailing_bytes
+        );
+    }
+
+    if report.frames.is_empty() {
+        return;
+    }
+    println!();
+
+    if all {
+        println!(
+            "  {:>5}  {:>10}  {:>8}  {:<10}  {:<10}",
+            "frame", "offset", "page", "commit", "status"
+        );
+        for f in &report.frames {
+            println!(
+                "  {:>5}  {:>10}  {:>8}  {:<10}  {:<10}",
+                f.index,
+                f.offset,
+                f.page_no,
+                if f.is_commit() {
+                    format!("db={}", f.db_size_after_commit)
+                } else {
+                    "-".into()
+                },
+                if f.current { "current" } else { "leftover" },
+            );
+        }
+    } else {
+        println!("  transactions (commit frames):");
+        println!(
+            "  {:>4}  {:>8}  {:>9}  {:>10}",
+            "txn", "frames", "db-pages", "at-offset"
+        );
+        let mut txn = 0u64;
+        let mut since = 0u64;
+        for f in report.current_frames() {
+            since += 1;
+            if f.is_commit() {
+                txn += 1;
+                println!(
+                    "  {txn:>4}  {since:>8}  {:>9}  {:>10}",
+                    f.db_size_after_commit, f.offset
+                );
+                since = 0;
+            }
+        }
+        if since > 0 {
+            println!("  (+{since} uncommitted frame(s) after the last transaction)");
+        }
+        println!("\n  run with --all to see every frame");
+    }
 }
 
 const SERVE_USAGE: &str = "usage: meshdb serve <data-dir> [options]

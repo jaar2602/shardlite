@@ -83,6 +83,110 @@ impl FrameHeader {
     }
 }
 
+/// One frame as it physically sits in a WAL file, for offline inspection.
+///
+/// This is what `meshdb frames` reports: the raw physical stream, not the reconstructed
+/// transaction view the live capture builds. It reads a file at rest and reports every frame
+/// slot, so a frame past the last commit — an in-progress or leftover write — is shown rather
+/// than hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFrameInfo {
+    /// Zero-based position in the file.
+    pub index: u64,
+    /// Byte offset of the frame header.
+    pub offset: u64,
+    pub page_no: u32,
+    /// Database size in pages after this frame; `0` unless the frame commits a transaction.
+    pub db_size_after_commit: u32,
+    pub salt: [u8; 8],
+    /// Whether the frame's salt matches the WAL header. SQLite reuses a WAL in place and
+    /// rotates the salt on reset, so a non-matching frame is a leftover from a previous
+    /// generation that SQLite would stop reading at — not part of the current stream.
+    pub current: bool,
+}
+
+impl WalFrameInfo {
+    pub fn is_commit(&self) -> bool {
+        self.db_size_after_commit != 0
+    }
+}
+
+/// The result of inspecting a WAL file offline.
+#[derive(Debug, Clone)]
+pub struct WalReport {
+    /// `None` if the bytes are not a WAL file (no valid header).
+    pub header: Option<WalHeader>,
+    pub frames: Vec<WalFrameInfo>,
+    pub file_bytes: u64,
+    /// Bytes after the last whole frame — a partial frame from an interrupted write, or
+    /// padding. A non-zero value is worth noticing.
+    pub trailing_bytes: u64,
+}
+
+impl WalReport {
+    /// Frames belonging to the current generation (salt matches), which form a prefix.
+    pub fn current_frames(&self) -> impl Iterator<Item = &WalFrameInfo> {
+        self.frames.iter().take_while(|f| f.current)
+    }
+
+    /// Committed transactions in the current generation: one per commit frame.
+    pub fn transactions(&self) -> u64 {
+        self.current_frames().filter(|f| f.is_commit()).count() as u64
+    }
+
+    /// Frames past the last commit in the current generation — written but not yet committed.
+    pub fn uncommitted_frames(&self) -> u64 {
+        let current: Vec<&WalFrameInfo> = self.current_frames().collect();
+        let last_commit = current.iter().rposition(|f| f.is_commit());
+        match last_commit {
+            Some(i) => (current.len() - (i + 1)) as u64,
+            None => current.len() as u64,
+        }
+    }
+}
+
+/// Decode a WAL file's bytes into a report, without executing anything.
+///
+/// Read-only and offline: it never touches the live capture path, so inspecting a shard can
+/// never disturb replication. It reports what is physically present; whether SQLite would
+/// accept a given frame also depends on a cumulative checksum this does not recompute, so
+/// `current` (salt match) is a strong signal but not a full validity proof — stated plainly
+/// rather than implied.
+pub fn inspect_wal(bytes: &[u8]) -> WalReport {
+    let header = WalHeader::parse(bytes);
+    let mut frames = Vec::new();
+    let mut trailing = bytes.len() as u64;
+
+    if let Some(h) = &header {
+        let frame_size = FRAME_HEADER_SIZE as usize + h.page_size as usize;
+        let mut off = WAL_HEADER_SIZE as usize;
+        let mut idx = 0u64;
+        while off + frame_size <= bytes.len() {
+            let fh = &bytes[off..off + FRAME_HEADER_SIZE as usize];
+            let mut salt = [0u8; 8];
+            salt.copy_from_slice(&fh[8..16]);
+            frames.push(WalFrameInfo {
+                index: idx,
+                offset: off as u64,
+                page_no: be32(fh, 0),
+                db_size_after_commit: be32(fh, 4),
+                salt,
+                current: salt == h.salt,
+            });
+            off += frame_size;
+            idx += 1;
+        }
+        trailing = (bytes.len() - off) as u64;
+    }
+
+    WalReport {
+        header,
+        frames,
+        file_bytes: bytes.len() as u64,
+        trailing_bytes: trailing,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Frame {
     pub page_no: u32,

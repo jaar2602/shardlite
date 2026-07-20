@@ -8,4 +8,7 @@ pub mod passthrough;
 pub mod wal;
 
 pub use passthrough::{VFS_NAME, capture_for, capture_for_with_limit, register};
-pub use wal::{CaptureStats, CommittedTxn, Frame, WalCapture, apply_to_db_file};
+pub use wal::{
+    CaptureStats, CommittedTxn, Frame, WalCapture, WalFrameInfo, WalHeader, WalReport,
+    apply_to_db_file, inspect_wal,
+};

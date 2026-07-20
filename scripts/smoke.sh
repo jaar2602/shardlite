@@ -127,6 +127,16 @@ assert_contains "select counted as a reader query" "queries=1" \
     bash -c "printf 'SELECT 1\n.stats\n.quit\n' | $BIN $DB"
 
 echo
+echo "frame inspector decodes the WAL"
+FR_DIR=$(mktemp -d)
+"$BIN" "$FR_DIR/fr" --shards 1 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
+"$BIN" "$FR_DIR/fr" -c "INSERT INTO t VALUES (1)" >/dev/null 2>&1
+assert_contains "frames reports the page size" "page size:" "$BIN" frames "$FR_DIR/fr" --shard 0
+assert_contains "frames reports committed transactions" "committed" "$BIN" frames "$FR_DIR/fr" --shard 0
+assert_contains "frames --all lists frame rows" "current" "$BIN" frames "$FR_DIR/fr" --shard 0 --all
+rm -rf "$FR_DIR"
+
+echo
 echo "manifest guards the immutable shard count"
 SH_DIR=$(mktemp -d); trap 'rm -rf "$DB_DIR" "$SH_DIR"' EXIT
 "$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
