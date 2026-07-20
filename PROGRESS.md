@@ -36,7 +36,7 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 11 | Shard placement + move | **done** | `tests/cluster.rs` (16) + `src/cluster/placement.rs` (7) + `src/net/forward.rs` |
 | 12 | Read consistency levels | not started | |
 
-**249 Rust tests + 41 CLI assertions. Clippy clean, fmt clean.**
+**249 Rust tests + 41 CLI assertions. Clippy clean, fmt clean. No known flaky tests.**
 
 ---
 
@@ -755,14 +755,40 @@ kept passing **only by racing the first placement round** — so they surfaced a
 failures under parallel load, not as honest breakage. When an invariant changes, the tests
 that quietly still pass are the ones to go looking at.
 
-### Known flaky test
+### The flaky checkpoint test: root-caused and fixed
 
-`checkpoint::a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation` failed twice
-in three full-suite runs under heavy parallel load, then passed in six consecutive runs
-across both this branch and the tree without these changes. It is timing-sensitive — it
-races WAL growth against the escalation threshold — and nothing in this work touches
-checkpointing. Not attributed to these changes, but not dismissed either: it should be made
-deterministic rather than left to fail occasionally in CI.
+It failed **17 runs in 40** once reproduced properly. The cause was not timing noise — the
+test asserted things SQLite does not do. Four wrong beliefs, each found by measuring:
+
+1. **A successful PASSIVE checkpoint shrinks the WAL file.** It does not. Measured on 3.53.2:
+   `(busy=0, log=2213, checkpointed=2213)` — everything copied — leaves the file at exactly
+   its previous length. Only TRUNCATE shrinks it.
+2. **After the reader releases, the ladder escalates and reclaims.** It correctly does the
+   opposite: passive checkpoints start succeeding, the stall counter resets, and escalation
+   never fires. The old test passed only when a stray stall happened to trigger a TRUNCATE
+   after release.
+3. **With no reader, the WAL stops growing.** It keeps growing while writes outpace the
+   checkpoint interval, stalls or no stalls.
+4. **Dropping the reader releases its snapshot immediately.** Ending the *transaction* does
+   not — the connection must go too — and even then one more stall can follow, because the
+   read mark is not cleared instantly.
+
+The product was correct throughout; the test was wrong four times over. It now asserts what
+the name promises — a pinned snapshot stalls checkpoints, the WAL passes its hard limit, and
+the ladder escalates to TRUNCATE **while the reader still holds** — and measures recovery
+over a settled window rather than on the instant after release.
+
+**45 consecutive clean runs**, and the checkpoint suite dropped from ~20s to 5s.
+
+Worth keeping as a lesson: a flaky test is often not a timing problem but a false belief that
+happens to be true most of the time.
+
+### Convergence checks now use the content hash
+
+`tests/replica_net.rs` compared whole files byte for byte, which worked only because those
+tests are small and quiesced. Primary and follower files are not byte-identical in general.
+They now compare `storage::verify::content_hash`, with `integrity_check` kept alongside and
+labelled as insufficient — a follower holding valid-but-wrong pages passes it happily.
 
 ### Debt deliberately deferred
 

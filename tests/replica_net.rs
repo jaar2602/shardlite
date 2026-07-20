@@ -87,16 +87,31 @@ fn insert(i: i64) -> Statement {
     )
 }
 
-/// Compare a shard on the primary against the follower's copy, byte for byte.
+/// Compare a shard on the primary against the follower's copy.
+///
+/// By **content**, not bytes. An earlier version compared whole files and happened to work
+/// because these tests are small and quiesced — but primary and follower files are not
+/// byte-identical in general: freelist layout, vacuum history and checkpoint timing all
+/// differ legitimately. Measured while building `storage::verify`: switching that module to
+/// a byte hash made `a_correctly_replicated_shard_matches_its_primary` fail outright.
 fn assert_converged(p: &Primary, r: &Replica, shard: ShardId) {
+    use meshdb::storage::verify::{hash_file, hex};
+
     let tmp = TempDir::new().unwrap();
     let snap = tmp.path().join("cmp.db");
     p.manager.snapshot(shard, &snap).unwrap();
-    let a = std::fs::read(&snap).unwrap();
-    let b = std::fs::read(shard.path(r.follower().dir())).unwrap();
-    assert_eq!(a.len(), b.len(), "{shard}: sizes differ");
-    assert!(a == b, "{shard}: follower diverged from primary");
 
+    let a = hash_file(&snap).unwrap();
+    let b = hash_file(&shard.path(r.follower().dir())).unwrap();
+    assert_eq!(
+        hex(&a),
+        hex(&b),
+        "{shard}: the follower's contents differ from the primary's"
+    );
+
+    // Still worth checking, and worth knowing it is not sufficient: a follower holding valid
+    // pages that are the wrong pages passes this happily. The content hash above is what
+    // actually catches that.
     let conn = meshdb::rusqlite::Connection::open(shard.path(r.follower().dir())).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))

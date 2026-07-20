@@ -105,9 +105,17 @@ fn wal_stays_bounded_under_sustained_writes() {
 
 #[test]
 fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
-    // This is the starvation scenario the ladder exists for: a reader holding a snapshot
-    // stops the checkpoint advancing, the WAL grows past its hard limit, and the ladder
-    // escalates to TRUNCATE.
+    // The starvation scenario the ladder exists for: a reader holding a snapshot stops the
+    // checkpoint advancing, the WAL grows past its hard limit, and the ladder escalates to a
+    // blocking TRUNCATE rather than letting the disk fill.
+    //
+    // Both assertions below were once made *after* the reader released, and both were wrong
+    // there. Measured on 3.53.2: a fully successful PASSIVE checkpoint — `(busy=0, log=2213,
+    // checkpointed=2213)`, everything copied — leaves the WAL file at exactly its previous
+    // size. Only TRUNCATE shrinks it. So once the reader lets go, passive checkpoints succeed,
+    // the stall counter resets, escalation correctly never fires, and the file stays at its
+    // high-water mark. The old test passed only when a stray stall happened to trigger a
+    // TRUNCATE after release, which is timing, not behaviour.
     let dir = TempDir::new().unwrap();
     let (w, path) = spawn(&dir, tight());
     let h = &w;
@@ -128,7 +136,10 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
 
-        write_rows(h, 100, 120);
+        // Enough writes that the WAL passes the hard limit with the stall counter exhausted.
+        // Escalation needs both, and it must happen *here*, while the reader still pins the
+        // snapshot — that is the condition the ladder is for.
+        write_rows(h, 100, 200);
 
         let during = w.checkpoint_stats();
         println!(
@@ -143,20 +154,51 @@ fn a_long_lived_reader_stalls_the_checkpointer_and_forces_escalation() {
             wal_len(&path) > tight().soft_limit_bytes,
             "the WAL should have grown while the reader pinned it"
         );
+        assert!(
+            during.truncated > 0,
+            "with the WAL past its hard limit and passive checkpoints stalling, the ladder \
+             must escalate to TRUNCATE: {during:?}"
+        );
     } // read transaction ends here
 
-    // With the snapshot released, checkpointing can drain and reclaim.
-    write_rows(h, 100_000, 60);
+    // The *connection* has to go too, not just the transaction. Measured: a reader that has
+    // ended its transaction but stayed open still holds a read mark, so passive checkpoints
+    // keep partially stalling. Ending the transaction alone is not releasing the snapshot.
+    drop(reader);
+
+    // What "recovered" means here is that the checkpointer stops being starved — not
+    // anything about the file's size, and not immediately.
+    //
+    // Four earlier versions of this test asserted the wrong thing here. Measured on 3.53.2:
+    // (a) a fully successful PASSIVE checkpoint (`busy=0, log=2213, checkpointed=2213` —
+    // everything copied) leaves the WAL at exactly its previous length; only TRUNCATE
+    // shrinks it. (b) The file legitimately keeps growing while writes outpace the
+    // checkpoint interval, even with nothing stalling. (c) Dropping the reader does not
+    // clear its read mark instantly, so one more stall can follow the drop — that alone
+    // made the test fail 17 runs in 40.
+    //
+    // So: let it settle, then measure a clean window. Asserting on the instant after release
+    // is asserting on a transient.
+    write_rows(h, 100_000, 200);
+    let settled = w.checkpoint_stats();
+
+    write_rows(h, 200_000, 200);
     let after = w.checkpoint_stats();
     println!(
-        "after release: passive={} truncated={} stalls={} wal={}",
-        after.passive, after.truncated, after.stalls, after.wal_bytes
+        "settled: passive={} stalls={} | after a clean window: passive={} stalls={}",
+        settled.passive, settled.stalls, after.passive, after.stalls
     );
 
     assert!(
-        after.truncated > 0 || wal_len(&path) < tight().hard_limit_bytes,
-        "once the reader released, the WAL should be reclaimed: wal={}",
-        wal_len(&path)
+        after.passive > settled.passive,
+        "checkpointing should still be running after the reader let go"
+    );
+    assert_eq!(
+        after.stalls,
+        settled.stalls,
+        "with no reader pinning a snapshot, a settled checkpointer must not stall again; \
+         {} new stalls appeared",
+        after.stalls - settled.stalls
     );
 }
 
