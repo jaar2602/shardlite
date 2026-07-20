@@ -51,8 +51,21 @@ The gateway must not reverse that. The recommended stack is a **synchronous HTTP
 none of it. This preserves the footprint and keeps the gateway an optional edge, exactly as
 TLS is today.
 
-*(The alternative — axum/hyper on tokio — is more ergonomic but pulls tokio into the core's
-process and grows the footprint. Rejected for the same reason openraft was.)*
+**Decision (locked): sync now, async as a future drop-in feature.** The gateway's only contact
+with the core is one function, `handle(req, shards, services) -> Response`. That boundary
+insulates the core from the transport's concurrency model, so:
+
+- Today: `--features http` = a synchronous `tiny_http` gateway. Core stays sync, small,
+  loom-checkable, tokio-free at ~150 MB.
+- Later, *if and when* connections must scale to thousands: `--features http-async` = a tokio
+  gateway bridging to the same `handle()` via `spawn_blocking`. An **additive feature swap on
+  the gateway module only — not a rewrite**, and only that feature carries tokio.
+
+The trigger is measurable: `max_connections` is 256 today and every request blocks on an
+fsync, so async buys nothing below that. The signal to build the async gateway is a real need
+for thousands of concurrent HTTP clients. Until then, sync thread-per-connection is the
+better fit on merit, not a compromise. The sync gateway will be built with its HTTP server
+behind a thin internal boundary precisely so the async variant is a drop-in later.
 
 ---
 
@@ -174,31 +187,69 @@ contract.
 
 ---
 
-## Phase 3 — Web console
+## Phase 3 — Web console: a standalone management tool
 
-A browser SPA (TypeScript, reusing the Phase 2 JS driver) served either as static files or by
-the gateway. Screens, each backed by existing data:
+**Decision (locked): the console is its own process — backend + frontend — not served by the
+database.** Serving it from the DB binary was rejected for two real reasons: it would compete
+for the 256-connection cap meant for data clients, and it would put a public web entry point
+on the process that holds the data (a DDoS/attack-surface concern). A standalone console also
+removes CORS entirely — the browser talks only to the console's own backend, same origin.
+
+The console is best understood not as a dashboard for one cluster but as a **database client
+for many meshdb connections** — think DBeaver / pgAdmin / TablePlus, for meshdb:
+
+```
+browser ──HTTP (same origin)──► meshdb-console (standalone process)
+                                  • serves the frontend (its own backend)
+                                  • its OWN login (console username/password)
+                                  • holds meshdb credentials server-side, never in the browser
+                                  • manages MANY saved meshdb connections
+                                  • authenticates + rate-limits the operator before touching a cluster
+                                        │ HTTP/JSON (Phase 1 gateway) or native driver
+                                        ▼
+                                  one or more meshdb clusters (data processes, untouched)
+```
+
+Why this shape wins:
+- **Isolation** — flooding the console never touches a DB process directly; separate failure
+  and attack domains. (The console must still auth + rate-limit so it cannot become a DB load
+  amplifier — easy in a dedicated tier, awkward bolted onto the DB.)
+- **No CORS** — browser → console backend is same-origin; console backend → cluster is
+  server-to-server.
+- **Credentials stay server-side** in the console, not shipped to a browser tab.
+- **Multi-connection** — one console manages many meshdb clusters/nodes, with its own account
+  system separate from any cluster's users.
+- **Concurrency fully decoupled** — a separate process can be sync or async on its own terms
+  with zero bearing on meshdb's core; a UI backend facing bursty browsers is exactly where
+  async is least controversial.
+
+### Console features
+
+v1 (management):
 
 | Screen | Data source | Purpose |
 |---|---|---|
-| **Cluster topology** | `GET /v1/cluster` | node/term/role, leader, placement map (which node leads which shard), step-down/election counters |
-| **Node health** | `GET /v1/stats` per node | connections, auth failures, authz refusals, abandoned freezes, writer/reader stats |
-| **Shards** | placement + `GET /v1/schema` | per-shard owner, schema version, size; flag version skew during a rolling DDL |
-| **SQL runner** | `POST /v1/query` / `/execute` / `/tx` | run reads/writes with a shard + consistency selector; results table |
-| **Users** | `/v1/users` | list, create (role picker), drop — live, no restart |
-| **Replication / frames** | `GET /v1/frames/{shard}` | the frame inspector in the browser: transactions, commit markers, leftover frames, WAL growth |
-| **Divergence check** | `content_hash` per shard (new endpoint) | compare a follower against its primary from the UI |
+| **Connections** | console's own store | saved meshdb clusters; console login gates access |
+| **Cluster topology** | `GET /v1/cluster` | node/term/role, leader, placement map |
+| **Node health** | `GET /v1/stats` per node | connection + auth + writer/reader counters |
+| **Shards** | placement + `GET /v1/schema` | per-shard owner, schema version; version-skew flag |
+| **SQL runner** | `POST /v1/query` `/execute` `/tx` | shard + consistency selector; results grid |
+| **Users** | `/v1/users` | list / create (role picker) / drop — live, no restart |
+| **Replication / frames** | `GET /v1/frames/{shard}` | frame inspector in the browser |
 
-Console-specific concerns to decide at build time: how it discovers all nodes (seed list vs
-one node reporting peers), whether it polls or the gateway offers a lightweight
-server-sent-events stream for live counters, and read-only vs admin console modes gated by the
-logged-in role.
+Later (the console is where new operator features accrue, off the data path):
+- **Data ingestion** — CSV/JSON bulk import, routed to shards via `/v1/tx`.
+- **Monitoring** — time-series of the counters, alerts on step-down churn / auth failures /
+  WAL growth / divergence.
+- Query history, saved queries, schema browser, export.
 
-**Security note:** the console is an admin surface. It must be served over TLS, behind auth,
-and — because it can create users and run DDL — should default to the same trusted-network
-posture as the rest of meshdb, with the open-mode warning applying doubly.
+### Console stack
 
----
+Its own small backend (language open — could reuse the Phase 2 JS/TS driver on Node, or a
+Rust backend using `net::Client`) plus a frontend SPA. Kept in a separate directory or repo
+so it never entangles the meshdb crate's build. The console's account system (console
+login) is distinct from meshdb's user roles: logging into the console authorizes *using the
+console*; the meshdb credentials it stores authorize *acting on a cluster*.
 
 ## Effort and risk, honestly
 
@@ -213,15 +264,15 @@ The whole plan preserves the two decisions that define meshdb: **tokio-free core
 of an unchanged core — the same way TLS and auth were added without disturbing storage or
 replication.
 
-## Open questions for the reviewer
+## Decisions (resolved)
 
-1. **Sync vs async HTTP** — this plan assumes sync (`tiny_http`) to protect the footprint. If
-   throughput demands or a preference for axum's ergonomics outweigh that, the gateway can be
-   async with a threadpool bridge, at a footprint cost.
-2. **Where drivers and the console live** — in-repo (`drivers/`, `console/`) or separate
-   repos. In-repo is simpler to keep in sync with the protocol; separate keeps the Rust
-   crate's build lean.
-3. **Node discovery for the console** — seed list, or teach the gateway to report peer
-   addresses so the console learns the whole cluster from one node.
-4. **Live updates** — polling (simplest) vs a server-sent-events counter stream (nicer,
-   slightly more gateway code).
+1. **Sync vs async HTTP** — **sync now** (`tiny_http`), async as a future drop-in feature
+   (`http-async`) behind the `handle()` boundary, triggered by a real need for thousands of
+   concurrent connections. Not before.
+2. **Where drivers and the console live** — **outside the meshdb crate** (separate directory
+   or repos), so the core build stays lean and the console's concurrency model is fully
+   decoupled.
+3. **Console hosting** — **standalone process**, its own backend + frontend, its own login,
+   managing many meshdb connections. Not served by the DB binary.
+4. **Live updates** — start with polling; a server-sent-events counter stream is a later
+   nicety, and lives in the console tier (or the gateway) where it belongs, not in the core.
