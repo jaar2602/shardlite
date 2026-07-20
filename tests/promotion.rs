@@ -22,6 +22,27 @@ use tempfile::TempDir;
 const S0: ShardId = ShardId(0);
 const FOLLOWER: u64 = 2;
 
+/// Wait for the replica to have applied everything the primary has committed for `shard`.
+///
+/// A fixed sleep is a guess about how fast a machine is. Under load it is the wrong guess,
+/// and the failure it produces is a one-off nobody can reproduce — which is worse than a
+/// consistent failure, because it gets dismissed.
+fn await_caught_up(p: &Primary, r: &Replicant, shard: ShardId, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let target = p.manager.last_lsn(shard);
+        let have = r.replica.follower().position(shard).applied_lsn;
+        if target > 0 && have >= target {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("replica stuck at {have} of {target} for {shard}");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The single scalar a query returned.
 fn scalar(o: meshdb::storage::exec::Outcome) -> Value {
     match o {
@@ -186,9 +207,12 @@ fn a_followed_shard_refuses_writes_but_serves_reads() {
             .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        await_caught_up(&p, &r, S0, Duration::from_secs(10)),
+        "the replica never caught up"
+    );
     stop.store(true, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(r.replica.wait_idle(Duration::from_secs(5)));
 
     assert_eq!(r.manager.mode(S0), ShardMode::Followed);
 
@@ -252,7 +276,12 @@ fn a_read_never_sees_a_follower_mid_apply() {
             .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        await_caught_up(&p, &r, S0, Duration::from_secs(10)),
+        "the replica never caught up"
+    );
+    // One more pass so the reading thread definitely observes the final state.
+    std::thread::sleep(Duration::from_millis(50));
     reading.store(false, Ordering::Relaxed);
     let seen = checker.join().unwrap();
     stop.store(true, Ordering::Relaxed);
@@ -647,9 +676,12 @@ fn a_stale_read_is_answered_by_the_replica_and_a_strong_one_is_not() {
             .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        await_caught_up(&p, &r, S0, Duration::from_secs(10)),
+        "the replica never caught up"
+    );
     stop.store(true, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(r.replica.wait_idle(Duration::from_secs(5)));
 
     let mut rc = Client::connect(&replica_addr).unwrap();
 

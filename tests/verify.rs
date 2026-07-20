@@ -82,6 +82,26 @@ fn pair() -> Pair {
     }
 }
 
+/// Wait until the follower has applied everything the primary has committed.
+///
+/// A fixed sleep is a guess about how fast the machine is; under load it is the wrong guess,
+/// and the failure it produces is an unreproducible one-off.
+fn await_caught_up(p: &Pair, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let target = p.primary.last_lsn(S0);
+        let have = p.replica.follower().position(S0).applied_lsn;
+        if target > 0 && have >= target {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("replica stuck at {have} of {target}");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Hash the follower safely: stand its pull loop down first, because a hash taken while it
 /// is mid-apply describes a state that never existed.
 fn follower_hash(p: &Pair) -> [u8; 32] {
@@ -118,7 +138,10 @@ fn a_correctly_replicated_shard_matches_its_primary() {
             )
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        await_caught_up(&p, Duration::from_secs(10)),
+        "never caught up"
+    );
 
     let a = p.primary.content_hash(S0).unwrap();
     let b = follower_hash(&p);
@@ -150,7 +173,10 @@ fn a_follower_that_missed_frames_is_detected() {
             .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        await_caught_up(&p, Duration::from_secs(10)),
+        "never caught up"
+    );
     assert_eq!(p.primary.content_hash(S0).unwrap(), follower_hash(&p));
 
     // Now let the primary move on while the follower is stopped — the shape of a follower
@@ -209,14 +235,16 @@ fn a_checkpoint_does_not_look_like_divergence() {
             )
             .unwrap();
     }
-    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        await_caught_up(&p, Duration::from_secs(10)),
+        "never caught up"
+    );
 
     let before = p.primary.content_hash(S0).unwrap();
     assert_eq!(before, follower_hash(&p));
 
     // Force the primary to checkpoint, rewriting its file layout entirely.
     p.primary.vacuum(S0).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
 
     assert_eq!(
         hex(&p.primary.content_hash(S0).unwrap()),

@@ -791,6 +791,22 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### Tests wait on conditions, not on the clock
+
+The step 12 tests originally waited for replication with fixed sleeps — 300 to 400 ms. That
+is a guess about how fast the machine is, and under load it is the wrong guess. The failure
+it produces is an unreproducible one-off, which is worse than a consistent one because it
+gets dismissed rather than investigated.
+
+They now poll until the follower's applied position reaches the primary's committed position,
+with a generous deadline and a diagnostic if it is not met. Verified under **six full suites
+running concurrently**: 253 passed in every one, no failures, no panics.
+
+This was prompted by a single failing run I could **not** reproduce and could not diagnose,
+because the check that spotted it printed only "FAILED" and discarded the output. The
+diagnostic flaw is worth recording alongside the fix: a check that detects a problem without
+capturing it converts a bug into a rumour.
+
 ### The flaky checkpoint test: root-caused and fixed
 
 It failed **17 runs in 40** once reproduced properly. The cause was not timing noise — the
