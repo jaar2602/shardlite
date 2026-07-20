@@ -131,6 +131,22 @@ impl Server {
     ) -> Result<Self> {
         let listener = TcpListener::bind(&cfg.addr)
             .map_err(|e| Error::Protocol(format!("binding {}: {e}", cfg.addr)))?;
+        Self::from_listener(listener, shards, services, cfg)
+    }
+
+    /// Serve on a listener the caller already holds.
+    ///
+    /// Exists because cluster membership is circular to set up: a node needs its peers'
+    /// addresses, and an address is only known once something is bound. Binding, reading the
+    /// port, dropping, and rebinding leaves a window in which another process takes the port
+    /// — which is not hypothetical, it is an `Address already in use` failure that showed up
+    /// once in twenty-four concurrent suite runs. Handing the listener over closes it.
+    pub fn from_listener(
+        listener: TcpListener,
+        shards: Arc<ShardManager>,
+        services: NodeServices,
+        cfg: ServerConfig,
+    ) -> Result<Self> {
         tracing::info!(addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             max_connections = cfg.max_connections, "listening");
         Ok(Self {

@@ -52,7 +52,8 @@ struct Pending {
     manager: Arc<ShardManager>,
     frames: Arc<FrameLog>,
     fence: Arc<Fence>,
-    probe: Arc<Server>,
+    /// Held from the moment the port is known until the real server takes it over.
+    listener: std::net::TcpListener,
     addr: String,
 }
 
@@ -86,29 +87,20 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             )
             .unwrap(),
         );
-        // Bound to port 0 now; the cluster node is attached below, once every address exists.
-        let server = Arc::new(
-            Server::bind_with(
-                Arc::clone(&manager),
-                meshdb::net::NodeServices {
-                    frames: Some(Arc::clone(&frames)),
-                    ..Default::default()
-                },
-                ServerConfig {
-                    addr: "127.0.0.1:0".into(),
-                    ..ServerConfig::default()
-                },
-            )
-            .unwrap(),
-        );
-        let addr = server.local_addr().unwrap().to_string();
+        // Bind once and *hold* the listener. Setting up cluster membership is circular — a
+        // node needs its peers' addresses, which only exist once something is bound — and the
+        // obvious way round it, bind/read-port/drop/rebind, leaves a window where another
+        // process takes the port. That is an `Address already in use` failure that appeared
+        // once in twenty-four concurrent suite runs.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
         built.push(Pending {
             id,
             dir,
             manager,
             frames,
             fence,
-            probe: server,
+            listener,
             addr,
         });
     }
@@ -124,11 +116,10 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         manager,
         frames,
         fence,
-        probe,
+        listener,
         addr,
     } in built
     {
-        drop(probe);
         let peers: BTreeMap<NodeId, String> = addrs
             .iter()
             .filter(|(p, _)| **p != id)
@@ -160,7 +151,8 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
 
         let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
         let server = Arc::new(
-            Server::bind_with(
+            Server::from_listener(
+                listener,
                 Arc::clone(&manager),
                 meshdb::net::NodeServices {
                     frames: Some(frames),
@@ -300,10 +292,29 @@ fn killing_the_leader_elects_a_new_one_within_the_budget() {
 fn a_deposed_leader_is_fenced_and_stops_writing() {
     // Both halves of fencing, on real nodes: the deposed leader's own gate closes, and its
     // token no longer clears the bar its successor raised.
+    // Placement-aware, and it has to be: the coordinator leads a *subset* of shards, and
+    // which subset depends on who won the election. Asserting on shard 0 specifically was
+    // right before placement and became an intermittent failure after it — the fourth test
+    // in this file to make that assumption.
     let nodes = cluster(3);
     let first = await_leader(&nodes, Duration::from_secs(5)).expect("no initial leader");
+
+    // Winning an election and being assigned shards are separate steps, so wait for the
+    // second rather than racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first.cluster.led_shards().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let led = first.cluster.led_shards();
+    assert!(
+        !led.is_empty(),
+        "the leader should have been assigned at least one shard"
+    );
     let old_token = FenceToken::new(first.cluster.term(), first.id);
-    assert!(first.cluster.fence().is_open(ShardId(0)));
+    assert!(
+        first.cluster.fence().is_open(led[0]),
+        "the leader's gate must be open for a shard it actually leads"
+    );
 
     first.stop();
     let survivors: Vec<Arc<Node>> = nodes

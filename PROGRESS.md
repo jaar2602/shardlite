@@ -791,6 +791,36 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### The unreproducible failure, found
+
+A single failing run had been seen and lost — the loop that spotted it printed "FAILED" and
+discarded the output. `scripts/stress.sh` exists to make that impossible: it runs the suite
+repeatedly, optionally concurrently, and keeps the full log of every failure.
+
+It earned its keep immediately, finding **two** real problems in its first thirty runs:
+
+**1. A fourth placement-unaware test.** `a_deposed_leader_is_fenced_and_stops_writing`
+asserted `fence().is_open(ShardId(0))` on the elected leader. Under placement the coordinator
+leads a *subset*, and which subset depends on who won the election — so the assertion held or
+failed by luck. This is the fourth test in this file to assume the coordinator owns every
+shard; the pattern is now unmistakable.
+
+**2. A port race in the test harness, and a real gap in the library.** Setting up cluster
+membership is circular: a node needs its peers' addresses, and an address only exists once
+something is bound. The harness bound port 0, read the port, dropped the listener, and
+rebound — leaving a window where another process takes the port. Under three concurrent
+suites that produced `Address already in use` once in twenty-four runs.
+
+Fixed properly rather than retried around: `Server::from_listener` lets a caller bind once
+and hand the listener over, closing the window entirely. It is a legitimate API in its own
+right — pre-binding is what socket activation needs too.
+
+Verified after both fixes: **thirty suite runs across three concurrent suites, no failures.**
+
+The lesson is the harness, not the bugs. Two intermittent faults had been present for some
+time and were invisible because nothing was looking for them repeatedly and keeping the
+evidence.
+
 ### Tests wait on conditions, not on the clock
 
 The step 12 tests originally waited for replication with fixed sleeps — 300 to 400 ms. That
