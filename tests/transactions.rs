@@ -313,3 +313,34 @@ fn commit_is_durable_reaching_quorum_before_returning() {
     );
     assert_eq!(S0, ShardId(0));
 }
+
+#[test]
+fn a_transaction_that_exceeds_the_buffer_cap_is_refused() {
+    // The memory guard: a runaway transaction must be refused rather than accumulate
+    // unboundedly on the server. Exercised via large blob params, whose real size counts
+    // toward the cap (a bug once let them slip through as 16 bytes each).
+    let (addr, _dir, _s) = serve();
+    let mut c = Client::connect(&addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB) STRICT")
+        .unwrap();
+
+    let mut tx = c.begin(0).unwrap();
+    // ~4 MiB per statement; the cap is 64 MiB, so this refuses within ~17 statements rather
+    // than growing forever.
+    let big = vec![0u8; 4 * 1024 * 1024];
+    let mut refused = false;
+    for i in 0..40 {
+        let stmt = meshdb::storage::exec::Statement::with_params(
+            "INSERT INTO t VALUES (?1, ?2)",
+            vec![Value::Integer(i), Value::Blob(big.clone())],
+        );
+        if tx.execute(stmt).is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(
+        refused,
+        "a transaction of ~160 MiB must hit the 64 MiB cap and be refused"
+    );
+}

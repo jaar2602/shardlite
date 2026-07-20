@@ -294,3 +294,113 @@ fn a_single_voter_cluster_is_its_own_quorum() {
     }
     assert_eq!(l.acks.stats().timed_out, 0);
 }
+
+#[test]
+fn a_committed_transaction_survives_the_leaders_death_and_an_open_one_leaves_nothing() {
+    // The real durability proof for BEGIN/COMMIT, mirroring the plain-write survival test.
+    // voters=2 makes the single follower load-bearing: COMMIT cannot return until the
+    // follower holds the transaction. So a committed transaction MUST be on the survivor,
+    // and a transaction left uncommitted when the leader dies MUST leave nothing.
+    let l = leader(2, Duration::from_secs(5));
+    let fdir = TempDir::new().unwrap();
+    let stage = TempDir::new().unwrap();
+    let r = Arc::new(follower_for(&l, &fdir, &stage));
+    let stop = start(&r);
+
+    let mut c = Client::connect(&l.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT")
+        .unwrap();
+
+    // A committed transaction. Its COMMIT returned, so a quorum — including the follower —
+    // holds it.
+    let mut tx = c.begin(0).unwrap();
+    for i in 1..=25 {
+        tx.execute(Statement::with_params(
+            "INSERT INTO t VALUES (?1, ?2)",
+            vec![Value::Integer(i), Value::Text(format!("committed-{i}"))],
+        ))
+        .unwrap();
+    }
+    let (rows, _) = tx.commit().unwrap();
+    assert_eq!(rows, 25);
+
+    // A second transaction that is staged but never committed when the leader dies.
+    let mut open = c.begin(0).unwrap();
+    for i in 100..=110 {
+        open.execute(format!("INSERT INTO t VALUES ({i}, 'never-committed')"))
+            .unwrap();
+    }
+    // Do not commit. The leader dies with these buffered on its connection only.
+
+    l.server.shutdown_handle().store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    drop(open); // best-effort rollback goes nowhere; the server is gone
+
+    // The survivor: exactly the committed 25, and none of the uncommitted 11.
+    let conn = meshdb::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
+    let committed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM t WHERE v LIKE 'committed-%'",
+            [],
+            |x| x.get(0),
+        )
+        .unwrap();
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM t WHERE v = 'never-committed'",
+            [],
+            |x| x.get(0),
+        )
+        .unwrap();
+    let total: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |x| x.get(0))
+        .unwrap();
+
+    assert_eq!(
+        committed, 25,
+        "every committed-transaction row must be on the survivor"
+    );
+    assert_eq!(
+        leaked, 0,
+        "no row from the uncommitted transaction may be present"
+    );
+    assert_eq!(total, 25, "and nothing else");
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |x| x.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+}
+
+#[test]
+fn an_uncommitted_transaction_is_not_acknowledged_as_durable() {
+    // A staged-but-not-committed transaction must never have reached quorum: nothing was
+    // applied, so nothing was replicated, so `confirmed` must not move for it.
+    let l = leader(2, Duration::from_secs(5));
+    let fdir = TempDir::new().unwrap();
+    let stage = TempDir::new().unwrap();
+    let r = Arc::new(follower_for(&l, &fdir, &stage));
+    let stop = start(&r);
+
+    let mut c = Client::connect(&l.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    let confirmed_before = l.acks.stats().confirmed;
+    let mut tx = c.begin(0).unwrap();
+    for i in 1..=20 {
+        tx.execute(format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // Staging alone must not confirm anything.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        l.acks.stats().confirmed,
+        confirmed_before,
+        "staging writes must not reach quorum before COMMIT"
+    );
+
+    // COMMIT does.
+    tx.commit().unwrap();
+    assert!(l.acks.stats().confirmed > confirmed_before);
+    stop.store(true, Ordering::Relaxed);
+}

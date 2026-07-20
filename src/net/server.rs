@@ -762,8 +762,7 @@ fn session_step(
                     }
                     Some(open)
                         if open.staged.len() >= MAX_TXN_STATEMENTS
-                            || open.bytes + stmt.sql.len() + stmt.params.len() * 16
-                                > MAX_TXN_BYTES =>
+                            || open.bytes + statement_size(&stmt) > MAX_TXN_BYTES =>
                     {
                         return SessionStep::Handled(refuse(
                             "transaction too large; COMMIT or ROLLBACK and use smaller batches",
@@ -771,7 +770,7 @@ fn session_step(
                     }
                     Some(_) => {
                         let open = txn.as_mut().expect("checked open");
-                        open.bytes += stmt.sql.len() + stmt.params.len() * 16;
+                        open.bytes += statement_size(&stmt);
                         open.staged.push(stmt);
                         last = Response::Staged {
                             queued: open.staged.len() as u64,
@@ -782,6 +781,25 @@ fn session_step(
         }
     }
     SessionStep::Handled(last)
+}
+
+/// A statement's approximate memory footprint, for the transaction buffer cap.
+///
+/// Counts the actual size of text and blob parameters — an earlier version counted a flat 16
+/// bytes per parameter, so a transaction of large blobs would sail past the byte cap while the
+/// counter thought it was empty, which is exactly the runaway the cap exists to stop.
+fn statement_size(stmt: &crate::storage::exec::Statement) -> usize {
+    use crate::storage::exec::Value;
+    let params: usize = stmt
+        .params
+        .iter()
+        .map(|v| match v {
+            Value::Text(s) => s.len(),
+            Value::Blob(b) => b.len(),
+            _ => 8,
+        })
+        .sum();
+    stmt.sql.len() + params
 }
 
 /// Transaction-control keywords the session intercepts.

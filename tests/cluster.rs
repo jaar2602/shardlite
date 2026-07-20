@@ -1254,3 +1254,84 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     );
     a.join().unwrap();
 }
+
+#[test]
+fn a_transaction_commits_on_the_shard_owner_through_forwarding() {
+    // A client-held transaction on a shard owned by another node: it must buffer on the entry
+    // node and the atomic COMMIT must forward to the owner, landing there all-or-nothing.
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT")
+        .unwrap();
+
+    // A shard node 0 does NOT own, so BEGIN buffers on node 0 and COMMIT must forward.
+    let elsewhere = (0..2u32)
+        .map(ShardId)
+        .find(|s| placement.owner(*s) != Some(nodes[0].id))
+        .expect("some shard should live on another node");
+    let owner_id = placement.owner(elsewhere).unwrap();
+    assert_ne!(
+        owner_id, nodes[0].id,
+        "the transaction shard must be remote"
+    );
+
+    let mut tx = c.begin(elsewhere.0).unwrap();
+    for i in 1..=15 {
+        tx.execute(format!("INSERT INTO t VALUES ({i}, 'txn')"))
+            .unwrap();
+    }
+    let (rows, _) = tx.commit().unwrap();
+    assert_eq!(rows, 15, "the forwarded COMMIT applied the whole batch");
+
+    // Present on the owner, atomically.
+    let owner = nodes.iter().find(|n| n.id == owner_id).unwrap();
+    let n = owner
+        .manager
+        .query(
+            elsewhere,
+            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t"),
+        )
+        .unwrap();
+    match n {
+        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(15));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // A forwarded transaction that fails on the owner rolls back there too — atomicity
+    // survives the hop.
+    let mut c2 = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut bad = c2.begin(elsewhere.0).unwrap();
+    bad.execute("INSERT INTO t VALUES (500, 'ok')").unwrap();
+    bad.execute("INSERT INTO t VALUES (1, 'dup')").unwrap(); // duplicate PK
+    assert!(
+        bad.commit().is_err(),
+        "a forwarded failing transaction must be refused"
+    );
+    let after = owner
+        .manager
+        .query(
+            elsewhere,
+            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 500"),
+        )
+        .unwrap();
+    match after {
+        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+            assert_eq!(
+                r.rows[0][0],
+                meshdb::storage::Value::Integer(0),
+                "the failed forwarded transaction left nothing"
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    for n in &nodes {
+        n.stop();
+    }
+}
