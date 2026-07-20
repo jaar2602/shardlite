@@ -18,6 +18,7 @@ pub mod forward;
 pub mod protocol;
 pub mod replica;
 pub mod server;
+pub mod transport;
 
 pub use auth::{AuthConfig, Role};
 pub use client::Client;

@@ -791,6 +791,40 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### TLS, optional and behind a feature
+
+The auth layer authenticated without encrypting — stated as its own limit. TLS closes it,
+under the `tls` feature so a trusted-network deployment compiles none of rustls and carries
+none of its size.
+
+**rustls with the `ring` provider**, not the aws-lc-rs default, which wants a C toolchain and
+cmake; ring keeps the build self-contained, matching the bundled-SQLite discipline. Tests
+generate self-signed certs in-process with `rcgen`, so nothing is checked in to expire.
+
+**One structural change made TLS possible: the connection is no longer split.** The plaintext
+code `try_clone`d the socket into independent reader and writer halves — a TLS connection
+cannot be split that way, its record state is one object. It never needed to be: the protocol
+is strict request-then-response, so a single `transport::Stream` carries both directions.
+`write_message` now frames each message into one write, so dropping the write buffer costs
+nothing. This touched the most-tested code in the project; all 267 non-TLS tests pass
+unchanged.
+
+**Configuring it is one call on each side.** `Server::with_tls(cert)` turns encryption on;
+omit it and the server is plaintext exactly as before. A client uses `Client::connect_tls`
+with either `TlsClientConfig::with_ca_pem` (verifies the server — real MITM protection) or
+`dangerous_accept_any_cert` (encrypts against a passive eavesdropper only, warns at every
+call, for development). The accept loop wraps each socket through a closure and never learns
+which transport it got.
+
+**Verified, including the security-critical negatives:** a plaintext client cannot handshake
+a TLS server and vice versa (no silent downgrade); a verifying client rejects a wrong
+certificate (revert-checked — swapping it to accept-any fails the test); TLS and auth
+compose, encryption for the channel and credentials for the identity, orthogonal and stacked.
+
+**Scope line held:** this is the encryption the auth module said to add. It does not do
+client-certificate authentication — identity is still the challenge–response layer, and TLS
+is `with_no_client_auth` deliberately, so the two concerns stay separate.
+
 ### Authentication and authorization
 
 The largest recorded gap — the server accepted any connection — is closed. Protocol version

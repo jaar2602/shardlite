@@ -1,6 +1,6 @@
 //! A blocking client.
 
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -21,8 +21,12 @@ impl std::fmt::Debug for Client {
 }
 
 pub struct Client {
-    r: BufReader<TcpStream>,
-    w: BufWriter<TcpStream>,
+    // One buffered stream, not a split reader/writer pair. The protocol is strict
+    // request-then-response, so a single connection carries both directions — and a TLS
+    // stream cannot be split into independent halves anyway. Reads go through the buffer;
+    // writes go straight to the stream beneath it via `get_mut`, and `write_message` already
+    // frames each message into one write, so a write buffer would buy nothing.
+    conn: BufReader<super::transport::Stream>,
     shard_count: u32,
     epoch: Option<u64>,
 }
@@ -64,13 +68,8 @@ impl Client {
         Self::connect_full(addr, connect, io, None)
     }
 
-    /// The full-fat constructor: bounded waits plus optional credentials.
-    pub fn connect_full(
-        addr: &str,
-        connect: Duration,
-        io: Duration,
-        credentials: Option<(String, super::auth::Key)>,
-    ) -> Result<Self> {
+    /// Resolve, connect, and apply the timeouts and nodelay every connection needs.
+    fn connect_tcp(addr: &str, connect: Duration, io: Duration) -> Result<TcpStream> {
         let resolved = addr
             .to_socket_addrs()
             .map_err(|e| Error::Protocol(format!("resolving {addr}: {e}")))?
@@ -89,14 +88,45 @@ impl Client {
         stream
             .set_nodelay(true)
             .map_err(|e| Error::Protocol(format!("set_nodelay: {e}")))?;
+        Ok(stream)
+    }
 
+    /// Connect over TLS, verifying the server per `tls`, then authenticate as `credentials`.
+    ///
+    /// This is how a client gets encryption. Which verification applies — a real CA or the
+    /// dangerous accept-any mode — is entirely the `tls` config's business; see
+    /// `net::transport`.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(
+        addr: &str,
+        connect: Duration,
+        io: Duration,
+        credentials: Option<(String, super::auth::Key)>,
+        tls: &super::transport::TlsClientConfig,
+    ) -> Result<Self> {
+        let tcp = Self::connect_tcp(addr, connect, io)?;
+        let stream = tls.connect(tcp)?;
+        Self::from_stream(stream, credentials)
+    }
+
+    /// The full-fat constructor: bounded waits plus optional credentials.
+    pub fn connect_full(
+        addr: &str,
+        connect: Duration,
+        io: Duration,
+        credentials: Option<(String, super::auth::Key)>,
+    ) -> Result<Self> {
+        let tcp = Self::connect_tcp(addr, connect, io)?;
+        Self::from_stream(super::transport::Stream::Plain(tcp), credentials)
+    }
+
+    /// Run the handshake over an established stream, plaintext or TLS alike.
+    fn from_stream(
+        stream: super::transport::Stream,
+        credentials: Option<(String, super::auth::Key)>,
+    ) -> Result<Self> {
         let mut me = Self {
-            r: BufReader::new(
-                stream
-                    .try_clone()
-                    .map_err(|e| Error::Protocol(format!("cloning stream: {e}")))?,
-            ),
-            w: BufWriter::new(stream),
+            conn: BufReader::new(stream),
             shard_count: 0,
             epoch: None,
         };
@@ -267,8 +297,9 @@ impl Client {
     }
 
     fn round_trip(&mut self, req: Request) -> Result<Response> {
-        write_message(&mut self.w, &req)?;
-        let resp: Response = read_message(&mut self.r)?;
+        // Write straight through the buffer to the stream; read back through the buffer.
+        write_message(self.conn.get_mut(), &req)?;
+        let resp: Response = read_message(&mut self.conn)?;
         match resp {
             // A rejection is a result, not a transport failure, so it is surfaced as the
             // same `Rejected` the local API produces rather than as a protocol error.

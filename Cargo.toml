@@ -34,6 +34,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Pinned to the 2.x line deliberately: bincode 3.0.0 on crates.io is a placeholder whose
 # lib.rs is a single `compile_error!("https://xkcd.com/2347/")`. 2.0.1 is the real release.
 bincode = { version = "2", features = ["serde"] }
+# TLS. Pure-Rust with the `ring` provider rather than the aws-lc-rs default, which wants a
+# C toolchain and cmake — `ring` keeps the build self-contained, matching the bundled-SQLite
+# discipline. Optional, behind the `tls` feature: a deployment on a trusted network pays
+# nothing for it, in binary size or build time.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [[bench]]
 name = "write_throughput"
@@ -41,6 +47,9 @@ harness = false
 
 [dev-dependencies]
 tempfile = "3"
+# Self-signed certs for the TLS tests, generated in-process so nothing is checked in to
+# expire. Only compiled when the tls tests run.
+rcgen = "0.13"
 
 # Model-checks the fence and the read/apply coordination by exhaustively exploring thread
 # interleavings — the races fixed here were found probabilistically (one failure in eighteen
@@ -58,3 +67,4 @@ default = ["cli"]
 # facade and installs nothing, so a consumer chooses its own destination — or none, in
 # which case the macros compile to near-nothing.
 cli = ["dep:tracing-subscriber"]
+tls = ["dep:rustls", "dep:rustls-pemfile"]

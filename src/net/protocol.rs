@@ -215,10 +215,15 @@ pub fn write_message<T: Serialize, W: Write>(w: &mut W, msg: &T) -> Result<()> {
             body.len()
         )));
     }
-    w.write_all(&(body.len() as u32).to_be_bytes())
-        .map_err(|e| Error::Protocol(format!("writing length: {e}")))?;
-    w.write_all(&body)
-        .map_err(|e| Error::Protocol(format!("writing body: {e}")))?;
+    // Length prefix and body written as one buffer, then flushed. One write means the
+    // 4-byte prefix cannot leave as its own tiny TCP segment ahead of the body, and it means
+    // callers no longer need a separate BufWriter — which matters now that the same code path
+    // carries a TLS stream that cannot be split into independent read and write halves.
+    let mut framed = Vec::with_capacity(4 + body.len());
+    framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&body);
+    w.write_all(&framed)
+        .map_err(|e| Error::Protocol(format!("writing message: {e}")))?;
     w.flush()
         .map_err(|e| Error::Protocol(format!("flushing: {e}")))?;
     Ok(())

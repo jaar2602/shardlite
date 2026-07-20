@@ -1,7 +1,7 @@
 //! A thread-per-connection server over a [`ShardManager`].
 
 use std::collections::BTreeSet;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -102,6 +102,8 @@ pub struct NodeServices {
     pub auth: Option<Arc<super::auth::AuthConfig>>,
 }
 
+type Wrap = Arc<dyn Fn(TcpStream) -> Result<super::transport::Stream> + Send + Sync>;
+
 pub struct Server {
     listener: TcpListener,
     shards: Arc<ShardManager>,
@@ -109,6 +111,10 @@ pub struct Server {
     cfg: ServerConfig,
     counters: Arc<Counters>,
     shutdown: Arc<AtomicBool>,
+    /// How an accepted socket becomes a [`transport::Stream`]. Plaintext by default; TLS
+    /// once [`Server::with_tls`] has supplied a certificate. The accept loop calls this and
+    /// never learns which it got.
+    wrap: Wrap,
 }
 
 impl Server {
@@ -179,7 +185,18 @@ impl Server {
             cfg,
             counters: Arc::new(Counters::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            wrap: Arc::new(|tcp| Ok(super::transport::Stream::Plain(tcp))),
         })
+    }
+
+    /// Serve TLS. Every accepted connection is wrapped with this certificate; a client must
+    /// then speak TLS or the handshake fails. This is the one call that turns encryption on —
+    /// omit it and the server is plaintext, exactly as before.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: super::transport::TlsServerConfig) -> Self {
+        self.wrap = Arc::new(move |tcp| tls.accept(tcp));
+        tracing::info!("TLS enabled: connections are encrypted");
+        self
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -219,6 +236,19 @@ impl Server {
                     continue;
                 }
             };
+            // Socket options go on the raw TCP before any TLS wrapping — a wrapped stream has
+            // none of its own. The read timeout is this connection's idle bound.
+            let _ = stream.set_read_timeout(Some(self.cfg.idle_timeout));
+            let _ = stream.set_nodelay(true);
+
+            let stream = match (self.wrap)(stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    // A failed TLS setup is this connection's problem, not the listener's.
+                    tracing::debug!(error = %e, "could not wrap connection; dropping it");
+                    continue;
+                }
+            };
 
             let live = self.counters.live.load(Ordering::Relaxed);
             if live >= self.cfg.max_connections {
@@ -232,9 +262,11 @@ impl Server {
                     limit = self.cfg.max_connections,
                     "refusing a connection: at capacity"
                 );
-                let mut w = BufWriter::new(&stream);
+                // Answer over the same transport the client is speaking — a plaintext error
+                // to a TLS client would be an unreadable blob. `stream` is already wrapped.
+                let mut stream = stream;
                 let _ = write_message(
-                    &mut w,
+                    &mut stream,
                     &Response::Error {
                         message: Error::TooManyConnections {
                             current: live,
@@ -273,29 +305,22 @@ impl Server {
 }
 
 fn serve_connection(
-    stream: TcpStream,
+    stream: super::transport::Stream,
     shards: &ShardManager,
     services: &NodeServices,
     counters: &Counters,
-    idle: Duration,
+    _idle: Duration,
 ) -> Result<()> {
-    stream
-        .set_read_timeout(Some(idle))
-        .map_err(|e| Error::Protocol(format!("set_read_timeout: {e}")))?;
-    stream
-        .set_nodelay(true)
-        .map_err(|e| Error::Protocol(format!("set_nodelay: {e}")))?;
-
+    // Timeouts and nodelay are set on the raw socket in `serve`, before it is wrapped for
+    // TLS — a `Stream` has no socket options of its own to set.
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".into());
-    let mut r = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| Error::Protocol(format!("cloning stream: {e}")))?,
-    );
-    let mut w = BufWriter::new(stream);
+    // One buffered stream. Reads go through the buffer; each write borrows the stream
+    // beneath it via `get_mut`, since read and write never overlap in this ping-pong
+    // protocol and a TLS stream cannot be split into halves.
+    let mut r = BufReader::new(stream);
 
     /// Where this connection stands with the doorman.
     enum Gate {
@@ -336,7 +361,7 @@ fn serve_connection(
                         if !role.permits(need) {
                             counters.authz_refused.fetch_add(1, Ordering::Relaxed);
                             write_message(
-                                &mut w,
+                                r.get_mut(),
                                 &Response::Error {
                                     message: format!(
                                         "not permitted: this connection is authenticated with \
@@ -354,7 +379,7 @@ fn serve_connection(
                             Request::Hello { version, .. } => {
                                 if version != PROTOCOL_VERSION {
                                     write_message(
-                                        &mut w,
+                                        r.get_mut(),
                                         &Response::Error {
                                             message: format!(
                                                 "protocol version {version} is not supported; \
@@ -368,13 +393,13 @@ fn serve_connection(
                                 // Fail closed: no entropy, no challenge, no connection.
                                 let nonce = super::auth::nonce()?;
                                 gate = Gate::Challenged(nonce);
-                                write_message(&mut w, &Response::Challenge { nonce })?;
+                                write_message(r.get_mut(), &Response::Challenge { nonce })?;
                             }
                             _ => {
                                 // One message for every pre-auth request, so the refusal
                                 // teaches nothing about what exists.
                                 write_message(
-                                    &mut w,
+                                    r.get_mut(),
                                     &Response::Error {
                                         message: "authentication required".into(),
                                         retryable: false,
@@ -394,7 +419,7 @@ fn serve_connection(
                                     Some(role) => {
                                         gate = Gate::Authed(role);
                                         write_message(
-                                            &mut w,
+                                            r.get_mut(),
                                             &Response::Welcome {
                                                 version: PROTOCOL_VERSION,
                                                 shard_count: shards.shard_count(),
@@ -407,7 +432,7 @@ fn serve_connection(
                                         counters.auth_failures.fetch_add(1, Ordering::Relaxed);
                                         tracing::warn!(peer, name, "authentication failed");
                                         let _ = write_message(
-                                            &mut w,
+                                            r.get_mut(),
                                             &Response::Error {
                                                 message: "authentication failed".into(),
                                                 retryable: false,
@@ -422,7 +447,7 @@ fn serve_connection(
                             }
                             _ => {
                                 write_message(
-                                    &mut w,
+                                    r.get_mut(),
                                     &Response::Error {
                                         message: "authentication required".into(),
                                         retryable: false,
@@ -456,7 +481,7 @@ fn serve_connection(
             if matches!(resp, Response::Error { .. }) {
                 counters.errors.fetch_add(1, Ordering::Relaxed);
             }
-            write_message(&mut w, &resp)?;
+            write_message(r.get_mut(), &resp)?;
         }
     })();
 
