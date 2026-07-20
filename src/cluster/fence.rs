@@ -41,8 +41,9 @@
 //! Silent success would hide both.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::sync::Mutex;
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -266,7 +267,7 @@ impl crate::shard::WriteGate for Fence {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -462,5 +463,106 @@ mod tests {
         assert_eq!(accepted, 0, "no stale token may be accepted, ever");
         assert_eq!(f.stats().rejected, 8000);
         assert_eq!(f.highest_seen(), 100);
+    }
+}
+
+/// Exhaustive interleaving checks for the races the concurrency audit found.
+///
+/// Run with `RUSTFLAGS="--cfg loom" cargo test --release --lib loom_`. Each `loom::model`
+/// explores **every** schedule of the threads inside it, so a passing model is a proof over
+/// the modelled operations — where the stress harness's hammer test could only say "not seen
+/// in 500 tries". The hammer caught the check-outside-the-lock bug once in eighteen suite
+/// runs; the model below finds it in every run, deterministically, when the fix is reverted.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    const S0: ShardId = ShardId(0);
+    const S1: ShardId = ShardId(1);
+
+    /// Race 1/1b: a placement carrying the old term races the step-down deposing it.
+    ///
+    /// This is the exact interleaving from production: `apply_placement` on a connection
+    /// thread, a step-down on another. Whatever the schedule, once both complete the gate
+    /// must be closed — the stale open must never win.
+    #[test]
+    fn loom_a_deposed_leader_cannot_be_reopened() {
+        loom::model(|| {
+            let f = Arc::new(Fence::new(1, 0));
+            f.open_for(&[S0], 1);
+
+            let depose = {
+                let f = Arc::clone(&f);
+                thread::spawn(move || f.step_down(2, "deposed"))
+            };
+            let reopen = {
+                let f = Arc::clone(&f);
+                thread::spawn(move || f.open_for(&[S0], 1))
+            };
+            depose.join().unwrap();
+            reopen.join().unwrap();
+
+            assert!(
+                !f.is_open(S0),
+                "an interleaving exists where a stale placement reopens a deposed leader's gate"
+            );
+        });
+    }
+
+    /// Race 2's fence-level face: two placements racing must converge on the newer one,
+    /// never interleave into a mixture or end on the older.
+    #[test]
+    fn loom_racing_placements_converge_on_the_newer_term() {
+        loom::model(|| {
+            let f = Arc::new(Fence::new(1, 0));
+
+            let older = {
+                let f = Arc::clone(&f);
+                thread::spawn(move || f.open_for(&[S0], 1))
+            };
+            let newer = {
+                let f = Arc::clone(&f);
+                thread::spawn(move || f.open_for(&[S1], 2))
+            };
+            older.join().unwrap();
+            newer.join().unwrap();
+
+            // Either order: term 1 first then term 2 replaces it, or term 2 first and the
+            // term-1 open refuses itself as stale. The end state is the same.
+            assert!(!f.is_open(S0), "the older placement's gates survived");
+            assert!(
+                f.is_open(S1),
+                "the newer placement's gates must be in force"
+            );
+            assert_eq!(f.open_term(S1), Some(2));
+        });
+    }
+
+    /// A write racing a step-down may be granted a token or refused — both are safe — but a
+    /// granted token must carry the *deposed* term, which every remote fence that has seen
+    /// the successor will reject. It must never carry the deposing term.
+    #[test]
+    fn loom_a_token_issued_across_a_step_down_is_always_stale() {
+        loom::model(|| {
+            let f = Arc::new(Fence::new(1, 0));
+            f.open_for(&[S0], 1);
+
+            let depose = {
+                let f = Arc::clone(&f);
+                thread::spawn(move || f.step_down(2, "deposed"))
+            };
+            let token = f.check_may_write(S0);
+            depose.join().unwrap();
+
+            if let Ok(t) = token {
+                assert_eq!(
+                    t.term, 1,
+                    "a token minted across a step-down claimed the deposing term"
+                );
+            }
+            assert!(!f.is_open(S0));
+        });
     }
 }

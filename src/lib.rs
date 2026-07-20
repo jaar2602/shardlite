@@ -14,6 +14,7 @@ pub mod query;
 pub mod replication;
 pub mod shard;
 pub mod storage;
+pub(crate) mod sync;
 pub mod vfs;
 
 pub use error::{Error, Result};

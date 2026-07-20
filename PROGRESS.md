@@ -791,6 +791,35 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### The races are now model-checked, not hammered
+
+`RUSTFLAGS="--cfg loom" cargo test --lib loom_` runs five loom models over the two
+synchronization cores the audit found races in — the fence and the read/apply coordination.
+Loom explores **every** interleaving of the modelled threads, so a passing model is a proof
+over those operations, where the hammer test could only say "not seen in 500 tries".
+
+The difference is not academic. The check-outside-the-lock bug survived the 500-iteration
+hammer in most runs — it failed once in eighteen full suites. Loom finds it **every time, in
+milliseconds**, when the fix is reverted. All three fixes were revert-verified under loom:
+
+| Fix reverted | Loom's verdict |
+|---|---|
+| Staleness check moved back outside the gate mutex | fails: "an interleaving exists where a stale placement reopens a deposed leader's gate" |
+| Step-down closes without raising the bar | fails: same interleaving |
+| Generation bump moved outside the write lock | fails: "a matching generation served a stale cache" |
+
+The models also check what the hammer never could: the read/apply exclusion is verified by
+modelling the database file as a `loom::cell::UnsafeCell`, which loom itself polices — any
+schedule where a read overlaps a write fails the model outright, and a reader slipping
+between two writes of one apply would observe a value that never existed.
+
+**Scope, stated honestly.** Loom proves the modelled operations only. The fence and
+`ShardAccess` are small enough to model faithfully; `ClusterNode`, the writer fleet and the
+network server are not, and their concurrency is covered by the stress harness and the
+hammer tests, which sample schedules rather than enumerate them. The `std::sync` /
+`loom::sync` swap is confined to the two modelled modules (`src/sync.rs`), so a normal build
+compiles exactly what it always did.
+
 ### The concurrency audit: three product races, one of them in the fix itself
 
 Prompted by the observation that the intermittent failures were concurrency-shaped, the

@@ -42,6 +42,16 @@ harness = false
 [dev-dependencies]
 tempfile = "3"
 
+# Model-checks the fence and the read/apply coordination by exhaustively exploring thread
+# interleavings — the races fixed here were found probabilistically (one failure in eighteen
+# stress runs); loom turns "no failure in N runs" into "no interleaving exists".
+# Active only under `RUSTFLAGS="--cfg loom"`; a normal build never compiles it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [features]
 default = ["cli"]
 # Only the binary installs a subscriber. The library emits events through the `tracing`

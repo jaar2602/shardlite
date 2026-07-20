@@ -47,8 +47,10 @@
 //! for a measured, small cost.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Mutex, RwLock};
 
 use crate::error::{Error, Result};
 
@@ -94,7 +96,7 @@ impl ShardAccess {
     }
 
     /// Hold for the duration of a read. Blocks while an apply is in flight.
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+    pub fn read(&self) -> crate::sync::RwLockReadGuard<'_, ()> {
         self.lock.read().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -203,7 +205,7 @@ impl ShardModes {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -245,5 +247,100 @@ mod tests {
         assert!(m.check_may_open(ShardId(0)).is_err());
         m.set(ShardId(0), ShardMode::Led);
         assert!(m.check_may_open(ShardId(0)).is_ok());
+    }
+}
+
+/// Exhaustive interleaving checks for the read/apply coordination.
+///
+/// Run with `RUSTFLAGS="--cfg loom" cargo test --lib loom_`. The file is modelled as a
+/// `loom::cell::UnsafeCell`, which loom itself polices: any schedule in which a read
+/// overlaps a write without synchronization fails the model outright. That checks the
+/// contract directly — not "the lock looks right" but "no interleaving exists in which a
+/// reader touches the file while an apply is rewriting it".
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// No reader ever observes the file mid-apply, under any schedule.
+    #[test]
+    fn loom_a_read_never_overlaps_an_apply() {
+        loom::model(|| {
+            let access = Arc::new(ShardAccess::default());
+            let file = Arc::new(UnsafeCell::new(0u64));
+
+            let applier = {
+                let access = Arc::clone(&access);
+                let file = Arc::clone(&file);
+                thread::spawn(move || {
+                    access.apply(|| {
+                        // Two separate writes, so a torn observation is representable: a
+                        // reader slipping in between them would see 1, a value that never
+                        // exists outside the apply.
+                        file.with_mut(|p| unsafe { *p = 1 });
+                        file.with_mut(|p| unsafe { *p = 2 });
+                    });
+                })
+            };
+
+            let seen = {
+                let _guard = access.read();
+                file.with(|p| unsafe { *p })
+            };
+            applier.join().unwrap();
+
+            assert!(
+                seen == 0 || seen == 2,
+                "a reader observed the file mid-apply: saw {seen}, a state that never \
+                 existed outside the write lock"
+            );
+        });
+    }
+
+    /// The generation protocol: a cached connection is served only while its cache is
+    /// provably current. If the generation bump moved outside the write lock, or after the
+    /// guard drop, some schedule would serve stale rows with a matching generation — and
+    /// loom would find it.
+    #[test]
+    fn loom_a_matching_generation_means_the_cache_is_current() {
+        loom::model(|| {
+            let access = Arc::new(ShardAccess::default());
+            let file = Arc::new(UnsafeCell::new(0u64));
+
+            // The reader cached a connection earlier: it remembers the file's value and the
+            // generation it was current at. This mirrors the reader fleet's LRU entry.
+            let cached_value = 0u64;
+            let cached_gen = access.generation();
+
+            let applier = {
+                let access = Arc::clone(&access);
+                let file = Arc::clone(&file);
+                thread::spawn(move || {
+                    access.apply(|| file.with_mut(|p| unsafe { *p = 1 }));
+                })
+            };
+
+            // The reader fleet's exact sequence: take the read guard, compare generations,
+            // serve from cache on a match, reopen otherwise.
+            let (served, truth) = {
+                let _guard = access.read();
+                let g = access.generation();
+                let served = if g == cached_gen {
+                    cached_value
+                } else {
+                    file.with(|p| unsafe { *p })
+                };
+                let truth = file.with(|p| unsafe { *p });
+                (served, truth)
+            };
+            applier.join().unwrap();
+
+            assert_eq!(
+                served, truth,
+                "a schedule exists where a matching generation served a stale cache"
+            );
+        });
     }
 }
