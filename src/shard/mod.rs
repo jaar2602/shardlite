@@ -452,6 +452,16 @@ impl ShardManager {
         self.writers.execute(shard, statements)
     }
 
+    /// Apply `statements` as one atomic transaction on `shard`: all commit or none do. The
+    /// COMMIT of a client-held transaction.
+    pub fn execute_txn(
+        &self,
+        shard: ShardId,
+        statements: Vec<crate::storage::exec::Statement>,
+    ) -> crate::Result<Vec<crate::storage::exec::Outcome>> {
+        self.writers.execute_atomic(shard, statements)
+    }
+
     pub fn execute_one(
         &self,
         shard: ShardId,

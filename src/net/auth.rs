@@ -75,7 +75,7 @@ pub fn required(req: &Request) -> Requirement {
         | Request::Route { .. }
         | Request::Info => Requirement::Read,
 
-        Request::Execute { .. } => Requirement::Write,
+        Request::Execute { .. } | Request::Transaction { .. } => Requirement::Write,
 
         // Cluster-wide DDL reshapes every shard; that is an operator action, not a client one.
         Request::ExecuteAll { .. } | Request::SchemaApply { .. } => Requirement::Admin,

@@ -21,6 +21,24 @@ pub fn batch(
     conn: &mut Connection,
     groups: &[Vec<Statement>],
 ) -> std::result::Result<Vec<Vec<Outcome>>, String> {
+    batch_with(conn, groups, &[])
+}
+
+/// Apply groups, some of which may be **atomic**.
+///
+/// A group's index in `atomic` marks it all-or-nothing: if any statement in it fails, the
+/// whole group is rolled back and reported as a single [`Outcome::Rejected`]. This is what a
+/// client transaction needs — one bad statement voids the batch — and it is deliberately
+/// different from the default per-statement isolation, which independent group-commit
+/// requests need so that one caller's mistake cannot roll back another's write.
+///
+/// A missing or `false` entry keeps the per-statement behaviour. Atomic and non-atomic groups
+/// commit together in the one outer transaction, so a transaction still rides group commit.
+pub fn batch_with(
+    conn: &mut Connection,
+    groups: &[Vec<Statement>],
+    atomic: &[bool],
+) -> std::result::Result<Vec<Vec<Outcome>>, String> {
     // IMMEDIATE takes the write lock at BEGIN rather than on first write, so a problem
     // surfaces before any work is done instead of midway through the batch.
     let mut tx = conn
@@ -29,30 +47,64 @@ pub fn batch(
 
     let mut results: Vec<Vec<Outcome>> = Vec::with_capacity(groups.len());
 
-    for group in groups {
-        let mut outcomes = Vec::with_capacity(group.len());
-
-        for statement in group {
-            let sp = tx.savepoint().map_err(|e| e.to_string())?;
-
-            match exec::run(&sp, statement) {
-                Ok(executed) => {
-                    sp.commit().map_err(|e| e.to_string())?;
-                    outcomes.push(Outcome::Ok(executed));
-                }
-                Err(SqlError::Logic(msg)) => {
-                    // Dropping the savepoint rolls it back, leaving earlier statements in
-                    // this transaction untouched.
-                    drop(sp);
-                    outcomes.push(Outcome::Rejected(msg));
-                }
-                Err(SqlError::Fatal(e)) => return Err(e.to_string()),
-            }
+    for (i, group) in groups.iter().enumerate() {
+        if atomic.get(i).copied().unwrap_or(false) {
+            results.push(apply_atomic_group(&mut tx, group)?);
+        } else {
+            results.push(apply_isolated_group(&mut tx, group)?);
         }
-
-        results.push(outcomes);
     }
 
     tx.commit().map_err(|e| e.to_string())?;
     Ok(results)
+}
+
+/// Independent statements: each isolated by its own savepoint, so one rejection leaves the
+/// others standing. The original, unchanged behaviour.
+fn apply_isolated_group(
+    tx: &mut rusqlite::Transaction<'_>,
+    group: &[Statement],
+) -> std::result::Result<Vec<Outcome>, String> {
+    let mut outcomes = Vec::with_capacity(group.len());
+    for statement in group {
+        let sp = tx.savepoint().map_err(|e| e.to_string())?;
+        match exec::run(&sp, statement) {
+            Ok(executed) => {
+                sp.commit().map_err(|e| e.to_string())?;
+                outcomes.push(Outcome::Ok(executed));
+            }
+            Err(SqlError::Logic(msg)) => {
+                // Dropping the savepoint rolls it back, leaving earlier statements in this
+                // transaction untouched.
+                drop(sp);
+                outcomes.push(Outcome::Rejected(msg));
+            }
+            Err(SqlError::Fatal(e)) => return Err(e.to_string()),
+        }
+    }
+    Ok(outcomes)
+}
+
+/// A client transaction: all-or-nothing. Wrapped in one savepoint; the first failure rolls
+/// the whole group back and reports it as a single rejection.
+fn apply_atomic_group(
+    tx: &mut rusqlite::Transaction<'_>,
+    group: &[Statement],
+) -> std::result::Result<Vec<Outcome>, String> {
+    let sp = tx.savepoint().map_err(|e| e.to_string())?;
+    let mut outcomes = Vec::with_capacity(group.len());
+    for statement in group {
+        match exec::run(&sp, statement) {
+            Ok(executed) => outcomes.push(Outcome::Ok(executed)),
+            Err(SqlError::Logic(msg)) => {
+                // Roll the whole transaction back to its start — earlier statements included —
+                // and report the one rejection that voided it.
+                drop(sp);
+                return Ok(vec![Outcome::Rejected(msg)]);
+            }
+            Err(SqlError::Fatal(e)) => return Err(e.to_string()),
+        }
+    }
+    sp.commit().map_err(|e| e.to_string())?;
+    Ok(outcomes)
 }

@@ -457,8 +457,7 @@ the trace comparison (`take_trace()`) before trusting capture.
 |---|---|
 | `capture_for` must precede open | Registering later silently misses frames; enforced by convention, not types. |
 | No cross-shard atomicity, ever | WAL gives no atomic commit across ATTACHed databases. Permanent, and it shapes the user-facing API. |
-| Client-held transactions unsupported | A held `BEGIN` would pin the writer and defeat batching. Permanent. |
-| Multi-statement client transactions | Same cause. |
+| Interactive read-then-write transactions | A buffered transaction cannot read its own uncommitted writes (reads inside it are refused), so client-side logic that reads mid-transaction and branches is unsupported. The atomic write-batch case is supported; see below. |
 
 ### Step 8b result: frame retention + networked replication
 
@@ -790,6 +789,38 @@ guarantee.
 **Placement now also keeps shard modes in step**, not just the write gate. Previously a node
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
+
+### Client transactions: BEGIN/COMMIT, buffered and durable
+
+`BEGIN` used to be refused, with a documented reason: a client-held transaction pins the
+writer thread across a client round trip and defeats group commit. That reasoning was sound
+for a *held-open* transaction — and it is exactly what buffering avoids.
+
+The server now **buffers** a connection's statements between `BEGIN` and `COMMIT` and applies
+them as one atomic batch at `COMMIT`. The writer is engaged only at `COMMIT`, for one batch,
+so it is never pinned during think-time and everyone else's writes keep flowing — verified by
+`the_writer_is_not_pinned_during_a_transaction`. `COMMIT` returns the **durable** ack: the
+batch rides the same routing + quorum path as any write, so the reply arrives only once a
+quorum holds it.
+
+`COMMIT` is **all-or-nothing**, which required a real fix rather than a wrapper. `apply::batch`
+isolates each statement in its own savepoint — correct for independent group-commit requests
+(one caller's rejection must not roll back another's), wrong for a transaction. `batch_with`
+adds a group-level savepoint for atomic groups: one failure rolls the whole transaction back
+and reports a single rejection. Atomic and independent groups still commit together, so a
+transaction still rides group commit. Verified non-vacuous at both layers — reverting either
+the atomic-flush or the atomic-apply makes the failed-transaction test leave rows behind.
+
+**Honest limits, enforced not hidden:** a transaction is one shard (no cross-shard atomicity,
+ever — a cross-shard statement is refused, not half-applied); reads inside a transaction are
+refused (the buffer is not applied yet, so a read could not see it — refusing beats a stale
+lie); the buffer is capped (100k statements / 64 MiB) so a runaway cannot exhaust server
+memory; an abandoned transaction (dropped connection) vanishes, having applied nothing.
+
+The client surface is an RAII `Transaction`: `client.begin(shard)?`, `tx.execute(sql)?` (per
+call returns the queued count), `tx.commit()? -> (rows, rowid)` (the durable ack), `tx.rollback()?`
+or drop (best-effort rollback). This is the network path; the local single-node CLI shell has
+no session or quorum and still applies statements individually.
 
 ### User management: a live store, a CLI, and runtime creation
 

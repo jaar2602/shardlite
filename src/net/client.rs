@@ -11,6 +11,85 @@ use super::protocol::{
     PROTOCOL_VERSION, Request, Response, ShardOutcome, read_message, write_message,
 };
 
+/// A client-held transaction on one shard.
+///
+/// Writes buffer on the server; [`Self::commit`] applies them atomically and returns the
+/// durable acknowledgement. Dropping without committing rolls back — nothing was applied, so
+/// rollback is simply discarding the buffer.
+pub struct Transaction<'a> {
+    client: &'a mut Client,
+    shard: u32,
+    finished: bool,
+}
+
+impl Transaction<'_> {
+    /// Buffer a write into the transaction. Returns how many statements it now holds. The
+    /// write is not durable — nor even applied — until [`Self::commit`].
+    pub fn execute(&mut self, sql: impl Into<Statement>) -> Result<u64> {
+        match self.client.round_trip(Request::Execute {
+            shard: self.shard,
+            statements: vec![sql.into()],
+        })? {
+            Response::Staged { queued } => Ok(queued),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Apply the whole transaction atomically and wait for it to become durable.
+    ///
+    /// Returns `(rows_affected, last_insert_rowid)` for the batch. This is the durable ack:
+    /// it arrives only after a quorum holds the write.
+    pub fn commit(mut self) -> Result<(u64, i64)> {
+        self.finished = true;
+        match self.client.round_trip(Request::Execute {
+            shard: self.shard,
+            statements: vec![Statement::new("COMMIT")],
+        })? {
+            Response::Changed {
+                rows_affected,
+                last_insert_rowid,
+            } => Ok((rows_affected, last_insert_rowid)),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Send a raw request on the transaction's connection. For tests that need to probe the
+    /// server's in-transaction behaviour directly.
+    #[doc(hidden)]
+    pub fn raw(&mut self, req: Request) -> Result<Response> {
+        self.client.round_trip(req)
+    }
+
+    /// Discard the transaction. Nothing was applied, so this only drops the server's buffer.
+    pub fn rollback(mut self) -> Result<()> {
+        self.finished = true;
+        match self.client.round_trip(Request::Execute {
+            shard: self.shard,
+            statements: vec![Statement::new("ROLLBACK")],
+        })? {
+            Response::Ok => Ok(()),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        // A transaction dropped without commit or rollback — a `?` early-return, a panic —
+        // must not linger on the server holding a buffer. Best-effort rollback; nothing was
+        // applied, so there is nothing to undo, only a buffer to free.
+        if !self.finished {
+            let _ = self.client.round_trip(Request::Execute {
+                shard: self.shard,
+                statements: vec![Statement::new("ROLLBACK")],
+            });
+        }
+    }
+}
+
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
@@ -260,6 +339,31 @@ impl Client {
     pub fn put(&mut self, key: &[u8], sql: &str, params: Vec<Value>) -> Result<(u64, i64)> {
         let shard = self.route(key)?;
         self.execute(shard, Statement::with_params(sql, params))
+    }
+
+    /// Begin a transaction on `shard`.
+    ///
+    /// Statements run through the returned [`Transaction`] are buffered on the server and
+    /// applied as one atomic batch at [`Transaction::commit`], which returns only once the
+    /// whole transaction is durable (quorum-acknowledged). Nothing is applied until then, so
+    /// the writer is never pinned across your think-time — and an abandoned transaction
+    /// simply vanishes.
+    ///
+    /// A transaction is limited to one shard: there is no atomic commit across shards in this
+    /// design.
+    pub fn begin(&mut self, shard: u32) -> Result<Transaction<'_>> {
+        match self.round_trip(Request::Execute {
+            shard,
+            statements: vec![Statement::new("BEGIN")],
+        })? {
+            Response::Ok => Ok(Transaction {
+                client: self,
+                shard,
+                finished: false,
+            }),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(unexpected(other)),
+        }
     }
 
     /// Create or replace a user at runtime. The secret is hashed here — only the derived key

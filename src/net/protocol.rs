@@ -64,6 +64,13 @@ pub enum Request {
     },
     /// Apply a statement to every shard. How DDL is propagated.
     ExecuteAll { statement: Statement },
+    /// Apply `statements` as one atomic transaction on `shard`. All commit, or none do — the
+    /// COMMIT of a client-held transaction, distinct from `Execute` whose statements are
+    /// independent and isolated per-statement.
+    Transaction {
+        shard: u32,
+        statements: Vec<Statement>,
+    },
     /// Route a key to its shard, so a client can target writes without knowing the hash.
     Route { key: Vec<u8> },
     /// Ask what this node is.
@@ -184,6 +191,11 @@ pub enum Response {
         data: Vec<u8>,
     },
     Ok,
+    /// A write was buffered into an open transaction, not yet applied. `queued` is how many
+    /// statements the transaction now holds. Durability comes at COMMIT, not here.
+    Staged {
+        queued: u64,
+    },
     /// Authentication is required: prove knowledge of a secret by answering this nonce.
     /// Fresh per connection, so a recorded handshake replays as nothing.
     Challenge {

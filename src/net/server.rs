@@ -345,6 +345,14 @@ fn serve_connection(
     // must release what it took, whatever way it ends.
     let mut held: BTreeSet<ShardId> = BTreeSet::new();
 
+    // A client-held transaction, if one is open. Statements are *buffered* here rather than
+    // applied one at a time against a held-open SQLite transaction — that would pin the
+    // writer thread for the whole round trip and defeat group commit, which is exactly why
+    // BEGIN used to be refused. Buffered, the writer is engaged only at COMMIT, for one
+    // atomic batch, and everyone else's writes keep flowing in between. An abandoned
+    // transaction (connection dropped mid-transaction) simply vanishes: nothing was applied.
+    let mut txn: Option<Txn> = None;
+
     let result = (|| -> Result<()> {
         loop {
             // A closed or idle connection ends the loop as an error, which the caller logs
@@ -467,7 +475,10 @@ fn serve_connection(
                 _ => None,
             };
 
-            let resp = handle(req, shards, services);
+            let resp = match session_step(&mut txn, req, shards, services) {
+                SessionStep::Handled(r) => r,
+                SessionStep::Passthrough(req) => handle(req, shards, services),
+            };
             match (freeze, &resp) {
                 (Some((shard, true)), Response::SnapshotInfo { .. }) => {
                     held.insert(shard);
@@ -606,9 +617,179 @@ fn target_shard(req: &Request) -> Option<ShardId> {
     match req {
         Request::Query { shard, .. }
         | Request::Execute { shard, .. }
+        | Request::Transaction { shard, .. }
         | Request::SchemaApply { shard, .. } => Some(ShardId(*shard)),
         _ => None,
     }
+}
+
+/// An open client transaction: which shard it is on, and the writes buffered for COMMIT.
+struct Txn {
+    shard: u32,
+    staged: Vec<crate::storage::exec::Statement>,
+    bytes: usize,
+}
+
+/// A transaction cannot grow without bound in server memory. These caps bound one
+/// connection's buffered writes; past them the statement is refused and the client must
+/// COMMIT or ROLLBACK. Sized to hold a large batch insert comfortably while refusing a
+/// runaway.
+const MAX_TXN_STATEMENTS: usize = 100_000;
+const MAX_TXN_BYTES: usize = 64 * 1024 * 1024;
+
+enum SessionStep {
+    /// The session handled this request; here is the reply.
+    Handled(Response),
+    /// Not a transaction concern; hand it to the normal request handler.
+    Passthrough(Request),
+}
+
+fn refuse(message: &str) -> Response {
+    Response::Error {
+        message: message.to_string(),
+        retryable: false,
+    }
+}
+
+/// Apply transaction semantics to a request, buffering writes and flushing at COMMIT.
+///
+/// Returns `Passthrough` for anything that is not a transaction concern, so ordinary traffic
+/// — every existing client, which never sends BEGIN — is untouched and behaves exactly as
+/// before.
+fn session_step(
+    txn: &mut Option<Txn>,
+    req: Request,
+    shards: &ShardManager,
+    services: &NodeServices,
+) -> SessionStep {
+    // Reads inside a transaction cannot see the buffered-but-unapplied writes, so answering
+    // one would return a state that is a lie about this transaction. Refuse rather than
+    // mislead — the project's rule everywhere else too.
+    if txn.is_some() && matches!(req, Request::Query { .. } | Request::QueryAll { .. }) {
+        return SessionStep::Handled(refuse(
+            "reads are not supported inside a transaction: it buffers writes and applies them              atomically at COMMIT, so a read here could not see them. COMMIT first, or read              on a separate connection.",
+        ));
+    }
+
+    let Request::Execute { shard, statements } = req else {
+        return SessionStep::Passthrough(req);
+    };
+
+    // Nothing transactional here and none open: the common path, untouched.
+    let touches_txn = statements
+        .iter()
+        .any(|s| is_txn_keyword(&crate::db::first_keyword(&s.sql)));
+    if txn.is_none() && !touches_txn {
+        return SessionStep::Passthrough(Request::Execute { shard, statements });
+    }
+
+    let mut last = Response::Ok;
+    for stmt in statements {
+        let kw = crate::db::first_keyword(&stmt.sql);
+        match kw.as_str() {
+            "BEGIN" => {
+                if txn.is_some() {
+                    return SessionStep::Handled(refuse(
+                        "a transaction is already open on this connection; nested transactions                          are not supported",
+                    ));
+                }
+                *txn = Some(Txn {
+                    shard,
+                    staged: Vec::new(),
+                    bytes: 0,
+                });
+                last = Response::Ok;
+            }
+            "COMMIT" | "END" => {
+                let Some(open) = txn.take() else {
+                    return SessionStep::Handled(refuse("COMMIT without an open transaction"));
+                };
+                // The durable ack. The buffer is applied as one atomic batch through the
+                // normal path — routing to the shard's owner and waiting for quorum — so the
+                // COMMIT reply arrives only once the whole transaction is durable.
+                last = if open.staged.is_empty() {
+                    Response::Changed {
+                        rows_affected: 0,
+                        last_insert_rowid: 0,
+                    }
+                } else {
+                    handle(
+                        Request::Transaction {
+                            shard: open.shard,
+                            statements: open.staged,
+                        },
+                        shards,
+                        services,
+                    )
+                };
+            }
+            "ROLLBACK" => {
+                // Nothing was applied, so discarding the buffer is the whole of a rollback.
+                *txn = None;
+                last = Response::Ok;
+            }
+            "SAVEPOINT" | "RELEASE" => {
+                return SessionStep::Handled(refuse(
+                    "savepoints are not supported: a buffered transaction is applied atomically                      at COMMIT, with no intermediate points to roll back to",
+                ));
+            }
+            _ => {
+                // An ordinary statement. Decisions are taken through immutable reads so the
+                // cross-shard abort can clear the transaction without a borrow conflict.
+                match txn.as_ref() {
+                    None => {
+                        // A real statement outside any transaction, in a request that also
+                        // carried a transaction keyword (unusual ordering). Apply it now, as
+                        // it would be without a transaction at all.
+                        last = handle(
+                            Request::Execute {
+                                shard,
+                                statements: vec![stmt],
+                            },
+                            shards,
+                            services,
+                        );
+                    }
+                    Some(open) if open.shard != shard => {
+                        // Cross-shard atomicity does not exist in this design, so a
+                        // transaction is bound to the shard it began on. Abort rather than
+                        // silently split it.
+                        let began = open.shard;
+                        *txn = None;
+                        return SessionStep::Handled(refuse(&format!(
+                            "a transaction is limited to one shard: it began on shard {began}                              but a statement targets shard {shard}. Cross-shard transactions                              are not atomic in this design and are refused rather than                              half-applied."
+                        )));
+                    }
+                    Some(open)
+                        if open.staged.len() >= MAX_TXN_STATEMENTS
+                            || open.bytes + stmt.sql.len() + stmt.params.len() * 16
+                                > MAX_TXN_BYTES =>
+                    {
+                        return SessionStep::Handled(refuse(
+                            "transaction too large; COMMIT or ROLLBACK and use smaller batches",
+                        ));
+                    }
+                    Some(_) => {
+                        let open = txn.as_mut().expect("checked open");
+                        open.bytes += stmt.sql.len() + stmt.params.len() * 16;
+                        open.staged.push(stmt);
+                        last = Response::Staged {
+                            queued: open.staged.len() as u64,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    SessionStep::Handled(last)
+}
+
+/// Transaction-control keywords the session intercepts.
+fn is_txn_keyword(kw: &str) -> bool {
+    matches!(
+        kw,
+        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+    )
 }
 
 fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) -> Response {
@@ -675,6 +856,45 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                     columns: r.columns,
                     rows: r.rows,
                 },
+                Err(e) => error_response(e),
+            }
+        }
+
+        // The COMMIT of a client transaction: all-or-nothing, and durable before it returns.
+        Request::Transaction { shard, statements } => {
+            match shards.execute_txn(ShardId(shard), statements) {
+                Ok(outcomes) => {
+                    // A single rejection voids the whole transaction — report it as an error,
+                    // not a partial success, because nothing was applied.
+                    if let Some(Outcome::Rejected(m)) =
+                        outcomes.iter().find(|o| matches!(o, Outcome::Rejected(_)))
+                    {
+                        Response::Error {
+                            message: m.clone(),
+                            retryable: false,
+                        }
+                    } else {
+                        let rows: u64 = outcomes
+                            .iter()
+                            .map(|o| match o {
+                                Outcome::Ok(Executed::Changed(w)) => w.rows_affected,
+                                _ => 0,
+                            })
+                            .sum();
+                        let last = outcomes
+                            .iter()
+                            .rev()
+                            .find_map(|o| match o {
+                                Outcome::Ok(Executed::Changed(w)) => Some(w.last_insert_rowid),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        Response::Changed {
+                            rows_affected: rows,
+                            last_insert_rowid: last,
+                        }
+                    }
+                }
                 Err(e) => error_response(e),
             }
         }

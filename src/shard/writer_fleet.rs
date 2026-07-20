@@ -28,6 +28,9 @@ use crate::vfs::WalCapture;
 struct Pending {
     shard: ShardId,
     statements: Vec<Statement>,
+    /// All-or-nothing: one failing statement voids the whole set. A client transaction; see
+    /// [`super::super::storage::apply::batch_with`].
+    atomic: bool,
     reply: SyncSender<Result<Vec<Outcome>>>,
 }
 
@@ -255,9 +258,29 @@ impl WriterFleet {
     /// Returns [`Error::WriterBusy`] immediately if the queue is full, rather than blocking
     /// — the same load-shedding contract the reader fleet offers.
     pub fn execute(&self, shard: ShardId, statements: Vec<Statement>) -> Result<Vec<Outcome>> {
+        self.submit(shard, statements, false)
+    }
+
+    /// Apply `statements` as one atomic transaction: all commit, or none do. The COMMIT of a
+    /// client-held transaction.
+    pub fn execute_atomic(
+        &self,
+        shard: ShardId,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<Outcome>> {
+        self.submit(shard, statements, true)
+    }
+
+    fn submit(
+        &self,
+        shard: ShardId,
+        statements: Vec<Statement>,
+        atomic: bool,
+    ) -> Result<Vec<Outcome>> {
         let (reply_tx, reply_rx) = sync_channel(1);
         self.sender(shard)?
             .try_send(Job::Write(Pending {
+                atomic,
                 shard,
                 statements,
                 reply: reply_tx,
@@ -616,8 +639,9 @@ fn apply_shard_batch(
     }
 
     let groups: Vec<Vec<Statement>> = group.iter().map(|p| p.statements.clone()).collect();
+    let atomic: Vec<bool> = group.iter().map(|p| p.atomic).collect();
 
-    match apply::batch(&mut entry.conn, &groups) {
+    match apply::batch_with(&mut entry.conn, &groups, &atomic) {
         Ok(results) => {
             // Drain to the sink BEFORE replying. A caller told its write succeeded must be
             // able to assume the frames reached the replication stream; replying first
