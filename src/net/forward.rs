@@ -109,13 +109,28 @@ impl Router {
         let wrapped = Request::Direct(Box::new(req));
         self.forwarded.fetch_add(1, Ordering::Relaxed);
 
-        let mut links = self.links.lock().expect("router links");
-        if let Some(client) = links.get_mut(&owner) {
+        // Take the connection *out* of the map before using it, so the lock is never held
+        // across network I/O. Held across, one hung owner — accepting connections, answering
+        // nothing — would block every forward on this node for the full timeout, whatever
+        // shard or owner they were bound for. That is the same disease that once froze the
+        // election loop, sitting in the write path.
+        //
+        // The cost is benign: two threads forwarding to the same peer at once find the map
+        // empty and each open a connection; whichever finishes last parks its connection for
+        // reuse and the other's is dropped. Connection churn under a race, never a stall.
+        let cached = self.links.lock().expect("router links").remove(&owner);
+
+        if let Some(mut client) = cached {
             match client.request(wrapped.clone()) {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    self.links
+                        .lock()
+                        .expect("router links")
+                        .insert(owner, client);
+                    return Ok(r);
+                }
                 Err(e) => {
                     tracing::debug!(owner, error = %e, "forward link failed; reconnecting");
-                    links.remove(&owner);
                 }
             }
         }
@@ -123,7 +138,10 @@ impl Router {
         match Client::connect_bounded(&addr, self.timeout, self.timeout) {
             Ok(mut client) => match client.request(wrapped) {
                 Ok(r) => {
-                    links.insert(owner, client);
+                    self.links
+                        .lock()
+                        .expect("router links")
+                        .insert(owner, client);
                     Ok(r)
                 }
                 Err(e) => {
@@ -137,6 +155,12 @@ impl Router {
                 Err(e)
             }
         }
+    }
+
+    /// Bound on a forwarded round trip. The default is client-sized; tests shrink it.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 

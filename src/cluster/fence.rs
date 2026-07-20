@@ -78,6 +78,10 @@ pub struct FenceStats {
     pub rejected: u64,
     /// Writes refused because this node is not currently permitted to write.
     pub gated_writes: u64,
+    /// Attempts to open the gate for a term older than one already seen. Each is the
+    /// deposed-leader race caught at the last line of defence: a placement applied
+    /// concurrently with a step-down tried to reopen gates the step-down had closed.
+    pub stale_opens: u64,
 }
 
 /// Tracks the highest term seen and refuses anything older.
@@ -88,6 +92,7 @@ pub struct Fence {
     highest: AtomicU64,
     rejected: AtomicU64,
     gated: AtomicU64,
+    stale_opens: AtomicU64,
     /// Shards this node may write, and the term it was granted each in. Absent means closed.
     led: Mutex<BTreeMap<ShardId, Term>>,
 }
@@ -106,6 +111,7 @@ impl Fence {
             highest_seen: self.highest.load(Ordering::Acquire),
             rejected: self.rejected.load(Ordering::Relaxed),
             gated_writes: self.gated.load(Ordering::Relaxed),
+            stale_opens: self.stale_opens.load(Ordering::Relaxed),
         }
     }
 
@@ -144,8 +150,27 @@ impl Fence {
     /// that subtraction wrong at a call site would leave a node writing a shard another node
     /// now owns.
     pub fn open_for(&self, shards: &[ShardId], term: Term) {
-        self.highest.fetch_max(term, Ordering::AcqRel);
+        // The gate mutex is taken FIRST, and the staleness check happens inside it. The
+        // first version checked before locking, and the stress harness caught the hole once
+        // in eighteen suite runs: a step-down can run *between* this thread's term check and
+        // its gate update — check passes against the old term, step-down raises the bar and
+        // closes, then this thread inserts its gates anyway. Check-then-act, one level below
+        // the race it was built to stop. Holding the gate lock across both makes the check
+        // and the mutation one step, so a step-down lands wholly before or wholly after.
         let mut led = self.led.lock().expect("fence mutex");
+
+        let previous = self.highest.fetch_max(term, Ordering::AcqRel);
+        if term < previous {
+            self.stale_opens.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                term,
+                highest_seen = previous,
+                "refusing to open the write gate for a stale term; a newer term has already \
+                 been seen, so this placement is a leftover from a deposed leadership"
+            );
+            return;
+        }
+
         let before: Vec<ShardId> = led.keys().copied().collect();
         led.clear();
         for &s in shards {
@@ -159,6 +184,20 @@ impl Fence {
             tracing::warn!(?dropped, term, "write gate closed for shards no longer led");
         }
         tracing::info!(count = shards.len(), term, "write gate open");
+    }
+
+    /// Step down: raise the bar to `term` and close every gate, as one step.
+    ///
+    /// One step under the gate mutex, not a raise followed by a close — the raise is what
+    /// makes a concurrently-applied stale placement refuse itself, and it must not be
+    /// separable from the close it protects.
+    pub fn step_down(&self, term: Term, why: &str) {
+        let mut led = self.led.lock().expect("fence mutex");
+        self.highest.fetch_max(term, Ordering::AcqRel);
+        let was = std::mem::take(&mut *led);
+        if !was.is_empty() {
+            tracing::warn!(shards = was.len(), term, why, "write gate closed");
+        }
     }
 
     /// Forbid this node from writing anything. Called the moment leadership is lost.
@@ -353,6 +392,49 @@ mod tests {
             10,
             "a stale token must not lower the bar it just failed to clear"
         );
+    }
+
+    #[test]
+    fn a_stale_open_is_refused_and_counted() {
+        let f = Fence::new(1, 0);
+        f.open_for(&[S0], 5);
+        // A newer term is observed — a successor's frames, say.
+        f.validate(FenceToken::new(7, 2)).unwrap();
+        // A leftover placement from term 5 tries to open. It must bounce.
+        f.open_for(&[S1], 5);
+        assert!(!f.is_open(S1), "a stale open must not take effect");
+        assert!(f.is_open(S0), "and must not disturb what was already open");
+        assert_eq!(f.stats().stale_opens, 1, "the refusal must be counted");
+    }
+
+    #[test]
+    fn a_deposed_leader_cannot_be_reopened_by_a_racing_placement() {
+        // The interleaving this reproduces is real: `apply_placement` runs on every
+        // connection thread as heartbeats arrive, and a step-down can land between its term
+        // check and its `open_for`. Whichever order the two threads run in, the gate must be
+        // closed once both are done — the step-down carries the higher term, so the late
+        // open must refuse itself.
+        for _ in 0..500 {
+            let f = std::sync::Arc::new(Fence::new(1, 0));
+            f.open_for(&[S0], 1);
+
+            let depose = {
+                let f = std::sync::Arc::clone(&f);
+                std::thread::spawn(move || f.step_down(2, "deposed by term 2"))
+            };
+            let reopen = {
+                let f = std::sync::Arc::clone(&f);
+                std::thread::spawn(move || f.open_for(&[S0], 1))
+            };
+            depose.join().unwrap();
+            reopen.join().unwrap();
+
+            assert!(
+                !f.is_open(S0),
+                "a placement from term 1 reopened the gate after a term-2 step-down; a \
+                 deposed leader can write again"
+            );
+        }
     }
 
     #[test]

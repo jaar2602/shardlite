@@ -791,6 +791,52 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### The concurrency audit: three product races, one of them in the fix itself
+
+Prompted by the observation that the intermittent failures were concurrency-shaped, the
+concurrent call graph was audited directly rather than fixing tests around it. Heartbeats are
+handled on **every connection thread**, and `apply_placement` runs there — that is the fact
+the earlier code had not internalised.
+
+**Race 1 — a deposed leader could reopen its own write gate.** `handle_heartbeat` checks the
+term, then applies placement and opens gates. A step-down (higher term, another connection
+thread) could land between the check and the open: `fence.close()` fires, then the stale
+placement's `open_for` reopens the gates the step-down just closed. Two writers on one shard,
+enabled by thread interleaving. Fixed at the fence, the serialization point everything above
+can race around: `step_down(term)` raises the bar as it closes, and `open_for` refuses any
+term below the bar.
+
+**Race 1b — the first version of that fix had the same bug one level down.** The staleness
+check ran before taking the gate mutex, so a step-down could run *between* the check and the
+gate update. The stress harness caught it — the 500-iteration hammer test failed once in
+eighteen suite runs. The check now happens inside the gate mutex, making check and mutation
+one step. A guard against check-then-act, written as check-then-act.
+
+**Race 2 — placement map and gates could cross.** Two connection threads applying different
+placements could record P1 then P2 into the map but apply gates in the order P2 then P1.
+Application is now serialized under a dedicated mutex, with `try_lock`-and-skip rather than
+queueing: a handover legitimately takes seconds, and heartbeat threads queued behind it would
+stall their replies — the hung-peer failure mode, self-inflicted. A skipped placement is not
+recorded, so the next heartbeat retries it.
+
+**Race 3 — the router held its lock across network I/O.** One hung shard owner — accepting
+connections, answering nothing — blocked every forward on the node for the full timeout,
+whatever shard or owner they were bound for. The same disease that once froze the election
+loop, sitting in the write path. Connections are now taken out of the map before use, so the
+lock never spans a round trip. Measured before the fix: a forward to a healthy owner waited
+**1.8 s** behind a hung one; after, it completes independently.
+
+All three verified by faithful revert: the stale-open refusal, the raise-on-step-down, and
+the lock-across-I/O each fail their tests when reverted. One revert attempt was unfaithful —
+it introduced a deadlock the original never had — and was redone against the exact pre-fix
+code before its result was trusted.
+
+A **fifth** placement-unaware test also surfaced (`three_nodes_elect_exactly_one_leader`,
+racing gate-opening at election and asserting followers never hold gates). Five is a pattern
+about the cost of changing an invariant late, not five accidents.
+
+Verified: **48 suite runs across concurrent stress rounds, no failures.**
+
 ### The unreproducible failure, found
 
 A single failing run had been seen and lost — the loop that spotted it printed "FAILED" and

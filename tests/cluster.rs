@@ -221,27 +221,35 @@ fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<meshdb::cluster:
 
 #[test]
 fn three_nodes_elect_exactly_one_leader() {
+    // The fifth test in this file found asserting pre-placement behaviour. It checked the
+    // gate for ShardId(0) the instant `is_leader()` flipped — racing the placement that
+    // opens gates — and asserted followers never hold gates, which stops being true the
+    // moment placement spreads shards to them. Both assumptions produced intermittent
+    // failures under the stress harness, not honest ones.
     let nodes = cluster(3);
     let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader was elected");
 
-    // The others must agree, and must not think they lead.
-    let followers: Vec<&Arc<Node>> = nodes.iter().filter(|n| n.id != leader.id).collect();
-    for f in &followers {
+    // The others must agree, and must not think they lead the *election*.
+    for f in nodes.iter().filter(|n| n.id != leader.id) {
         assert!(!f.cluster.is_leader(), "node {} also thinks it leads", f.id);
     }
 
-    // Only the leader may write.
-    assert!(
-        leader.cluster.fence().is_open(ShardId(0)),
-        "the leader's write gate must be open"
-    );
-    for f in &followers {
-        assert!(
-            !f.cluster.fence().is_open(ShardId(0)),
-            "follower {} must not be permitted to write",
-            f.id
-        );
+    // Winning the election and being assigned shards are separate steps; wait for the
+    // second rather than racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while leader.cluster.led_shards().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
     }
+    let led = leader.cluster.led_shards();
+    assert!(!led.is_empty(), "the leader was never assigned a shard");
+    assert!(
+        leader.cluster.fence().is_open(led[0]),
+        "the leader's gate must be open for a shard it leads"
+    );
+
+    // Which shards followers may write is placement's business, covered by
+    // `a_node_writes_only_the_shards_placement_gave_it` — not asserted here, where the
+    // spread may or may not have happened yet.
 
     for n in &nodes {
         n.stop();
@@ -1109,4 +1117,140 @@ fn the_default_read_level_is_the_strong_one() {
     for n in &nodes {
         n.stop();
     }
+}
+
+#[test]
+fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
+    // The router once held its connection map's lock across the network round trip. One
+    // owner that accepted connections and answered nothing would then block every forward on
+    // the node — any shard, any owner — for the full timeout. Same disease that froze the
+    // election loop, sitting in the write path.
+    use meshdb::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use std::net::TcpListener;
+
+    // Owner of shard 0: accepts, says hello, then never answers anything again.
+    let hung = TcpListener::bind("127.0.0.1:0").unwrap();
+    let hung_addr = hung.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in hung.incoming().flatten() {
+            {
+                let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut w = std::io::BufWriter::new(stream.try_clone().unwrap());
+                let _: Result<Request, _> = read_message(&mut r);
+                let _ = write_message(
+                    &mut w,
+                    &Response::Welcome {
+                        version: PROTOCOL_VERSION,
+                        shard_count: 2,
+                        epoch: None,
+                    },
+                );
+                held.push(stream); // and now silence, forever
+            }
+        }
+    });
+
+    // Owner of shard 1: healthy, answers everything with Ok.
+    let healthy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let healthy_addr = healthy.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in healthy.incoming().flatten() {
+            {
+                std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut w = std::io::BufWriter::new(stream);
+                    let _: Result<Request, _> = read_message(&mut r);
+                    let _ = write_message(
+                        &mut w,
+                        &Response::Welcome {
+                            version: PROTOCOL_VERSION,
+                            shard_count: 2,
+                            epoch: None,
+                        },
+                    );
+                    while read_message::<Request, _>(&mut r).is_ok() {
+                        let _ = write_message(&mut w, &Response::Ok);
+                    }
+                });
+            }
+        }
+    });
+
+    // A node that believes node 2 (hung) owns shard 0 and node 3 (healthy) owns shard 1.
+    let dir = TempDir::new().unwrap();
+    let terms = TermStore::open(dir.path()).unwrap();
+    let fence = Arc::new(Fence::new(1, 0));
+    let election = Election::new(quick(1, vec![2, 3]), terms, Instant::now()).unwrap();
+    let manager = Arc::new(
+        ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap(),
+    );
+    let node = Arc::new(ClusterNode::new(
+        1,
+        election,
+        fence,
+        [(2u64, hung_addr), (3u64, healthy_addr)]
+            .into_iter()
+            .collect(),
+        manager as Arc<dyn DurabilitySource>,
+        vec![ShardId(0), ShardId(1)],
+    ));
+    let mut assignments = std::collections::BTreeMap::new();
+    assignments.insert(ShardId(0), 2u64);
+    assignments.insert(ShardId(1), 3u64);
+    node.handle_heartbeat(&meshdb::cluster::Heartbeat {
+        term: 1,
+        leader: 2,
+        placement: meshdb::cluster::Placement {
+            term: 1,
+            assignments,
+        },
+    })
+    .unwrap();
+
+    let router =
+        Arc::new(meshdb::net::Router::new(Arc::clone(&node)).with_timeout(Duration::from_secs(2)));
+
+    // Thread A forwards into the hung owner and will sit there until its timeout.
+    let ra = Arc::clone(&router);
+    let a = std::thread::spawn(move || {
+        let _ = ra.forward(
+            ShardId(0),
+            Request::Execute {
+                shard: 0,
+                statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+            },
+        );
+    });
+    // Give A time to be inside the round trip.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Thread B forwards to the healthy owner. It must not wait for A's timeout.
+    let started = Instant::now();
+    let result = router.forward(
+        ShardId(1),
+        Request::Execute {
+            shard: 1,
+            statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+        },
+    );
+    let took = started.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "the healthy forward should succeed: {result:?}"
+    );
+    assert!(
+        took < Duration::from_millis(800),
+        "a forward to a healthy owner waited {took:?} behind a hung one; the router is \
+         serialising forwards through a lock held across network I/O"
+    );
+    a.join().unwrap();
 }

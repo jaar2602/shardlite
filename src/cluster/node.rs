@@ -84,6 +84,12 @@ pub struct ClusterNode {
     shards: Vec<crate::shard::ShardId>,
     /// The assignment currently in force on this node.
     placement: Mutex<Placement>,
+    /// Serialises the *application* of a placement — the map update and the gate changes
+    /// together. The `placement` mutex alone is not enough: it guards the compare-and-record
+    /// but was dropped before the gates were touched, so two heartbeat threads could record
+    /// P1 then P2 and yet apply their gates in the order P2 then P1, leaving the map and the
+    /// gates describing different worlds.
+    applying: Mutex<()>,
     /// Drives the file handover when placement moves a shard. `None` on a node with no
     /// replication configured — there is then no other writer competing for the files, so
     /// opening and closing gates is the whole of ownership.
@@ -126,6 +132,7 @@ impl ClusterNode {
             durability,
             shards,
             placement: Mutex::new(Placement::default()),
+            applying: Mutex::new(()),
             ownership: None,
             modes: None,
             live: Mutex::new(std::collections::BTreeSet::new()),
@@ -213,6 +220,16 @@ impl ClusterNode {
     /// this having to compute the difference — the subtraction that would otherwise be easy
     /// to miss, leaving this node writing a shard another node now owns.
     fn apply_placement(&self, p: &Placement) {
+        // One application at a time, and *skip* rather than queue behind one in flight.
+        // Blocking would be worse on both sides: a handover can legitimately take seconds
+        // (it waits for the pull loop to rest), and heartbeat threads queued behind it would
+        // stall their replies — the hung-peer failure mode again, self-inflicted. Skipping
+        // is safe because a skipped placement is not recorded, so the next heartbeat, at
+        // most one interval away, simply retries it.
+        let Ok(_applying) = self.applying.try_lock() else {
+            return;
+        };
+
         let mine = p.shards_for(self.id);
         {
             let mut current = self.placement.lock().expect("placement mutex");
@@ -343,7 +360,13 @@ impl ClusterNode {
                 // Close the gate *first*. Anything else on this path — draining queues,
                 // notifying peers — happens after writes have already stopped, or the window
                 // this is meant to close stays open for exactly as long as that work takes.
-                self.fence.close(why);
+                //
+                // `step_down`, not `close`: it raises the fence to the deposing term as it
+                // closes. Heartbeats are handled on every connection thread, so a placement
+                // carrying the *old* term can be mid-application right now — and a plain
+                // close would be undone the moment that thread reaches `open_for`. Raising
+                // the bar makes the late open refuse itself as stale.
+                self.fence.step_down(term, why);
                 tracing::warn!(node = self.id, term, why, "no longer leader");
             }
         }
