@@ -11,6 +11,15 @@ use super::protocol::{
     PROTOCOL_VERSION, Request, Response, ShardOutcome, read_message, write_message,
 };
 
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("shard_count", &self.shard_count)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Client {
     r: BufReader<TcpStream>,
     w: BufWriter<TcpStream>,
@@ -21,6 +30,20 @@ pub struct Client {
 impl Client {
     pub fn connect(addr: &str) -> Result<Self> {
         Self::connect_with(addr, Duration::from_secs(30))
+    }
+
+    /// Connect and authenticate as `name`.
+    ///
+    /// The secret never crosses the wire: the server sends a fresh nonce and this answers
+    /// with a keyed hash over it. See `net::auth` for what that does and does not protect.
+    pub fn connect_as(addr: &str, name: &str, secret: &str) -> Result<Self> {
+        let t = Duration::from_secs(30);
+        Self::connect_full(
+            addr,
+            t,
+            t,
+            Some((name.to_string(), super::auth::derive_key(secret))),
+        )
     }
 
     pub fn connect_with(addr: &str, timeout: Duration) -> Result<Self> {
@@ -38,6 +61,16 @@ impl Client {
     /// makes an unresponsive peer indistinguishable from a dead one, which is the only way the
     /// lease can do its job.
     pub fn connect_bounded(addr: &str, connect: Duration, io: Duration) -> Result<Self> {
+        Self::connect_full(addr, connect, io, None)
+    }
+
+    /// The full-fat constructor: bounded waits plus optional credentials.
+    pub fn connect_full(
+        addr: &str,
+        connect: Duration,
+        io: Duration,
+        credentials: Option<(String, super::auth::Key)>,
+    ) -> Result<Self> {
         let resolved = addr
             .to_socket_addrs()
             .map_err(|e| Error::Protocol(format!("resolving {addr}: {e}")))?
@@ -78,6 +111,32 @@ impl Client {
                 me.shard_count = shard_count;
                 me.epoch = epoch;
                 Ok(me)
+            }
+            // The server wants proof. Answer the nonce, or say plainly that credentials are
+            // needed — a bare "unexpected response" would send someone digging through
+            // protocol code for what is a configuration matter.
+            Response::Challenge { nonce } => {
+                let Some((name, key)) = credentials else {
+                    return Err(Error::Protocol(
+                        "this server requires authentication; connect with credentials \
+                         (Client::connect_as)"
+                            .into(),
+                    ));
+                };
+                let proof = super::auth::prove(&key, &nonce);
+                match me.round_trip(Request::Auth { name, proof })? {
+                    Response::Welcome {
+                        shard_count, epoch, ..
+                    } => {
+                        me.shard_count = shard_count;
+                        me.epoch = epoch;
+                        Ok(me)
+                    }
+                    Response::Error { message, .. } => Err(Error::Protocol(message)),
+                    other => Err(Error::Protocol(format!(
+                        "expected a welcome after authenticating, got {other:?}"
+                    ))),
+                }
             }
             Response::Error { message, .. } => Err(Error::Protocol(message)),
             other => Err(Error::Protocol(format!(

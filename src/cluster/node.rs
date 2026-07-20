@@ -103,6 +103,10 @@ pub struct ClusterNode {
     /// only to members it can currently reach — a shard assigned to a node that is gone has
     /// no leader at all, which is worse than an uneven spread.
     live: Mutex<std::collections::BTreeSet<NodeId>>,
+    /// Credentials for talking to peers, when the cluster requires authentication. Every
+    /// node shares the cluster principal — peers are one trust domain, and per-peer secrets
+    /// would multiply key management without changing what a compromised node can do.
+    credentials: Option<(String, crate::net::auth::Key)>,
     /// Bound on every peer round trip. Deliberately a fraction of the election timeout: a
     /// peer that is hung rather than dead must look dead before the lease is due, or the
     /// leader is still blocked in a socket read at the moment it should be stepping down.
@@ -135,6 +139,7 @@ impl ClusterNode {
             applying: Mutex::new(()),
             ownership: None,
             modes: None,
+            credentials: None,
             live: Mutex::new(std::collections::BTreeSet::new()),
             peer_timeout,
             counters: Counters::default(),
@@ -149,6 +154,13 @@ impl ClusterNode {
     /// pages.
     pub fn with_ownership(mut self, promotion: Arc<super::promotion::Promotion>) -> Self {
         self.ownership = Some(promotion);
+        self
+    }
+
+    /// Authenticate to peers as `name`. Required once any node in the cluster enables
+    /// authentication — an unauthenticated heartbeat is refused like any other request.
+    pub fn with_cluster_credentials(mut self, name: &str, secret: &str) -> Self {
+        self.credentials = Some((name.to_string(), crate::net::auth::derive_key(secret)));
         self
     }
 
@@ -465,7 +477,12 @@ impl ClusterNode {
             }
         }
 
-        match Client::connect_bounded(addr, self.peer_timeout, self.peer_timeout) {
+        match Client::connect_full(
+            addr,
+            self.peer_timeout,
+            self.peer_timeout,
+            self.credentials.clone(),
+        ) {
             Ok(mut client) => match f(&mut client) {
                 Ok(v) => {
                     links.insert(peer, client);

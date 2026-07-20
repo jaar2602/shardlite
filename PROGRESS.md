@@ -791,6 +791,39 @@ guarantee.
 that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
 let a node with no copy answer reads for shards it did not hold.
 
+### Authentication and authorization
+
+The largest recorded gap — the server accepted any connection — is closed. Protocol version
+bumped to 2.
+
+**Challenge–response, because there is no TLS.** A password in `Hello` would cross plain TCP
+in clear. Instead the server sends a fresh 32-byte nonce from `/dev/urandom` (fail-closed: no
+entropy, no connection) and the client answers with `blake3::keyed_hash(key, nonce)` — the
+secret never crosses the wire, and a captured handshake replays as nothing. blake3 was
+already a dependency; its `Hash` equality is constant-time, so the comparison does not leak
+matching-prefix timing. The server stores `blake3(secret)`, never the secret.
+
+**Stated limit, in the module docs and here:** this stops unauthorized access. It does not
+encrypt — an eavesdropper still sees queries and rows, and an active MITM can hijack a
+connection after its handshake. On a hostile network, run inside a tunnel (WireGuard, SSH).
+Pulling a TLS stack into the 0.5 GB footprint is an operator's decision, not this crate's.
+
+**Roles.** `Read` < `Write` < `Admin` (DDL), and `Cluster` deliberately off that ladder:
+Subscribe and snapshots hand out entire shards, votes and heartbeats steer the cluster — a
+stolen admin credential must not include the exfiltration path, and a peer node's credential
+must not run ad-hoc queries. The requirement map is exhaustive over `Request`, so a new verb
+must choose its requirement or fail to compile. Client authz is enforced at the entry node;
+forwarded requests arrive as `Direct`, a Cluster verb, trusting the peer's own enforcement.
+
+**No users configured = open, loudly.** Existing deployments and all 260 prior tests run
+unchanged; the server warns at bind that it is accepting anything. Failed authentications
+close the connection (each guess costs a fresh connection and nonce) and are counted, as are
+authorization refusals. Wrong-secret and unknown-name refusals are byte-identical, so the
+handshake cannot enumerate names.
+
+Guards verified by revert: disabling the role check fails the role tests, a constant nonce
+fails the replay test, removing the doorman fails the unauthenticated-client test.
+
 ### The races are now model-checked, not hammered
 
 `RUSTFLAGS="--cfg loom" cargo test --lib loom_` runs five loom models over the two

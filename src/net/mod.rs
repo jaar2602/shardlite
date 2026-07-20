@@ -12,12 +12,14 @@
 //! write queue behind it cannot fill from connections alone, so refusing the connection is
 //! the honest first line and the queue bound remains a second.
 
+pub mod auth;
 pub mod client;
 pub mod forward;
 pub mod protocol;
 pub mod replica;
 pub mod server;
 
+pub use auth::{AuthConfig, Role};
 pub use client::Client;
 pub use forward::{ForwardStats, Router};
 pub use protocol::{ReadConsistency, Request, Response, ShardOutcome};

@@ -44,6 +44,9 @@ pub struct ReplicaConfig {
     /// This follower's cluster identity, sent with every subscription so the primary can
     /// count it toward a quorum. Zero means an anonymous reader that confirms nothing.
     pub node: u64,
+    /// Credentials for the primary, when it requires authentication. Subscription and
+    /// snapshots are cluster verbs, so this is the cluster principal.
+    pub credentials: Option<(String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -180,7 +183,10 @@ impl Replica {
         if shards.is_empty() {
             return Ok(());
         }
-        let mut client = Client::connect(&self.cfg.primary_addr)?;
+        let mut client = match &self.cfg.credentials {
+            Some((name, secret)) => Client::connect_as(&self.cfg.primary_addr, name, secret)?,
+            None => Client::connect(&self.cfg.primary_addr)?,
+        };
         for shard in shards {
             // Re-checked each time round: placement can take a shard away mid-pass, and
             // applying frames to a file this node has just taken ownership of would be

@@ -75,6 +75,7 @@ fn replica(p: &Primary, dir: &TempDir, stage: &TempDir, shards: Vec<ShardId>) ->
             snapshot_chunk: 64 * 1024,
             staging_dir: stage.path().to_path_buf(),
             node: 2,
+            credentials: None,
         },
         Arc::new(Follower::open(dir.path()).unwrap()),
     )

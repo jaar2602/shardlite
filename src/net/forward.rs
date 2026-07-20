@@ -52,6 +52,7 @@ pub struct Router {
     /// links so a slow forward cannot delay a heartbeat, which the lease depends on.
     links: Mutex<BTreeMap<u64, Client>>,
     timeout: Duration,
+    credentials: Option<(String, super::auth::Key)>,
     forwarded: AtomicU64,
     failed: AtomicU64,
 }
@@ -62,6 +63,7 @@ impl Router {
             cluster,
             links: Mutex::new(BTreeMap::new()),
             timeout: Duration::from_secs(10),
+            credentials: None,
             forwarded: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         }
@@ -135,7 +137,7 @@ impl Router {
             }
         }
 
-        match Client::connect_bounded(&addr, self.timeout, self.timeout) {
+        match Client::connect_full(&addr, self.timeout, self.timeout, self.credentials.clone()) {
             Ok(mut client) => match client.request(wrapped) {
                 Ok(r) => {
                     self.links
@@ -160,6 +162,12 @@ impl Router {
     /// Bound on a forwarded round trip. The default is client-sized; tests shrink it.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Authenticate forwards as the cluster principal.
+    pub fn with_credentials(mut self, name: &str, secret: &str) -> Self {
+        self.credentials = Some((name.to_string(), super::auth::derive_key(secret)));
         self
     }
 }

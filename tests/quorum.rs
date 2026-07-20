@@ -88,6 +88,7 @@ fn follower_for(l: &Leader, dir: &TempDir, stage: &TempDir) -> Replica {
             snapshot_chunk: 64 * 1024,
             staging_dir: stage.path().to_path_buf(),
             node: FOLLOWER_NODE,
+            credentials: None,
         },
         Arc::new(Follower::open(dir.path()).unwrap()),
     )

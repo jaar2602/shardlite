@@ -16,7 +16,7 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest single message. Snapshot chunks are the biggest legitimate payload, so this sits
 /// comfortably above the chunk size while still refusing anything absurd.
@@ -98,6 +98,9 @@ pub enum Request {
     /// briefly different placement maps could forward the same request back and forth
     /// forever; with it, the second node refuses instead of bouncing it.
     Direct(Box<Request>),
+    /// The answer to a [`Response::Challenge`]: `proof = blake3::keyed_hash(key, nonce)`.
+    /// The secret itself never crosses the wire.
+    Auth { name: String, proof: [u8; 32] },
     /// A peer is standing for election.
     Vote(crate::cluster::VoteRequest),
     /// A peer claims leadership and is renewing its lease.
@@ -169,6 +172,11 @@ pub enum Response {
         data: Vec<u8>,
     },
     Ok,
+    /// Authentication is required: prove knowledge of a secret by answering this nonce.
+    /// Fresh per connection, so a recorded handshake replays as nothing.
+    Challenge {
+        nonce: [u8; 32],
+    },
     SchemaVersion {
         shard: u32,
         version: i64,

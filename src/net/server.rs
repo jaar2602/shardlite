@@ -46,6 +46,8 @@ impl Default for ServerConfig {
 struct Counters {
     accepted: AtomicU64,
     refused_at_capacity: AtomicU64,
+    auth_failures: AtomicU64,
+    authz_refused: AtomicU64,
     requests: AtomicU64,
     errors: AtomicU64,
     abandoned_freezes: AtomicU64,
@@ -60,6 +62,12 @@ pub struct ServerStats {
     pub refused_at_capacity: u64,
     pub requests: u64,
     pub errors: u64,
+    /// Failed authentication attempts. A number that climbs is someone guessing.
+    pub auth_failures: u64,
+    /// Requests refused because the authenticated role does not permit them. Counted rather
+    /// than silently erroring, because a client repeatedly hitting this is misconfigured —
+    /// or probing.
+    pub authz_refused: u64,
     /// Snapshot freezes released because the connection holding one went away. Each is a
     /// follower that died mid-bootstrap; a node accumulating them is one whose WAL keeps
     /// being pinned by copies that never finish.
@@ -88,6 +96,10 @@ pub struct NodeServices {
     /// Sends shard work to the node that owns it. Without it a client can only reach shards
     /// that happen to live on the node it connected to.
     pub router: Option<Arc<super::forward::Router>>,
+    /// Who may connect and what they may do. `None` or empty means the server is open —
+    /// announced loudly at bind, because an unsecured database should be a decision, not a
+    /// discovery.
+    pub auth: Option<Arc<super::auth::AuthConfig>>,
 }
 
 pub struct Server {
@@ -134,6 +146,16 @@ impl Server {
         Self::from_listener(listener, shards, services, cfg)
     }
 
+    fn warn_if_open(services: &NodeServices) {
+        if services.auth.as_ref().is_none_or(|a| a.is_empty()) {
+            tracing::warn!(
+                "authentication is NOT configured: this server accepts any connection and \
+                 grants it everything, including the replication stream. Fine on a trusted \
+                 network; a decision worth having made on any other"
+            );
+        }
+    }
+
     /// Serve on a listener the caller already holds.
     ///
     /// Exists because cluster membership is circular to set up: a node needs its peers'
@@ -149,6 +171,7 @@ impl Server {
     ) -> Result<Self> {
         tracing::info!(addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             max_connections = cfg.max_connections, "listening");
+        Self::warn_if_open(&services);
         Ok(Self {
             listener,
             shards,
@@ -169,6 +192,8 @@ impl Server {
         ServerStats {
             accepted: self.counters.accepted.load(Ordering::Relaxed),
             refused_at_capacity: self.counters.refused_at_capacity.load(Ordering::Relaxed),
+            auth_failures: self.counters.auth_failures.load(Ordering::Relaxed),
+            authz_refused: self.counters.authz_refused.load(Ordering::Relaxed),
             requests: self.counters.requests.load(Ordering::Relaxed),
             errors: self.counters.errors.load(Ordering::Relaxed),
             abandoned_freezes: self.counters.abandoned_freezes.load(Ordering::Relaxed),
@@ -261,12 +286,34 @@ fn serve_connection(
         .set_nodelay(true)
         .map_err(|e| Error::Protocol(format!("set_nodelay: {e}")))?;
 
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
     let mut r = BufReader::new(
         stream
             .try_clone()
             .map_err(|e| Error::Protocol(format!("cloning stream: {e}")))?,
     );
     let mut w = BufWriter::new(stream);
+
+    /// Where this connection stands with the doorman.
+    enum Gate {
+        /// No authentication configured; everything is permitted.
+        Open,
+        /// Nothing has happened yet; only `Hello` is acceptable.
+        Fresh,
+        /// A challenge is outstanding; only `Auth` is acceptable.
+        Challenged([u8; 32]),
+        /// Proven. The role bounds every request from here on.
+        Authed(super::auth::Role),
+    }
+    let auth_cfg = services.auth.as_ref().filter(|a| !a.is_empty()).cloned();
+    let mut gate = if auth_cfg.is_some() {
+        Gate::Fresh
+    } else {
+        Gate::Open
+    };
 
     // Freezes this connection holds. A freeze suspends checkpointing, so one abandoned by a
     // follower that crashed mid-bootstrap would grow the WAL without bound — the connection
@@ -279,6 +326,114 @@ fn serve_connection(
             // at debug — disconnection is ordinary, not a fault.
             let req: Request = read_message(&mut r)?;
             counters.requests.fetch_add(1, Ordering::Relaxed);
+
+            // The doorman, before anything else looks at the request.
+            if let Some(auth) = &auth_cfg {
+                match &gate {
+                    Gate::Open => unreachable!("auth is configured"),
+                    Gate::Authed(role) => {
+                        let need = super::auth::required(&req);
+                        if !role.permits(need) {
+                            counters.authz_refused.fetch_add(1, Ordering::Relaxed);
+                            write_message(
+                                &mut w,
+                                &Response::Error {
+                                    message: format!(
+                                        "not permitted: this connection is authenticated with \
+                                         the {role} role, and this request requires {need:?}"
+                                    ),
+                                    retryable: false,
+                                },
+                            )?;
+                            continue;
+                        }
+                        // Falls through to normal handling.
+                    }
+                    Gate::Fresh => {
+                        match req {
+                            Request::Hello { version, .. } => {
+                                if version != PROTOCOL_VERSION {
+                                    write_message(
+                                        &mut w,
+                                        &Response::Error {
+                                            message: format!(
+                                                "protocol version {version} is not supported; \
+                                                 this server speaks {PROTOCOL_VERSION}"
+                                            ),
+                                            retryable: false,
+                                        },
+                                    )?;
+                                    continue;
+                                }
+                                // Fail closed: no entropy, no challenge, no connection.
+                                let nonce = super::auth::nonce()?;
+                                gate = Gate::Challenged(nonce);
+                                write_message(&mut w, &Response::Challenge { nonce })?;
+                            }
+                            _ => {
+                                // One message for every pre-auth request, so the refusal
+                                // teaches nothing about what exists.
+                                write_message(
+                                    &mut w,
+                                    &Response::Error {
+                                        message: "authentication required".into(),
+                                        retryable: false,
+                                    },
+                                )?;
+                            }
+                        }
+                        continue;
+                    }
+                    Gate::Challenged(nonce) => {
+                        match req {
+                            Request::Auth {
+                                ref name,
+                                ref proof,
+                            } => {
+                                match auth.verify(name, nonce, proof) {
+                                    Some(role) => {
+                                        gate = Gate::Authed(role);
+                                        write_message(
+                                            &mut w,
+                                            &Response::Welcome {
+                                                version: PROTOCOL_VERSION,
+                                                shard_count: shards.shard_count(),
+                                                epoch: shards.epoch(),
+                                            },
+                                        )?;
+                                        continue;
+                                    }
+                                    None => {
+                                        counters.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                        tracing::warn!(peer, name, "authentication failed");
+                                        let _ = write_message(
+                                            &mut w,
+                                            &Response::Error {
+                                                message: "authentication failed".into(),
+                                                retryable: false,
+                                            },
+                                        );
+                                        // The connection closes. Each guess costs a fresh
+                                        // connection and a fresh nonce, so the handshake
+                                        // cannot be hammered in place.
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            _ => {
+                                write_message(
+                                    &mut w,
+                                    &Response::Error {
+                                        message: "authentication required".into(),
+                                        retryable: false,
+                                    },
+                                )?;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Noted before the request is consumed; applied only if it actually succeeded.
             let freeze = match &req {
@@ -629,6 +784,13 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
 
         // Unwrapped above; reaching here would mean a nested wrapper, which nothing sends.
         Request::Direct(inner) => handle_local(*inner, shards, services),
+
+        // Answered inside the connection's handshake when authentication is configured;
+        // reaching here means it is not.
+        Request::Auth { .. } => Response::Error {
+            message: "authentication is not enabled on this server".into(),
+            retryable: false,
+        },
 
         Request::Vote(req) => match cluster {
             Some(c) => match c.handle_vote_request(&req) {

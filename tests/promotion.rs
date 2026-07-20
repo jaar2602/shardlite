@@ -160,6 +160,7 @@ fn replicant_with_shards(p: &Primary, shards: u32) -> Replicant {
             snapshot_chunk: 64 * 1024,
             staging_dir: stage.path().to_path_buf(),
             node: FOLLOWER,
+            credentials: None,
         },
         // The same directory the manager was opened on.
         Arc::new(Follower::open(dir.path()).unwrap()),
@@ -457,6 +458,7 @@ fn promotion_refuses_rather_than_racing_a_running_pull_loop() {
             snapshot_chunk: 64 * 1024,
             staging_dir: r._stage.path().to_path_buf(),
             node: FOLLOWER,
+            credentials: None,
         },
         Arc::new(Follower::open(r.dir.path()).unwrap()),
     ));
