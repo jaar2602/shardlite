@@ -1,3 +1,7 @@
+# The driver crates under drivers/ are standalone; keep them out of this package.
+[workspace]
+exclude = ["drivers"]
+
 [package]
 name = "meshdb"
 version = "0.1.0"

@@ -1,0 +1,19 @@
+[package]
+name = "meshdb-driver"
+version = "0.1.0"
+edition = "2024"
+description = "Driver for meshdb — HTTP by default, native bincode-over-TCP behind a feature."
+
+[features]
+default = []
+# The native bincode-over-TCP transport — the fastest path. Pulls in the meshdb crate, so it
+# is opt-in; the default HTTP client stays lean.
+native = ["dep:meshdb"]
+
+[dependencies]
+# A small synchronous HTTP client; default-features off keeps it TLS-light. Enable ureq's
+# tls feature in your app if you talk to the gateway over https.
+ureq = { version = "2", default-features = false }
+serde_json = "1"
+# Native transport, feature-gated. default-features off drops the CLI's tracing-subscriber.
+meshdb = { path = "../..", optional = true, default-features = false }
