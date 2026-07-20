@@ -103,8 +103,23 @@ impl Client {
         }
     }
 
+    /// Read a shard at the strongest level. See [`Self::query_with`] for a weaker one.
     pub fn query(&mut self, shard: u32, sql: impl Into<Statement>) -> Result<QueryResult> {
+        self.query_with(shard, sql, super::protocol::ReadConsistency::default())
+    }
+
+    /// Read a shard at a chosen freshness.
+    ///
+    /// `Stale` and `AtLeastLsn` can be served by a follower, which is what spreads reads off
+    /// the leader. `Linearizable` always goes to the leader.
+    pub fn query_with(
+        &mut self,
+        shard: u32,
+        sql: impl Into<Statement>,
+        consistency: super::protocol::ReadConsistency,
+    ) -> Result<QueryResult> {
         match self.round_trip(Request::Query {
+            consistency,
             shard,
             statement: sql.into(),
         })? {

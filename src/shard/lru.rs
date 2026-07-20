@@ -96,6 +96,14 @@ impl<V> Lru<V> {
             .map(|(id, _)| *id)
     }
 
+    /// Look at an entry without counting it as a use.
+    ///
+    /// Deliberately not `get`: checking whether a cached connection has gone stale must not
+    /// change which connection is evicted next.
+    pub fn peek(&self, id: ShardId) -> Option<&V> {
+        self.entries.get(&id).map(|(_, v)| v)
+    }
+
     /// Drop a shard's entry, closing whatever it held.
     ///
     /// Used to hand a shard's file over to the replication path: a connection left open

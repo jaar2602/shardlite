@@ -27,16 +27,28 @@
 //! Enforced where connections are opened rather than by convention, because the failure it
 //! prevents is invisible and permanent.
 //!
-//! # The cost, stated plainly
+//! # Followers can serve reads, under a protocol
 //!
-//! This means **a follower cannot serve reads**, which the original plan wanted for read
-//! scale-out. Making that safe requires applying frames through SQLite's own WAL rather than
-//! writing pages behind its back, so readers use ordinary WAL locking. That is a real change
-//! to the apply path, not a flag, and it is not done here.
+//! Writes are refused outright on a followed shard. Reads are allowed, but only through
+//! [`ShardAccess`], which supplies the two things SQLite is not getting for itself:
+//!
+//! - **Exclusion.** Applies take the lock exclusively, reads share it. So no read is ever in
+//!   flight while pages are being rewritten or a file renamed underneath it.
+//! - **A generation.** Every apply bumps it. A cached connection from an older generation is
+//!   closed and reopened rather than reused, which is what clears the stale page cache — and,
+//!   after a snapshot install, the handle to the deleted inode.
+//!
+//! Measured before choosing this over applying frames through SQLite's own WAL: reopening a
+//! read connection costs ~8 us, and a query through a fresh connection 23 us against 2 us on
+//! a persistent one. An apply costs an fsync — about 1.5 ms on container storage — so the
+//! reopen is under 1% of the work it follows, and only the first read after each apply pays
+//! it. Rewriting the apply path to produce real WAL frames would be faster still and is the
+//! eventual answer, but it is the riskiest change available and this buys the same capability
+//! for a measured, small cost.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{Error, Result};
 
@@ -53,6 +65,51 @@ pub enum ShardMode {
     Followed,
 }
 
+/// Serialises reads against the replication path, and marks when a reader's view went stale.
+///
+/// Held per shard and shared between the reader fleet and the follower, which are otherwise
+/// unaware of each other.
+#[derive(Debug, Default)]
+pub struct ShardAccess {
+    /// Applies take this exclusively; reads share it. The only thing standing between a read
+    /// and a file being rewritten beneath it.
+    lock: RwLock<()>,
+    /// Bumped by every apply. A connection opened in an older generation is stale.
+    generation: AtomicU64,
+    reopens: AtomicU64,
+}
+
+impl ShardAccess {
+    /// The current generation. A reader that cached a connection at an older one must reopen.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn reopens(&self) -> u64 {
+        self.reopens.load(Ordering::Relaxed)
+    }
+
+    pub fn note_reopen(&self) {
+        self.reopens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hold for the duration of a read. Blocks while an apply is in flight.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.lock.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hold for the duration of an apply, then bump the generation.
+    ///
+    /// The bump happens **while the lock is still held**, so no reader can observe the new
+    /// pages through a connection still marked as current.
+    pub fn apply<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.lock.write().unwrap_or_else(|e| e.into_inner());
+        let out = f();
+        self.generation.fetch_add(1, Ordering::Release);
+        out
+    }
+}
+
 /// Per-shard ownership, consulted before any connection is opened.
 ///
 /// Defaults to [`ShardMode::Led`] so a standalone deployment — which has no replication and
@@ -60,6 +117,7 @@ pub enum ShardMode {
 #[derive(Debug, Default)]
 pub struct ShardModes {
     modes: Mutex<BTreeMap<ShardId, ShardMode>>,
+    access: Mutex<BTreeMap<ShardId, Arc<ShardAccess>>>,
     refused: AtomicU64,
     closed_on_handover: AtomicU64,
 }
@@ -112,7 +170,26 @@ impl ShardModes {
         }
     }
 
-    /// May SQLite open this shard? `Err` if the replication path owns it.
+    /// The read/apply coordination for a shard, created on first use.
+    pub fn access(&self, shard: ShardId) -> Arc<ShardAccess> {
+        Arc::clone(
+            self.access
+                .lock()
+                .expect("shard access mutex")
+                .entry(shard)
+                .or_default(),
+        )
+    }
+
+    /// May a **reader** open this shard?
+    ///
+    /// Yes in either mode. A followed shard is readable through [`ShardAccess`], which is
+    /// what makes the read safe; refusing here would give up read scale-out for nothing.
+    pub fn check_may_read(&self, _shard: ShardId) -> Result<()> {
+        Ok(())
+    }
+
+    /// May a **writer** open this shard? `Err` if the replication path owns it.
     pub fn check_may_open(&self, shard: ShardId) -> Result<()> {
         match self.mode(shard) {
             ShardMode::Led => Ok(()),

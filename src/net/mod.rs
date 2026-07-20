@@ -20,6 +20,6 @@ pub mod server;
 
 pub use client::Client;
 pub use forward::{ForwardStats, Router};
-pub use protocol::{Request, Response, ShardOutcome};
+pub use protocol::{ReadConsistency, Request, Response, ShardOutcome};
 pub use replica::{Replica, ReplicaConfig, ReplicaStats};
 pub use server::{NodeServices, Server, ServerConfig, ServerStats};

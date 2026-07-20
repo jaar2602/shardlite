@@ -43,6 +43,10 @@ pub enum Need {
 pub struct Follower {
     dir: PathBuf,
     positions: Mutex<BTreeMap<ShardId, Position>>,
+    /// Lets readers on this node be excluded while pages are rewritten, and their cached
+    /// connections invalidated afterwards. `None` when nothing on this node reads these
+    /// files — a replica with no server in front of it.
+    access: Mutex<Option<std::sync::Arc<crate::shard::mode::ShardModes>>>,
 }
 
 impl Follower {
@@ -52,6 +56,7 @@ impl Follower {
         let me = Self {
             dir: dir.to_path_buf(),
             positions: Mutex::new(BTreeMap::new()),
+            access: Mutex::new(None),
         };
         me.load_positions()?;
         Ok(me)
@@ -59,6 +64,24 @@ impl Follower {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Share the per-shard read/apply coordination with the node's readers.
+    ///
+    /// Without this a follower rewrites pages with no regard for connections that may be
+    /// reading them. With it, applies exclude readers and invalidate their caches — which is
+    /// what makes a followed shard readable at all.
+    pub fn coordinate_with(&self, modes: std::sync::Arc<crate::shard::mode::ShardModes>) {
+        *self.access.lock().expect("follower access mutex") = Some(modes);
+    }
+
+    /// Run `f` as an apply: readers excluded throughout, and their caches invalidated after.
+    fn as_apply<T>(&self, shard: ShardId, f: impl FnOnce() -> T) -> T {
+        let modes = self.access.lock().expect("follower access mutex").clone();
+        match modes {
+            Some(m) => m.access(shard).apply(f),
+            None => f(),
+        }
     }
 
     /// Every shard this follower holds a position for.
@@ -161,13 +184,14 @@ impl Follower {
 
         let path = shard.path(&self.dir);
         let raw: Vec<crate::vfs::CommittedTxn> = txns.iter().map(|t| t.txn.clone()).collect();
-        crate::vfs::apply_to_db_file(&path, &raw).map_err(|e| Error::Open {
-            path: path.display().to_string(),
-            source: rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some(e.to_string()),
-            ),
-        })?;
+        self.as_apply(shard, || crate::vfs::apply_to_db_file(&path, &raw))
+            .map_err(|e| Error::Open {
+                path: path.display().to_string(),
+                source: rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    Some(e.to_string()),
+                ),
+            })?;
 
         // Pages are durable before the position moves. A crash here replays them, which is
         // harmless; the reverse order would skip them, which is not.
@@ -194,11 +218,18 @@ impl Follower {
         let tmp = dest.with_extension("db.installing");
         std::fs::copy(snapshot, &tmp)
             .map_err(|e| Error::Manifest(format!("copying snapshot to {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &dest)
-            .map_err(|e| Error::Manifest(format!("installing {}: {e}", dest.display())))?;
 
-        // Any WAL left from a previous life describes a database that no longer exists.
-        let _ = std::fs::remove_file(crate::storage::checkpoint::wal_path_for(&dest));
+        // The rename and the WAL removal are an apply: a reader holding a connection across
+        // the rename keeps the *deleted inode* and serves a database frozen at this instant,
+        // forever, with no error. Excluding readers and bumping the generation is the only
+        // thing that prevents it.
+        self.as_apply(shard, || -> Result<()> {
+            std::fs::rename(&tmp, &dest)
+                .map_err(|e| Error::Manifest(format!("installing {}: {e}", dest.display())))?;
+            // Any WAL left from a previous life describes a database that no longer exists.
+            let _ = std::fs::remove_file(crate::storage::checkpoint::wal_path_for(&dest));
+            Ok(())
+        })?;
 
         tracing::info!(%shard, epoch, lsn, "installed snapshot");
         self.set_position(

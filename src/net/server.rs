@@ -14,7 +14,7 @@ use crate::shard::{ShardId, ShardManager};
 use crate::storage::exec::{Executed, Outcome};
 
 use super::protocol::{
-    PROTOCOL_VERSION, Request, Response, ShardOutcome, read_message, write_message,
+    PROTOCOL_VERSION, ReadConsistency, Request, Response, ShardOutcome, read_message, write_message,
 };
 
 #[derive(Debug, Clone)]
@@ -82,6 +82,9 @@ pub struct NodeServices {
     /// Quorum confirmation. Independent of `cluster` because a follower's subscription is
     /// what reports its position, and that works whether or not elections are running.
     pub acks: Option<Arc<crate::replication::AckTracker>>,
+    /// This node's replicated copies, so it can say how far behind they are when a caller
+    /// asks for a bounded staleness.
+    pub follower: Option<Arc<crate::replication::Follower>>,
     /// Sends shard work to the node that owns it. Without it a client can only reach shards
     /// that happen to live on the node it connected to.
     pub router: Option<Arc<super::forward::Router>>,
@@ -310,6 +313,31 @@ fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Respo
         return handle_local(*inner, shards, services);
     }
 
+    // A read may be answerable here even though another node owns the shard — that is the
+    // whole point of the weaker levels. Decided before the generic ownership rule.
+    if let Request::Query {
+        shard, consistency, ..
+    } = &req
+    {
+        let id = ShardId(*shard);
+        if can_serve_read(id, *consistency, shards, services) {
+            return handle_local(req, shards, services);
+        }
+        // This node cannot honour the level. If there is nowhere to forward to, say so
+        // rather than answering from a copy that does not meet the guarantee — rows that
+        // quietly break the level are worse than no rows.
+        if services.router.is_none() {
+            return Response::TooStale {
+                shard: *shard,
+                have: local_position(id, shards, services),
+                need: match consistency {
+                    ReadConsistency::AtLeastLsn(n) => *n,
+                    _ => 0,
+                },
+            };
+        }
+    }
+
     // Shard-targeted work goes to the node that owns the shard.
     if let Some(router) = &services.router
         && let Some(shard) = target_shard(&req)
@@ -324,6 +352,57 @@ fn handle(req: Request, shards: &ShardManager, services: &NodeServices) -> Respo
     }
 
     handle_local(req, shards, services)
+}
+
+/// How far this node's own copy of `shard` has got.
+fn local_position(shard: ShardId, shards: &ShardManager, services: &NodeServices) -> u64 {
+    match shards.mode(shard) {
+        // Led: what this node has committed itself.
+        crate::shard::mode::ShardMode::Led => shards.last_lsn(shard),
+        // Followed: what it has durably applied — not what it has received.
+        crate::shard::mode::ShardMode::Followed => services
+            .follower
+            .as_ref()
+            .map(|f| f.position(shard).applied_lsn)
+            .unwrap_or(0),
+    }
+}
+
+/// Whether this node may answer a read itself, given the freshness asked for.
+///
+/// Decided by what this node **is** for the shard, not by whether a router happens to be
+/// configured. An earlier version treated "no router" as "I can satisfy anything", which is
+/// true for a standalone node — every shard is `Led` — and false for a replica, which then
+/// answered `Linearizable` reads from a copy that was behind. The guarantee was a lie in
+/// exactly the deployment where it mattered.
+fn can_serve_read(
+    shard: ShardId,
+    consistency: ReadConsistency,
+    shards: &ShardManager,
+    services: &NodeServices,
+) -> bool {
+    match shards.mode(shard) {
+        // This node writes the shard, so it holds every acknowledged write by definition.
+        crate::shard::mode::ShardMode::Led => true,
+        crate::shard::mode::ShardMode::Followed => {
+            // Not leading a shard is not the same as replicating it. A node can be neither —
+            // it simply does not hold the shard — and such a node has an empty file that
+            // would answer "no such table", or worse, zero rows for a table that exists
+            // elsewhere. Having applied something is the evidence that a copy exists at all.
+            let have = local_position(shard, shards, services);
+            if have == 0 {
+                return false;
+            }
+            match consistency {
+                // Only the leader reflects every acknowledged write.
+                ReadConsistency::Linearizable => false,
+                // Any copy will do — including one still catching up.
+                ReadConsistency::Stale => true,
+                // Only if this copy has actually reached the position asked for.
+                ReadConsistency::AtLeastLsn(n) => have >= n,
+            }
+        }
+    }
 }
 
 /// The shard a request is about, if it is about one.
@@ -374,7 +453,11 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             shard: shards.route(&key).0,
         },
 
-        Request::Query { shard, statement } => match shards.query(ShardId(shard), statement) {
+        Request::Query {
+            shard,
+            statement,
+            consistency: _,
+        } => match shards.query(ShardId(shard), statement) {
             Ok(o) => outcome_to_response(o),
             Err(e) => error_response(e),
         },

@@ -120,6 +120,13 @@ pub enum Error {
     NotLeader { highest_seen: u64 },
 
     #[error(
+        "shard_{shard} on this node has reached LSN {have}, short of the {need} the read \
+         asked for, and there is no leader to forward to. Refusing rather than answering \
+         from a copy that does not meet the guarantee"
+    )]
+    TooStale { shard: u32, have: u64, need: u64 },
+
+    #[error(
         "no node currently owns {shard}: placement has not assigned it, or its owner is \
          unreachable. Writes to it cannot be routed until placement settles"
     )]

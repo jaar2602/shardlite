@@ -22,6 +22,25 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// comfortably above the chunk size while still refusing anything absurd.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// How fresh a read has to be.
+///
+/// The default is [`ReadConsistency::Linearizable`], and deliberately so: a caller that says
+/// nothing about freshness gets the strongest guarantee, not the fastest answer. A weaker
+/// default would silently hand stale rows to code that never considered the question.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// Any copy will do, however far behind. The cheapest read, and the only one a follower
+    /// can always answer.
+    Stale,
+    /// A copy that has applied at least this position. Lets a caller read its own writes
+    /// without pinning every read to the leader: remember the LSN a write returned, then ask
+    /// for at least that.
+    AtLeastLsn(u64),
+    /// The shard's current leader. The only level that reflects every acknowledged write.
+    #[default]
+    Linearizable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Request {
     /// First message on a connection.
@@ -31,7 +50,11 @@ pub enum Request {
         client: String,
     },
     /// Run a read against one shard.
-    Query { shard: u32, statement: Statement },
+    Query {
+        shard: u32,
+        statement: Statement,
+        consistency: ReadConsistency,
+    },
     /// Run a read across every shard, merged.
     QueryAll { statement: Statement },
     /// Run a write against one shard.
@@ -91,6 +114,14 @@ pub enum Response {
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+    },
+    /// No copy on this node is fresh enough for the level asked for, and the leader could not
+    /// be reached. Distinct from an error: the data exists, this node just cannot honour the
+    /// guarantee, and saying so beats returning rows that quietly break it.
+    TooStale {
+        shard: u32,
+        have: u64,
+        need: u64,
     },
     Changed {
         rows_affected: u64,

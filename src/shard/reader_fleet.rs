@@ -188,7 +188,7 @@ struct ThreadCtx {
 }
 
 fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
-    let mut open: Lru<Connection> = Lru::new(ctx.capacity);
+    let mut open: Lru<(Connection, u64)> = Lru::new(ctx.capacity);
 
     while let Ok(job) = rx.recv() {
         match job {
@@ -198,10 +198,16 @@ fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
                 reply,
             } => {
                 ctx.counters.queries.fetch_add(1, Ordering::Relaxed);
+                // Held for the whole read, opening included. Without it an apply could land
+                // between the staleness check and the query, and the connection this read is
+                // using would be looking at pages that no longer exist.
+                let access = ctx.modes.access(shard);
+                let guard = access.read();
                 let result = match ensure_shard(&mut open, &ctx, shard) {
                     Ok(conn) => run_with_deadline(conn, &statement, ctx.timeout, &ctx.counters),
                     Err(e) => Err(e),
                 };
+                drop(guard);
                 let _ = reply.send(result);
             }
             Job::Quiesce { shard, reply } => {
@@ -213,15 +219,26 @@ fn reader_loop(rx: flume::Receiver<Job>, ctx: ThreadCtx) {
 }
 
 fn ensure_shard<'a>(
-    open: &'a mut Lru<Connection>,
+    open: &'a mut Lru<(Connection, u64)>,
     ctx: &ThreadCtx,
     shard: ShardId,
 ) -> Result<&'a mut Connection> {
-    // Before anything, including the round trip to the writer: a followed shard must not be
-    // opened, and asking the writer to create it would be the wrong move too.
-    ctx.modes.check_may_open(shard)?;
+    ctx.modes.check_may_read(shard)?;
 
-    if !open.contains(shard) {
+    // A connection cached before the last apply is looking at pages that have since been
+    // rewritten — or, after a snapshot install, at a file that has been unlinked. Closing it
+    // is what clears both; nothing else would.
+    let access = ctx.modes.access(shard);
+    let generation = access.generation();
+    if open
+        .peek(shard)
+        .is_some_and(|(_, cached)| *cached != generation)
+    {
+        open.remove(shard);
+        access.note_reopen();
+    }
+
+    if !open.contains(shard) && ctx.modes.mode(shard) == super::mode::ShardMode::Led {
         // Cold shard. A read-only connection cannot *create* the database file, so a shard
         // that has never been written to cannot be opened by a reader at all — ask the
         // writer to bring it into existence first. Warm shards skip this entirely, so the
@@ -235,9 +252,9 @@ fn ensure_shard<'a>(
     let profile = ctx.profile.clone();
     let writers = ctx.writers.clone();
 
-    let (conn, event) = open.get_or_open(shard, move || -> Result<Connection> {
+    let (entry, event) = open.get_or_open(shard, move || -> Result<(Connection, u64)> {
         match open_reader_existing(&path, &profile) {
-            Ok(c) => Ok(c),
+            Ok(c) => Ok((c, generation)),
             Err(first) => {
                 // The shard may have gone away between `ensure_open` and here — another
                 // thread's eviction plus an unclean close can leave a `-wal` a read-only
@@ -247,7 +264,7 @@ fn ensure_shard<'a>(
                     return Err(first);
                 };
                 w.ensure_open(shard)?;
-                open_reader_existing(&path, &profile)
+                open_reader_existing(&path, &profile).map(|c| (c, generation))
             }
         }
     })?;
@@ -261,7 +278,7 @@ fn ensure_shard<'a>(
             .fetch_add(event.evicted, Ordering::Relaxed);
     }
 
-    Ok(conn)
+    Ok(&mut entry.0)
 }
 
 fn run_with_deadline(

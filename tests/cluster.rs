@@ -142,16 +142,21 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             Instant::now(),
         )
         .unwrap();
-        let cluster = Arc::new(ClusterNode::new(
-            id,
-            election,
-            Arc::clone(&fence),
-            peers,
-            Arc::clone(&manager) as Arc<dyn DurabilitySource>,
-            // Stage one of multi-write: a single leader takes every shard. Placement narrows
-            // this to a per-node assignment.
-            (0..2).map(ShardId).collect(),
-        ));
+        let cluster = Arc::new(
+            ClusterNode::new(
+                id,
+                election,
+                Arc::clone(&fence),
+                peers,
+                Arc::clone(&manager) as Arc<dyn DurabilitySource>,
+                (0..2).map(ShardId).collect(),
+            )
+            // These nodes hold no replicated copies, so marking ownership is all that is
+            // needed — there is no file to hand over, only a claim to drop. Without this the
+            // fence and the mode disagree, and a node with no copy answers reads for shards
+            // it does not own.
+            .with_modes(Arc::clone(manager.modes())),
+        );
 
         let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
         let server = Arc::new(
@@ -679,12 +684,15 @@ fn a_node_writes_only_the_shards_placement_gave_it() {
         );
     }
 
-    let gated: u64 = nodes
+    // Refused either by the write gate or by the ownership mark, depending on which guard
+    // saw it first. Both are real refusals and both are counted; what matters is that the
+    // refusal is visible rather than silently absorbed.
+    let refused: u64 = nodes
         .iter()
-        .map(|n| n.cluster.fence().stats().gated_writes)
+        .map(|n| n.cluster.fence().stats().gated_writes + n.manager.modes().refused_opens())
         .sum();
     assert!(
-        gated > 0,
+        refused > 0,
         "refusing a write to an unowned shard must be counted, not silently absorbed"
     );
 
@@ -981,4 +989,113 @@ fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
         ),
     }
     assert_eq!(router.stats().forwarded, 1);
+}
+
+/// A node with a follower attached, so weaker reads have a local copy to be answered from.
+#[test]
+fn read_consistency_levels_decide_where_a_read_is_answered() {
+    // The point of step 12: a caller trades freshness for not going to the leader. The levels
+    // are only meaningful if they actually route differently, so this checks the routing, not
+    // just that each returns rows.
+    use meshdb::net::ReadConsistency;
+
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    // A shard node 0 does not own, so the level actually decides something.
+    let elsewhere = (0..2u32)
+        .map(ShardId)
+        .find(|s| placement.owner(*s) != Some(nodes[0].id))
+        .expect("some shard should live elsewhere");
+    c.execute(elsewhere.0, "INSERT INTO t VALUES (1)").unwrap();
+
+    // Linearizable is forwarded to the owner and sees the write.
+    let strong = c
+        .query_with(
+            elsewhere.0,
+            "SELECT count(*) FROM t",
+            ReadConsistency::Linearizable,
+        )
+        .unwrap();
+    assert_eq!(strong.rows[0][0], meshdb::storage::Value::Integer(1));
+
+    // Stale is answerable by whichever node took the request. It must still be answered —
+    // the level is about freshness, not about failing.
+    let stale = c
+        .query_with(
+            elsewhere.0,
+            "SELECT count(*) FROM t",
+            ReadConsistency::Stale,
+        )
+        .unwrap();
+    assert!(
+        stale.rows[0][0] == meshdb::storage::Value::Integer(0)
+            || stale.rows[0][0] == meshdb::storage::Value::Integer(1),
+        "a stale read may lag but must be a real answer: {:?}",
+        stale.rows[0][0]
+    );
+
+    // AtLeastLsn beyond anything this node holds cannot be answered locally, so it is
+    // forwarded to the owner — which does hold it.
+    let bounded = c
+        .query_with(
+            elsewhere.0,
+            "SELECT count(*) FROM t",
+            ReadConsistency::AtLeastLsn(1),
+        )
+        .unwrap();
+    assert_eq!(
+        bounded.rows[0][0],
+        meshdb::storage::Value::Integer(1),
+        "a bounded-staleness read must not be answered by a copy that is behind it"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
+fn the_default_read_level_is_the_strong_one() {
+    // A caller that says nothing about freshness must get the strongest guarantee. The
+    // opposite default would hand stale rows to code that never considered the question, and
+    // it would do it silently.
+    use meshdb::net::ReadConsistency;
+    assert_eq!(ReadConsistency::default(), ReadConsistency::Linearizable);
+
+    let nodes = cluster(3);
+    let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    let elsewhere = (0..2u32)
+        .map(ShardId)
+        .find(|s| placement.owner(*s) != Some(nodes[0].id))
+        .expect("some shard should live elsewhere");
+
+    for i in 1..=5 {
+        c.execute(elsewhere.0, format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
+    }
+
+    // Plain `query` must see every acknowledged write, which means it went to the owner.
+    let rows = c.query(elsewhere.0, "SELECT count(*) FROM t").unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        meshdb::storage::Value::Integer(5),
+        "the default read must reflect every acknowledged write"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
 }

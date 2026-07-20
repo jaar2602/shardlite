@@ -48,6 +48,13 @@ impl Promotion {
         fence: Arc<Fence>,
         shards: Vec<ShardId>,
     ) -> Self {
+        // Connect the replication path to the reader coordination. Without this, applies
+        // neither exclude readers nor invalidate their cached connections, and a reader on a
+        // followed shard is served from a page cache frozen at whenever it first connected —
+        // silently, and forever.
+        replica
+            .follower()
+            .coordinate_with(Arc::clone(manager.modes()));
         Self {
             manager,
             replica,

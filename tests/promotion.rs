@@ -162,31 +162,133 @@ fn replicant_with_shards(p: &Primary, shards: u32) -> Replicant {
 }
 
 #[test]
-fn a_followed_shard_cannot_be_opened_by_sqlite() {
-    // The invariant, enforced where connections are opened. Without it, a read here would
-    // succeed and go on serving stale pages after the follower rewrote the file.
+fn a_followed_shard_refuses_writes_but_serves_reads() {
+    // The asymmetry that makes read scale-out possible. Writes on a followed shard are
+    // refused outright — two writers on one file is the corruption everything else guards
+    // against. Reads are allowed, because `ShardAccess` excludes them from applies and
+    // invalidates their cached connections afterwards, which is what makes them safe.
     let p = primary(2);
     let r = replicant(&p);
     r.promotion.follow().unwrap();
 
-    assert_eq!(r.manager.mode(S0), ShardMode::Followed);
+    // Give the follower something to hold. A shard it has never received has no file at all,
+    // and a read then fails for that reason rather than this one.
+    let stop = r.replica.stop_handle();
+    let r2 = Arc::clone(&r.replica);
+    std::thread::spawn(move || {
+        let _ = r2.run();
+    });
+    let mut c = Client::connect(&p.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    for i in 1..=20 {
+        p.manager
+            .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(50));
 
-    let read = r
-        .manager
-        .query(S0, Statement::new("SELECT count(*) FROM sqlite_schema"));
-    let err = read.expect_err("a read on a followed shard must be refused");
-    assert!(err.to_string().contains("followed"), "{err}");
+    assert_eq!(r.manager.mode(S0), ShardMode::Followed);
 
     let write = r
         .manager
-        .execute_one(S0, Statement::new("CREATE TABLE x (a INTEGER)"));
+        .execute_one(S0, Statement::new("INSERT INTO t VALUES (999)"));
     assert!(
         write.is_err(),
-        "and a write on a followed shard must be refused too"
+        "a write on a followed shard must be refused"
     );
     assert!(
         r.manager.modes().refused_opens() > 0,
-        "refusals are counted"
+        "the refused write must be counted"
+    );
+
+    // And the read is served — from the follower's own replicated copy.
+    let read = r
+        .manager
+        .query(S0, Statement::new("SELECT count(*) FROM t"))
+        .expect("a followed shard must serve reads");
+    assert_eq!(scalar(read), Value::Integer(20));
+}
+
+#[test]
+fn a_read_never_sees_a_follower_mid_apply() {
+    // The protocol's real job. Without the lock a read can land while pages are being
+    // rewritten; without the generation it can be served from a connection whose cache
+    // predates them. Either way the rows returned describe a state that never existed.
+    let p = primary(2);
+    let r = replicant(&p);
+    r.promotion.follow().unwrap();
+
+    let stop = r.replica.stop_handle();
+    let r2 = Arc::clone(&r.replica);
+    std::thread::spawn(move || {
+        let _ = r2.run();
+    });
+
+    let mut c = Client::connect(&p.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+
+    // Read continuously while the primary writes and the follower applies.
+    let reader_mgr = Arc::clone(&r.manager);
+    let reading = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = Arc::clone(&reading);
+    let checker = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while flag.load(Ordering::Relaxed) {
+            if let Ok(out) = reader_mgr.query(S0, Statement::new("SELECT count(*) FROM t"))
+                && let Value::Integer(n) = scalar(out)
+            {
+                seen.push(n);
+            }
+        }
+        seen
+    });
+
+    for i in 1..=60 {
+        p.manager
+            .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    reading.store(false, Ordering::Relaxed);
+    let seen = checker.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+
+    assert!(!seen.is_empty(), "the reader should have seen something");
+    // Counts must only ever go up. A read served from a stale cache, or taken across an
+    // apply, would show the count going backwards — data appearing to vanish.
+    for w in seen.windows(2) {
+        assert!(
+            w[1] >= w[0],
+            "a follower read went backwards, {} then {}: the reader saw a state that never \
+             existed. Sequence: {seen:?}",
+            w[0],
+            w[1]
+        );
+    }
+    // Monotonicity alone is not enough: a reader frozen on a stale cached connection returns
+    // the same number forever, which is perfectly monotonic and completely wrong. It must
+    // actually catch up.
+    assert_eq!(
+        seen.last().copied(),
+        Some(60),
+        "the follower's readers never caught up — a reader pinned to a stale connection \
+         reports a constant value, which passes a monotonicity check while being wrong. \
+         Saw {} distinct values, last {:?}",
+        {
+            let mut d = seen.clone();
+            d.dedup();
+            d.len()
+        },
+        seen.last()
+    );
+    println!(
+        "{} reads, values progressed to {:?}",
+        seen.len(),
+        seen.last()
     );
 }
 
@@ -278,11 +380,14 @@ fn demotion_closes_connections_rather_than_merely_stopping_writes() {
         r.manager.modes().closed_on_handover()
     );
 
+    // Reads still work — that is the point of the handover protocol, not a hole in it — but
+    // they are served by a *fresh* connection, which the count above establishes. The old
+    // handle is gone, and with it the stale page cache and the risk of a deleted inode.
     assert!(
         r.manager
             .query(S0, Statement::new("SELECT count(*) FROM t"))
-            .is_err(),
-        "a reader must not keep serving a followed shard from a cached connection"
+            .is_ok(),
+        "a followed shard should still serve reads after the handover"
     );
     assert!(
         !r.fence.is_open(S0),
@@ -490,4 +595,95 @@ fn applying_the_same_placement_twice_changes_nothing() {
         "repeating an unchanged placement must not churn connections"
     );
     assert!(r.fence.is_open(ShardId(0)) && r.fence.is_open(ShardId(1)));
+}
+
+#[test]
+fn a_stale_read_is_answered_by_the_replica_and_a_strong_one_is_not() {
+    // The levels only mean something if they route differently. Here the replica genuinely
+    // holds the shard, so a weak read can be served from it while a strong one cannot.
+    use meshdb::net::ReadConsistency;
+    use meshdb::net::protocol::{Request, Response};
+
+    let p = primary(2);
+    let r = replicant(&p);
+    r.promotion.follow().unwrap();
+
+    // A server in front of the replica, told about its follower so it can report how far
+    // behind its copy is.
+    let server = Arc::new(
+        Server::bind_with(
+            Arc::clone(&r.manager),
+            NodeServices {
+                follower: Some(Arc::clone(r.replica.follower())),
+                ..Default::default()
+            },
+            ServerConfig {
+                addr: "127.0.0.1:0".into(),
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let replica_addr = server.local_addr().unwrap().to_string();
+    let s = Arc::clone(&server);
+    std::thread::spawn(move || {
+        let _ = s.serve();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let stop = r.replica.stop_handle();
+    let r2 = Arc::clone(&r.replica);
+    std::thread::spawn(move || {
+        let _ = r2.run();
+    });
+
+    let mut c = Client::connect(&p.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    for i in 1..=30 {
+        p.manager
+            .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    stop.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut rc = Client::connect(&replica_addr).unwrap();
+
+    // Stale: the replica answers from its own copy.
+    let stale = rc
+        .query_with(0, "SELECT count(*) FROM t", ReadConsistency::Stale)
+        .expect("a replica must answer a stale read");
+    assert_eq!(stale.rows[0][0], Value::Integer(30));
+
+    // AtLeastLsn within what it holds: also answered locally.
+    let applied = r.replica.follower().position(S0).applied_lsn;
+    assert!(applied > 0, "the replica should have applied something");
+    let bounded = rc
+        .query_with(
+            0,
+            "SELECT count(*) FROM t",
+            ReadConsistency::AtLeastLsn(applied),
+        )
+        .expect("a bounded read within what the replica holds must be answered");
+    assert_eq!(bounded.rows[0][0], Value::Integer(30));
+
+    // Beyond what it holds, and with no router to forward to, it must refuse rather than
+    // answer from a copy that is behind the guarantee asked for.
+    let too_new = rc.request(Request::Query {
+        shard: 0,
+        statement: Statement::new("SELECT count(*) FROM t"),
+        consistency: ReadConsistency::AtLeastLsn(applied + 10_000),
+    });
+    match too_new {
+        Err(e) => assert!(
+            !e.to_string().is_empty(),
+            "a read past what this copy holds must not be answered"
+        ),
+        Ok(Response::Rows { .. }) => {
+            panic!("a copy behind the requested position answered anyway — the guarantee is a lie")
+        }
+        Ok(_) => {}
+    }
 }

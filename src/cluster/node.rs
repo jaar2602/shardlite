@@ -88,6 +88,11 @@ pub struct ClusterNode {
     /// replication configured — there is then no other writer competing for the files, so
     /// opening and closing gates is the whole of ownership.
     ownership: Option<Arc<super::promotion::Promotion>>,
+    /// Per-shard ownership marks. Kept in step with placement even when no `Promotion` is
+    /// attached, so a node cannot claim to lead a shard the map gave to someone else — the
+    /// fence and the mode saying different things is how a read gets answered by a node with
+    /// no copy.
+    modes: Option<Arc<crate::shard::mode::ShardModes>>,
     /// Peers that answered the most recent heartbeat round. The coordinator assigns shards
     /// only to members it can currently reach — a shard assigned to a node that is gone has
     /// no leader at all, which is worse than an uneven spread.
@@ -122,6 +127,7 @@ impl ClusterNode {
             shards,
             placement: Mutex::new(Placement::default()),
             ownership: None,
+            modes: None,
             live: Mutex::new(std::collections::BTreeSet::new()),
             peer_timeout,
             counters: Counters::default(),
@@ -136,6 +142,15 @@ impl ClusterNode {
     /// pages.
     pub fn with_ownership(mut self, promotion: Arc<super::promotion::Promotion>) -> Self {
         self.ownership = Some(promotion);
+        self
+    }
+
+    /// Keep shard ownership marks in step with placement without a full handover.
+    ///
+    /// For a node that holds no replicated copies, marking is all that is needed: there is no
+    /// file to hand over, only a claim to drop.
+    pub fn with_modes(mut self, modes: Arc<crate::shard::mode::ShardModes>) -> Self {
+        self.modes = Some(modes);
         self
     }
 
@@ -234,7 +249,23 @@ impl ClusterNode {
                     *self.placement.lock().expect("placement mutex") = Placement::default();
                 }
             }
-            None => self.fence.open_for(&mine, p.term),
+            None => {
+                if let Some(modes) = &self.modes {
+                    use crate::shard::mode::ShardMode;
+                    for &shard in p.assignments.keys() {
+                        let ours = mine.contains(&shard);
+                        modes.set(
+                            shard,
+                            if ours {
+                                ShardMode::Led
+                            } else {
+                                ShardMode::Followed
+                            },
+                        );
+                    }
+                }
+                self.fence.open_for(&mine, p.term)
+            }
         }
     }
 

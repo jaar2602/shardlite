@@ -34,9 +34,9 @@ no unpatched design escapes that, so concurrency for writers comes from sharding
 | 9 | Divergence detection | **done (content hash; merkle deferred)** | `tests/verify.rs` (4) + `src/storage/verify.rs` (12) |
 | 10 | Cluster: election, fencing, failover | **done** | `tests/cluster.rs` (10) + `tests/quorum.rs` (5) + `tests/promotion.rs` (5) + `src/cluster/` (44) |
 | 11 | Shard placement + move | **done** | `tests/cluster.rs` (16) + `src/cluster/placement.rs` (7) + `src/net/forward.rs` |
-| 12 | Read consistency levels | not started | |
+| 12 | Read consistency levels | **done** | `tests/promotion.rs` (11) + `tests/cluster.rs` (18) |
 
-**249 Rust tests + 41 CLI assertions. Clippy clean, fmt clean. No known flaky tests.**
+**253 Rust tests + 41 CLI assertions. Clippy clean, fmt clean. No known flaky tests.**
 
 ---
 
@@ -754,6 +754,42 @@ coordinator owns every shard. Once placement spread them that stopped being true
 kept passing **only by racing the first placement round** — so they surfaced as intermittent
 failures under parallel load, not as honest breakage. When an invariant changes, the tests
 that quietly still pass are the ones to go looking at.
+
+### Step 12: follower reads, then consistency levels
+
+**Follower reads came first, and the approach was chosen on a measurement.** Applying frames
+through SQLite's own WAL is the eventual answer and the riskiest change available — it means
+rewriting the code Stage 0 was gated on. The alternative, invalidate-on-apply, was measured
+first: reopening a read connection costs **~8 us**, and a query through a fresh connection
+23 us against 2 us on a persistent one. An apply costs an fsync — about 1.5 ms on container
+storage — so the reopen is under 1% of the work it follows, and only the first read after
+each apply pays it. That settled it.
+
+`ShardAccess` supplies the two things SQLite is not getting for itself: **exclusion** (applies
+take the lock, reads share it, so no read is in flight while pages are rewritten or a file
+renamed) and a **generation** (bumped by every apply, so a connection from an older one is
+closed rather than reused — which clears the stale page cache and, after a snapshot install,
+the handle to the deleted inode).
+
+**Levels.** `Stale`, `AtLeastLsn(n)`, `Linearizable`, defaulting to `Linearizable`: a caller
+that says nothing about freshness gets the strongest guarantee, not the fastest answer.
+
+**Three bugs found while testing, all the same shape** — claiming a guarantee that could not
+be met:
+
+| Bug | Consequence |
+|---|---|
+| `coordinate_with` was never wired | Applies neither excluded readers nor invalidated them, so a follower's readers were pinned to a page cache frozen at first connect. The test caught it only because I read the output: `final count Some(1)` after 60 rows. Monotonicity alone passed — a frozen reader returns the same number forever, which is perfectly monotonic and completely wrong. |
+| "No router" meant "I satisfy every level" | True for a standalone node, where every shard is `Led`; false for a replica, which then answered `Linearizable` from a copy that was behind. Ownership now comes from the shard's mode, not from whether a router is configured. |
+| "Not leading" was treated as "replicating" | A node can be neither. Such a node has an empty file and would answer `no such table`, or zero rows for a table that exists elsewhere. A weaker read is now served locally only with evidence a copy exists. |
+
+When a level cannot be honoured and there is nowhere to forward to, the answer is
+`TooStale { have, need }` — refusing rather than returning rows that quietly break the
+guarantee.
+
+**Placement now also keeps shard modes in step**, not just the write gate. Previously a node
+that owned nothing still reported mode `Led`; the fence and the mode disagreed, which is what
+let a node with no copy answer reads for shards it did not hold.
 
 ### The flaky checkpoint test: root-caused and fixed
 
