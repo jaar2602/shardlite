@@ -283,6 +283,28 @@ fn the_gateway_refuses_auth_without_transport_security() {
     assert!(err.to_string().contains("transport security"), "{err}");
 }
 
+#[test]
+fn bearer_token_authenticates_the_same_as_basic() {
+    // The alternative scheme: Bearer base64(name:secret). Same verification, no browser
+    // login prompt — the option a programmatic client picks.
+    let auth = AuthConfig::new().user("api", "tok", Role::Read);
+    let g = gateway(Some(auth), true);
+
+    let bearer = format!("Bearer {}", b64(b"api:tok"));
+    let ok = ureq::get(&format!("{}/v1/info", g.base))
+        .set("Authorization", &bearer)
+        .call()
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // A wrong token under Bearer is refused just the same.
+    let bad = ureq::get(&format!("{}/v1/info", g.base))
+        .set("Authorization", &format!("Bearer {}", b64(b"api:wrong")))
+        .call()
+        .unwrap_err();
+    assert!(matches!(bad, ureq::Error::Status(401, _)), "{bad}");
+}
+
 fn basic(user: &str, secret: &str) -> String {
     use std::fmt::Write;
     // Minimal base64 encode for the test's Basic header.
@@ -316,4 +338,160 @@ fn b64(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[test]
+fn stats_schema_route_and_execute_all_endpoints() {
+    let g = gateway(None, false);
+    // Create the table via the HTTP execute_all endpoint (the rolling, version-bumping DDL
+    // path), so this also exercises /v1/execute_all end to end.
+    let all: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{}/v1/execute_all", g.base))
+            .send_string(
+                &serde_json::json!({"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"})
+                    .to_string(),
+            )
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        all["shards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["ok"] == true)
+    );
+
+    // stats
+    let stats: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/stats", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(stats["reader"]["threads"].as_u64().unwrap() >= 1);
+    assert!(stats["http"]["requests"].as_u64().unwrap() >= 1);
+
+    // schema version
+    let sch: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/schema/0", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sch["shard"], 0);
+    assert_eq!(
+        sch["schema_version"].as_i64().unwrap(),
+        1,
+        "the execute_all DDL should have advanced the schema version"
+    );
+
+    // route: a key maps to some shard
+    let route: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{}/v1/route", g.base))
+            .send_string(&serde_json::json!({"key":"alice"}).to_string())
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(route["shard"].is_number());
+
+    // cluster: standalone reports clustered:false
+    let cl: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/cluster", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cl["clustered"], false);
+}
+
+#[test]
+fn frames_endpoint_decodes_the_wal() {
+    let g = gateway(None, false);
+    ddl(&g, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT");
+    g.manager
+        .execute_one(ShardId(0), Statement::new("INSERT INTO t VALUES (1)"))
+        .unwrap();
+
+    let f: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/frames/0", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(f["wal"], true);
+    assert!(f["transactions"].as_u64().unwrap() >= 1);
+    assert_eq!(f["page_size"], 4096);
+}
+
+#[test]
+fn user_management_over_http() {
+    let auth =
+        AuthConfig::new()
+            .user("boss", "bosspw", Role::Admin)
+            .user("app", "apppw", Role::Write);
+    let g = gateway(Some(auth), true);
+
+    // Admin lists users.
+    let list: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/users", g.base))
+            .set("Authorization", &basic("boss", "bosspw"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(list["users"].as_array().unwrap().len(), 2);
+
+    // Admin creates a user, who can then authenticate.
+    ureq::post(&format!("{}/v1/users", g.base))
+        .set("Authorization", &basic("boss", "bosspw"))
+        .send_string(&serde_json::json!({"name":"newbie","secret":"npw","role":"read"}).to_string())
+        .unwrap();
+    let info = ureq::get(&format!("{}/v1/info", g.base))
+        .set("Authorization", &basic("newbie", "npw"))
+        .call()
+        .unwrap();
+    assert_eq!(info.status(), 200);
+
+    // Admin cannot mint a cluster credential over the wire.
+    let cluster_attempt = ureq::post(&format!("{}/v1/users", g.base))
+        .set("Authorization", &basic("boss", "bosspw"))
+        .send_string(&serde_json::json!({"name":"peer","secret":"x","role":"cluster"}).to_string())
+        .unwrap_err();
+    assert!(
+        matches!(cluster_attempt, ureq::Error::Status(400, _)),
+        "{cluster_attempt}"
+    );
+
+    // A non-admin cannot manage users.
+    let refused = ureq::get(&format!("{}/v1/users", g.base))
+        .set("Authorization", &basic("app", "apppw"))
+        .call()
+        .unwrap_err();
+    assert!(matches!(refused, ureq::Error::Status(403, _)), "{refused}");
+
+    // Admin drops the new user, who is then denied.
+    ureq::delete(&format!("{}/v1/users/newbie", g.base))
+        .set("Authorization", &basic("boss", "bosspw"))
+        .call()
+        .unwrap();
+    let denied = ureq::get(&format!("{}/v1/info", g.base))
+        .set("Authorization", &basic("newbie", "npw"))
+        .call()
+        .unwrap_err();
+    assert!(matches!(denied, ureq::Error::Status(401, _)), "{denied}");
 }

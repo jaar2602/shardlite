@@ -176,6 +176,34 @@ impl HttpGateway {
             (Method::Post, "/v1/tx") => {
                 return self.handle_tx(req, role);
             }
+            (Method::Post, "/v1/execute_all") => {
+                return self.handle_execute_all(req, role);
+            }
+            (Method::Post, "/v1/route") => {
+                return self.handle_route(req, role);
+            }
+            (Method::Get, "/v1/stats") => {
+                self.route(&req, role, Requirement::Read, || self.stats_json())
+            }
+            (Method::Get, "/v1/cluster") => {
+                self.route(&req, role, Requirement::Read, || self.cluster_json())
+            }
+            (Method::Get, p) if p.starts_with("/v1/schema/") => {
+                self.schema_route(role, p.trim_start_matches("/v1/schema/"))
+            }
+            (Method::Get, p) if p.starts_with("/v1/frames/") => {
+                self.frames_route(role, p.trim_start_matches("/v1/frames/"))
+            }
+            (Method::Get, "/v1/users") => {
+                return self.handle_list_users(req, role);
+            }
+            (Method::Post, "/v1/users") => {
+                return self.handle_create_user(req, role);
+            }
+            (Method::Delete, p) if p.starts_with("/v1/users/") => {
+                let name = p.trim_start_matches("/v1/users/").to_string();
+                return self.handle_drop_user(req, role, name);
+            }
             _ => Err(HttpError::new(404, "no such endpoint")),
         };
 
@@ -233,8 +261,10 @@ impl HttpGateway {
         let Some(auth) = self.services.auth.as_ref().filter(|a| !a.is_empty()) else {
             return Ok(None);
         };
-        let Some((name, secret)) = basic_credentials(req) else {
-            return Err(auth_challenge("authentication required (HTTP Basic)"));
+        let Some((name, secret)) = http_credentials(req) else {
+            return Err(auth_challenge(
+                "authentication required (Authorization: Basic or Bearer, base64 of name:secret)",
+            ));
         };
         let nonce = auth::nonce()
             .map_err(|_| json_response(500, &serde_json::json!({ "error": "entropy failure" })))?;
@@ -379,6 +409,171 @@ impl HttpGateway {
         });
         respond_json(req, out);
     }
+
+    fn handle_execute_all(&self, mut req: Request, role: Option<Role>) {
+        let out = self.check(role, Requirement::Admin).and_then(|()| {
+            let body = read_body(&mut req)?;
+            let q: SqlBody = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            let resp = super::server::handle(
+                super::protocol::Request::ExecuteAll {
+                    statement: Statement::new(&q.sql),
+                },
+                &self.shards,
+                &self.services,
+            );
+            Ok(response_to_http(resp))
+        });
+        respond_json(req, out);
+    }
+
+    fn handle_route(&self, mut req: Request, role: Option<Role>) {
+        let out = self.check(role, Requirement::Read).and_then(|()| {
+            let body = read_body(&mut req)?;
+            let k: KeyBody = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            let resp = super::server::handle(
+                super::protocol::Request::Route {
+                    key: k.key.into_bytes(),
+                },
+                &self.shards,
+                &self.services,
+            );
+            Ok(response_to_http(resp))
+        });
+        respond_json(req, out);
+    }
+
+    fn handle_list_users(&self, req: Request, role: Option<Role>) {
+        let out = self.check(role, Requirement::Admin).map(|()| {
+            response_to_http(super::server::handle(
+                super::protocol::Request::ListUsers,
+                &self.shards,
+                &self.services,
+            ))
+        });
+        respond_json(req, out);
+    }
+
+    fn handle_create_user(&self, mut req: Request, role: Option<Role>) {
+        let out = self.check(role, Requirement::Admin).and_then(|()| {
+            let body = read_body(&mut req)?;
+            let u: CreateUserBody = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            let parsed: Role = u
+                .role
+                .parse()
+                .map_err(|e: Error| HttpError::new(400, &e.to_string()))?;
+            // The key is derived here so the secret is never forwarded to the core; the
+            // cluster-role refusal lives in handle(), the single place that rule is enforced.
+            let resp = super::server::handle(
+                super::protocol::Request::CreateUser {
+                    name: u.name,
+                    key: auth::derive_key(&u.secret),
+                    role: parsed,
+                },
+                &self.shards,
+                &self.services,
+            );
+            Ok(response_to_http(resp))
+        });
+        respond_json(req, out);
+    }
+
+    fn handle_drop_user(&self, req: Request, role: Option<Role>, name: String) {
+        let out = self.check(role, Requirement::Admin).map(|()| {
+            response_to_http(super::server::handle(
+                super::protocol::Request::DropUser { name },
+                &self.shards,
+                &self.services,
+            ))
+        });
+        respond_json(req, out);
+    }
+
+    fn schema_route(
+        &self,
+        role: Option<Role>,
+        shard_str: &str,
+    ) -> std::result::Result<serde_json::Value, HttpError> {
+        self.check(role, Requirement::Read)?;
+        let shard: u32 = shard_str
+            .parse()
+            .map_err(|_| HttpError::new(400, "shard must be a number"))?;
+        let version = self
+            .shards
+            .schema_version(crate::shard::ShardId(shard))
+            .map_err(|e| error_to_http(&e))?;
+        Ok(serde_json::json!({ "shard": shard, "schema_version": version }))
+    }
+
+    fn frames_route(
+        &self,
+        role: Option<Role>,
+        shard_str: &str,
+    ) -> std::result::Result<serde_json::Value, HttpError> {
+        self.check(role, Requirement::Admin)?;
+        let shard: u32 = shard_str
+            .parse()
+            .map_err(|_| HttpError::new(400, "shard must be a number"))?;
+        let db = crate::shard::ShardId(shard).path(self.shards.dir());
+        let wal = crate::storage::checkpoint::wal_path_for(&db);
+        let bytes = std::fs::read(&wal).unwrap_or_default();
+        let report = crate::vfs::inspect_wal(&bytes);
+        Ok(frames_json(&report))
+    }
+
+    fn stats_json(&self) -> serde_json::Value {
+        let w = self.shards.writer_stats();
+        let r = self.shards.reader_stats();
+        serde_json::json!({
+            "writer": {
+                "batches": w.batches, "requests": w.requests, "max_batch": w.max_batch,
+                "open_now": w.open_now, "threads": w.threads,
+            },
+            "reader": {
+                "queries": r.queries, "rejected_busy": r.rejected_busy,
+                "timed_out": r.timed_out, "threads": r.threads,
+            },
+            "http": {
+                "requests": self.counters.requests.load(Ordering::Relaxed),
+                "errors": self.counters.errors.load(Ordering::Relaxed),
+                "auth_failures": self.counters.auth_failures.load(Ordering::Relaxed),
+                "authz_refused": self.counters.authz_refused.load(Ordering::Relaxed),
+            },
+        })
+    }
+
+    fn cluster_json(&self) -> serde_json::Value {
+        match self.services.cluster.as_ref() {
+            None => {
+                serde_json::json!({ "clustered": false, "shard_count": self.shards.shard_count() })
+            }
+            Some(c) => {
+                let p = c.placement();
+                let assignments: serde_json::Map<String, serde_json::Value> = p
+                    .assignments
+                    .iter()
+                    .map(|(s, n)| (s.0.to_string(), serde_json::json!(n)))
+                    .collect();
+                let s = c.stats();
+                serde_json::json!({
+                    "clustered": true,
+                    "node": c.id(),
+                    "term": c.term(),
+                    "role": format!("{:?}", c.role()).to_lowercase(),
+                    "leader": c.leader(),
+                    "led_shards": c.led_shards().iter().map(|s| s.0).collect::<Vec<_>>(),
+                    "placement": { "term": p.term, "assignments": assignments },
+                    "stats": {
+                        "elections_started": s.elections_started, "became_leader": s.became_leader,
+                        "stepped_down": s.stepped_down, "heartbeats_sent": s.heartbeats_sent,
+                        "peer_unreachable": s.peer_unreachable, "handover_failed": s.handover_failed,
+                    },
+                })
+            }
+        }
+    }
 }
 
 // ---- request bodies ----
@@ -404,6 +599,18 @@ struct StmtBody {
     sql: String,
     #[serde(default)]
     params: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct KeyBody {
+    key: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CreateUserBody {
+    name: String,
+    secret: String,
+    role: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -476,6 +683,23 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
+/// A WAL inspection report as JSON, matching the `meshdb frames` view.
+fn frames_json(report: &crate::vfs::WalReport) -> serde_json::Value {
+    match &report.header {
+        None => serde_json::json!({ "wal": false, "file_bytes": report.file_bytes }),
+        Some(h) => serde_json::json!({
+            "wal": true,
+            "file_bytes": report.file_bytes,
+            "page_size": h.page_size,
+            "salt": h.salt.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "frames": report.frames.len(),
+            "transactions": report.transactions(),
+            "uncommitted_frames": report.uncommitted_frames(),
+            "leftover_frames": report.frames.iter().filter(|f| !f.current).count(),
+        }),
+    }
+}
+
 /// A native `Response` → (HTTP status, JSON) for the bounded (non-streaming) endpoints. The
 /// status reflects the outcome: a rejected statement is a 400, not a 200 with an error body.
 fn response_to_http(resp: super::protocol::Response) -> (u16, serde_json::Value) {
@@ -523,6 +747,9 @@ fn response_json_body(resp: super::protocol::Response) -> serde_json::Value {
         }
         R::TooStale { shard, have, need } => serde_json::json!({
             "error": "too stale", "shard": shard, "have": have, "need": need,
+        }),
+        R::Users { users } => serde_json::json!({
+            "users": users.iter().map(|(n, r)| serde_json::json!({ "name": n, "role": r.to_string() })).collect::<Vec<_>>(),
         }),
         R::Rejected { message } => serde_json::json!({ "error": message, "rejected": true }),
         R::Error { message, retryable } => {
@@ -697,15 +924,23 @@ fn respond_json(req: Request, out: std::result::Result<(u16, serde_json::Value),
     let _ = req.respond(resp);
 }
 
-/// Decode the username and secret from an HTTP Basic `Authorization` header.
-fn basic_credentials(req: &Request) -> Option<(String, String)> {
+/// Decode `name` and `secret` from an `Authorization` header.
+///
+/// Accepts two schemes, both carrying `base64(name:secret)` — the caller picks:
+/// - `Basic` — the standard browser-friendly form; a browser will prompt for it.
+/// - `Bearer` — the same payload under the bearer scheme, which programmatic clients often
+///   prefer because it does not trigger a browser login dialog. The "token" is the secret; the
+///   verification is identical either way.
+fn http_credentials(req: &Request) -> Option<(String, String)> {
     let header = req
         .headers()
         .iter()
         .find(|h| h.field.equiv("Authorization"))?;
     let value = header.value.as_str();
-    let b64 = value.strip_prefix("Basic ")?;
-    let decoded = base64_decode(b64)?;
+    let b64 = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("Bearer "))?;
+    let decoded = base64_decode(b64.trim())?;
     let text = String::from_utf8(decoded).ok()?;
     let (name, secret) = text.split_once(':')?;
     Some((name.to_string(), secret.to_string()))

@@ -807,21 +807,26 @@ reader early when the consumer drops. The bounded channel *is* the backpressure 
 client throttles the reader rather than filling memory. (This also gave the core a streaming
 read it never had; even the native path materialised and was capped at the 16 MB frame limit.)
 
-Endpoints: `/v1/info`, `/v1/query` (streaming), `/v1/query_all`, `/v1/execute`, `/v1/tx`
-(atomic, durable). Each maps to the existing `Request` and reuses routing, forwarding, and the
-reader fleet unchanged. Native `Response` maps to a faithful HTTP status (a rejected statement
-is 400, not 200 — caught by a test).
+Endpoints (all of Phase 1): `/v1/info`, `/v1/query` (streaming), `/v1/query_all`,
+`/v1/execute`, `/v1/tx` (atomic+durable), `/v1/execute_all` (rolling DDL), `/v1/route`,
+`/v1/schema/{shard}`, `/v1/stats`, `/v1/cluster` (topology + placement), `/v1/frames/{shard}`
+(the WAL inspector as JSON), and `/v1/users` (GET/POST/DELETE, admin). Each maps to the
+existing `Request` and reuses routing, forwarding, the reader fleet, and the user store
+unchanged. Native `Response` maps to a faithful HTTP status (a rejected statement is 400, not
+200 — caught by a test).
 
 **Security posture enforced at startup, not documented and hoped for:** HTTP Basic →
 the same challenge-response verification the native handshake uses (secret → keyed proof
 against a fresh nonce; byte-identical). Roles apply unchanged (`Read`/`Write`/`Admin`). And the
 gateway **refuses to start with auth enabled but no transport security** unless `--http-insecure`
-is passed — because Basic over plaintext leaks secrets. Both the posture and the status mapping
-are revert-verified.
+is passed — because a credential over plaintext leaks. Both the posture and the status mapping
+are revert-verified. Two credential schemes are accepted, the caller's choice: `Basic`
+(browser-friendly) and `Bearer` (same `base64(name:secret)` payload, no browser login prompt —
+what programmatic clients prefer).
 
 CLI: `meshdb serve <dir> --http ADDR [--http-insecure]` runs the gateway alongside the native
-TCP server on one core. Remaining for later phases: `/v1/cluster`, `/v1/users`, `/v1/frames`,
-cross-language drivers, and the standalone console.
+TCP server on one core. Remaining for later phases: cross-language drivers and the standalone
+console (Phases 2-3).
 
 ### Frame inspection: `meshdb frames`
 
