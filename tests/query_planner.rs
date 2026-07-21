@@ -162,6 +162,39 @@ fn grouped_ordering_and_limit_match_a_single_shard() {
 }
 
 #[test]
+fn grouped_having_matches_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // HAVING filters complete groups on the coordinator. Compared as multisets against native
+    // SQLite. The NULL bucket (n NULL every 17th row → ~24 rows) is smaller than the others
+    // (~38), so a `count(*) > 30` threshold is genuinely selective.
+    for sql in [
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 HAVING count(*) > 30",
+        // The HAVING aggregate need not be selected.
+        "SELECT n % 10 FROM t GROUP BY n % 10 HAVING count(*) > 30",
+        "SELECT n % 10, sum(n) FROM t GROUP BY n % 10 HAVING sum(n) > 15000 AND count(*) > 30",
+        "SELECT n % 10, avg(n) FROM t GROUP BY n % 10 HAVING avg(n) >= 450",
+        "SELECT n % 7, min(n), max(n) FROM t GROUP BY n % 7 HAVING max(n) > 950 OR min(n) < 20",
+        "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING NOT count(*) < 30",
+        // HAVING on the grouping column, including its expression form and NULL handling.
+        "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING n % 10 IS NOT NULL",
+        "SELECT n % 5, count(*) FROM t GROUP BY n % 5 HAVING (n % 5) <> 0",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // HAVING composes with ORDER BY / LIMIT (deterministic — the group key is unique per row).
+    for sql in [
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 HAVING count(*) > 30 ORDER BY b",
+        "SELECT n % 10 AS b, sum(n) AS s FROM t GROUP BY n % 10 HAVING sum(n) > 10000 \
+         ORDER BY b DESC LIMIT 3",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
 fn grouped_answers_are_invariant_to_shard_count() {
     // The merge iterates groups in key order, so a grouped answer is deterministic regardless of
     // how the data is spread. Removing the cross-shard re-aggregation would make the same query
@@ -475,10 +508,10 @@ fn queries_that_cannot_be_combined_are_refused() {
             "SELECT n % 10, count(DISTINCT n) FROM t GROUP BY n % 10",
             "DISTINCT",
         ),
-        // HAVING filters groups that are only complete after the merge (a later increment).
+        // A HAVING operand that is neither a grouping column nor an aggregate.
         (
-            "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING count(*) > 5",
-            "HAVING",
+            "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING s > 5",
+            "neither grouped nor aggregated",
         ),
         // GROUP_CONCAT within a group has undefined cross-shard order.
         (

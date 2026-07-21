@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::exec::{QueryResult, Value};
 
-use super::plan::{Combine, Grouped, OutputCol, Plan, PostProcess, SetKind, SetTree, SortKey};
+use super::plan::{
+    Combine, CompareOp, Grouped, HavingExpr, HavingValue, OutputCol, Plan, PostProcess, SetKind,
+    SetTree, SortKey,
+};
 
 /// Combine per-shard results according to `plan`.
 ///
@@ -225,6 +228,7 @@ fn merge_grouped(g: &Grouped, parts: Vec<QueryResult>) -> QueryResult {
 
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
     for (key, partials) in &groups {
+        // Compute the full output row — visible columns plus any hidden columns HAVING needs.
         let mut out: Vec<Value> = Vec::with_capacity(g.outputs.len());
         for col in &g.outputs {
             out.push(match col {
@@ -239,6 +243,13 @@ fn merge_grouped(g: &Grouped, parts: Vec<QueryResult>) -> QueryResult {
                 OutputCol::Avg { sum_col, count_col } => avg_of(partials, *sum_col, *count_col),
             });
         }
+        // HAVING filters complete groups; NULL (unknown) excludes the group, as SQLite does.
+        if let Some(having) = &g.having
+            && eval_having(having, &out) != Some(true)
+        {
+            continue;
+        }
+        out.truncate(g.visible_count);
         rows.push(out);
     }
 
@@ -269,6 +280,54 @@ fn avg_of(partials: &[Vec<Value>], sum_col: usize, count_col: usize) -> Value {
         Value::Null
     } else {
         Value::Real(total_sum / total_count as f64)
+    }
+}
+
+/// Evaluate a `HAVING` predicate over a group's computed output row, in SQL's three-valued logic:
+/// `Some(true)` / `Some(false)` for known outcomes, `None` for NULL (unknown). A group is kept only
+/// on `Some(true)`, so an unknown (NULL) predicate excludes it — exactly as SQLite does.
+fn eval_having(expr: &HavingExpr, row: &[Value]) -> Option<bool> {
+    use std::cmp::Ordering;
+    match expr {
+        HavingExpr::And(a, b) => match (eval_having(a, row), eval_having(b, row)) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+        HavingExpr::Or(a, b) => match (eval_having(a, row), eval_having(b, row)) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        },
+        HavingExpr::Not(a) => eval_having(a, row).map(|b| !b),
+        HavingExpr::IsNull { value, negated } => {
+            let is_null = matches!(having_value(value, row), Value::Null);
+            Some(is_null ^ *negated)
+        }
+        HavingExpr::Compare { left, op, right } => {
+            let l = having_value(left, row);
+            let r = having_value(right, row);
+            // A comparison with NULL is unknown.
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return None;
+            }
+            let ord = compare_values(&l, &r);
+            Some(match op {
+                CompareOp::Eq => ord == Ordering::Equal,
+                CompareOp::Ne => ord != Ordering::Equal,
+                CompareOp::Lt => ord == Ordering::Less,
+                CompareOp::Le => ord != Ordering::Greater,
+                CompareOp::Gt => ord == Ordering::Greater,
+                CompareOp::Ge => ord != Ordering::Less,
+            })
+        }
+    }
+}
+
+fn having_value(value: &HavingValue, row: &[Value]) -> Value {
+    match value {
+        HavingValue::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
+        HavingValue::Literal(v) => v.clone(),
     }
 }
 

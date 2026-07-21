@@ -17,7 +17,7 @@
 //! | `COUNT(*)`, `COUNT(c)` | sum the counts |
 //! | `SUM(c)` | sum the sums |
 //! | `MIN(c)` / `MAX(c)` | min of minima / max of maxima |
-//! | `GROUP BY g, …` | two-phase: per-shard partial groups, then re-aggregate by key |
+//! | `GROUP BY g, …` (+ `HAVING`) | two-phase: per-shard partial groups, re-aggregate, then filter |
 //! | `AVG(c)` (bare or grouped) | decompose to `SUM(c)`/`COUNT(c)`, divide at the coordinator |
 //! | `DISTINCT` | per-shard dedup, then dedup the union on the coordinator |
 //! | `OFFSET` (± `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
@@ -26,15 +26,14 @@
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
 //! carrying `SUM` and `COUNT` per shard and dividing once. `GROUP BY` is the same idea per
-//! group (see [`Grouped`]); `DISTINCT` and `OFFSET` are coordinator-side reshapes of the
-//! concatenated rows (see [`PostProcess`]); a set operation evaluates each branch as its own
-//! fan-out and combines the results (see [`SetOp`]), so a branch may itself be an aggregate.
+//! group (see [`Grouped`]), and `HAVING` filters the complete groups on the coordinator;
+//! `DISTINCT` and `OFFSET` are coordinator-side reshapes of the concatenated rows (see
+//! [`PostProcess`]); a set operation evaluates each branch as its own fan-out and combines the
+//! results (see [`SetOp`]), so a branch may itself be an aggregate.
 //!
 //! # What is refused, and why each one
 //!
 //! - **`JOIN`** — rows that must meet live on different shards, and nothing moves them.
-//! - **`HAVING`** — filtering groups across shards needs a coordinator-side evaluator, not yet
-//!   built (a later increment).
 //! - **`COUNT(DISTINCT c)` and other `DISTINCT` aggregates** — the same value can appear on
 //!   several shards, so a per-shard distinct count double-counts.
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
@@ -53,10 +52,10 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, GroupByWithModifier, LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement as SqlStatement, Value as SqlValue, ValueWithSpan,
-    visit_expressions,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, GroupByWithModifier, LimitClause, OrderByKind, Query, Select,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement, UnaryOperator,
+    Value as SqlValue, ValueWithSpan, visit_expressions,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -164,11 +163,17 @@ pub struct Grouped {
     pub shard_sql: String,
     /// Positions of the grouping columns within a partial row; together they are the group key.
     pub group_cols: Vec<usize>,
-    /// One entry per final output column, in the order the user selected them.
+    /// One entry per output column. The first `visible_count` are the user's selected columns, in
+    /// order; any beyond that are hidden columns a `HAVING` predicate needs, dropped from the
+    /// final result.
     pub outputs: Vec<OutputCol>,
-    /// Final column headers.
+    /// How many of `outputs` are visible (the user's projection); the rest are HAVING scratch.
+    pub visible_count: usize,
+    /// The `HAVING` predicate, evaluated per group after re-aggregation.
+    pub having: Option<HavingExpr>,
+    /// Final column headers (length `visible_count`).
     pub output_names: Vec<String>,
-    /// Sort keys over the *final* output columns (empty when there is no `ORDER BY`).
+    /// Sort keys over the *visible* output columns (empty when there is no `ORDER BY`).
     pub order_by: Vec<SortKey>,
     /// Groups to skip after ordering — a global `OFFSET`.
     pub offset: usize,
@@ -186,6 +191,44 @@ pub enum OutputCol {
     Combine { kind: Combine, col: usize },
     /// `SUM(partial sums) / SUM(partial counts)`; `NULL` when the total count is zero.
     Avg { sum_col: usize, count_col: usize },
+}
+
+/// A parsed `HAVING` predicate, evaluated per group on the coordinator against the group's
+/// computed output row. Aggregates and columns that `HAVING` references but the projection does
+/// not are added to the group's outputs as *hidden* columns (dropped from the final result);
+/// `HavingValue::Column` indexes into that full row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingExpr {
+    And(Box<HavingExpr>, Box<HavingExpr>),
+    Or(Box<HavingExpr>, Box<HavingExpr>),
+    Not(Box<HavingExpr>),
+    Compare {
+        left: HavingValue,
+        op: CompareOp,
+        right: HavingValue,
+    },
+    IsNull {
+        value: HavingValue,
+        negated: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingValue {
+    /// A value in the group's computed output row, at this index.
+    Column(usize),
+    /// A constant.
+    Literal(crate::storage::exec::Value),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// How a projected aggregate decomposes across shards.
@@ -624,13 +667,6 @@ fn plan_grouped(
             why: "these produce super-aggregate rows that a fan-out cannot reassemble",
         });
     }
-    if select.having.is_some() {
-        return Err(Unsupported {
-            what: "HAVING",
-            why: "filtering groups across shards needs a coordinator-side evaluator that is not \
-                  built yet; select the aggregate and filter on the client",
-        });
-    }
     if select.from.len() > 1 || select.from.first().is_some_and(|f| !f.joins.is_empty()) {
         return Err(Unsupported {
             what: "a join",
@@ -675,27 +711,8 @@ fn plan_grouped(
         names.push(output_name(item, expr));
 
         if let Expr::Function(f) = expr
-            && let Some(choice) = classify_aggregate(f)?
+            && push_aggregate(f, &mut partial, &mut outputs, &mut next)?.is_some()
         {
-            let arg = single_arg_sql(f)?;
-            match choice {
-                AggChoice::Simple(kind) => {
-                    // Keep the original function per shard (COUNT stays COUNT, not SUM); the
-                    // coordinator's Combine folds the partials.
-                    partial.push(format!("{}({})", f.name, arg));
-                    outputs.push(OutputCol::Combine { kind, col: next });
-                    next += 1;
-                }
-                AggChoice::Avg => {
-                    partial.push(format!("SUM({arg})"));
-                    partial.push(format!("COUNT({arg})"));
-                    outputs.push(OutputCol::Avg {
-                        sum_col: next,
-                        count_col: next + 1,
-                    });
-                    next += 2;
-                }
-            }
             continue;
         }
 
@@ -713,8 +730,21 @@ fn plan_grouped(
         }
     }
 
+    // The projection columns are the visible ones; HAVING may append hidden columns after them.
+    let visible_count = outputs.len();
+    let having = match &select.having {
+        None => None,
+        Some(expr) => Some(build_having(
+            expr,
+            &mut partial,
+            &mut outputs,
+            &mut next,
+            &group_norm,
+        )?),
+    };
+
     // LIMIT and OFFSET are coordinator-only for a grouped query; ORDER BY resolves against the
-    // final output columns.
+    // visible output columns.
     let (limit, offset) = limit_and_offset(query)?;
     let order_by = resolve_sort_keys(&query.order_by, &select.projection)?;
 
@@ -735,11 +765,211 @@ fn plan_grouped(
         shard_sql,
         group_cols: (0..k).collect(),
         outputs,
+        visible_count,
+        having,
         output_names: names,
         order_by,
         offset,
         limit,
     })))
+}
+
+/// Add the partial column(s) and output entry for an aggregate function, advancing the partial
+/// column cursor. Returns the new output's index, or `None` if `f` is not a decomposable
+/// aggregate (in which case the caller treats it as a grouping expression).
+fn push_aggregate(
+    f: &sqlparser::ast::Function,
+    partial: &mut Vec<String>,
+    outputs: &mut Vec<OutputCol>,
+    next: &mut usize,
+) -> std::result::Result<Option<usize>, Unsupported> {
+    let Some(choice) = classify_aggregate(f)? else {
+        return Ok(None);
+    };
+    let arg = single_arg_sql(f)?;
+    let index = outputs.len();
+    match choice {
+        AggChoice::Simple(kind) => {
+            // Keep the original function per shard (COUNT stays COUNT, not SUM); the coordinator's
+            // Combine folds the partials.
+            partial.push(format!("{}({})", f.name, arg));
+            outputs.push(OutputCol::Combine { kind, col: *next });
+            *next += 1;
+        }
+        AggChoice::Avg => {
+            partial.push(format!("SUM({arg})"));
+            partial.push(format!("COUNT({arg})"));
+            outputs.push(OutputCol::Avg {
+                sum_col: *next,
+                count_col: *next + 1,
+            });
+            *next += 2;
+        }
+    }
+    Ok(Some(index))
+}
+
+/// Parse a `HAVING` predicate into a coordinator-evaluable form. Aggregates and grouping columns
+/// it references are added to `outputs` (as hidden columns) and their partials to `partial`, so
+/// the group's computed row carries every value the predicate needs. The grammar is bounded:
+/// comparisons and boolean combinations of {a decomposable aggregate | a grouping column | a
+/// literal}, plus `IS [NOT] NULL`. Anything else is refused.
+fn build_having(
+    expr: &Expr,
+    partial: &mut Vec<String>,
+    outputs: &mut Vec<OutputCol>,
+    next: &mut usize,
+    group_norm: &[String],
+) -> std::result::Result<HavingExpr, Unsupported> {
+    match expr {
+        Expr::Nested(inner) => build_having(inner, partial, outputs, next, group_norm),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => Ok(HavingExpr::Not(Box::new(build_having(
+            inner, partial, outputs, next, group_norm,
+        )?))),
+        Expr::IsNull(inner) => Ok(HavingExpr::IsNull {
+            value: build_having_value(inner, partial, outputs, next, group_norm)?,
+            negated: false,
+        }),
+        Expr::IsNotNull(inner) => Ok(HavingExpr::IsNull {
+            value: build_having_value(inner, partial, outputs, next, group_norm)?,
+            negated: true,
+        }),
+        Expr::BinaryOp { left, op, right } => {
+            let compare_op = match op {
+                BinaryOperator::And => {
+                    return Ok(HavingExpr::And(
+                        Box::new(build_having(left, partial, outputs, next, group_norm)?),
+                        Box::new(build_having(right, partial, outputs, next, group_norm)?),
+                    ));
+                }
+                BinaryOperator::Or => {
+                    return Ok(HavingExpr::Or(
+                        Box::new(build_having(left, partial, outputs, next, group_norm)?),
+                        Box::new(build_having(right, partial, outputs, next, group_norm)?),
+                    ));
+                }
+                BinaryOperator::Eq => CompareOp::Eq,
+                BinaryOperator::NotEq => CompareOp::Ne,
+                BinaryOperator::Lt => CompareOp::Lt,
+                BinaryOperator::LtEq => CompareOp::Le,
+                BinaryOperator::Gt => CompareOp::Gt,
+                BinaryOperator::GtEq => CompareOp::Ge,
+                _ => {
+                    return Err(Unsupported {
+                        what: "this operator in HAVING",
+                        why: "HAVING supports comparisons (= != < <= > >=) and AND/OR/NOT of them",
+                    });
+                }
+            };
+            Ok(HavingExpr::Compare {
+                left: build_having_value(left, partial, outputs, next, group_norm)?,
+                op: compare_op,
+                right: build_having_value(right, partial, outputs, next, group_norm)?,
+            })
+        }
+        _ => Err(Unsupported {
+            what: "this HAVING expression",
+            why: "HAVING supports comparisons and AND/OR/NOT over aggregates, grouping columns \
+                  and literals",
+        }),
+    }
+}
+
+/// Resolve one operand of a `HAVING` comparison to a column of the group's computed row (adding a
+/// hidden output if needed) or a literal.
+fn build_having_value(
+    expr: &Expr,
+    partial: &mut Vec<String>,
+    outputs: &mut Vec<OutputCol>,
+    next: &mut usize,
+    group_norm: &[String],
+) -> std::result::Result<HavingValue, Unsupported> {
+    match expr {
+        Expr::Nested(inner) => build_having_value(inner, partial, outputs, next, group_norm),
+        Expr::Function(f) => {
+            if let Some(index) = push_aggregate(f, partial, outputs, next)? {
+                Ok(HavingValue::Column(index))
+            } else {
+                // A non-aggregate function may still be a grouping expression, e.g. substr(name,1,1).
+                group_column_value(expr, outputs, group_norm)
+            }
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            group_column_value(expr, outputs, group_norm)
+        }
+        Expr::Value(_) => Ok(HavingValue::Literal(literal_value(expr)?)),
+        // A negative numeric literal parses as -(number).
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } if matches!(inner.as_ref(), Expr::Value(_)) => match literal_value(inner)? {
+            crate::storage::exec::Value::Integer(n) => Ok(HavingValue::Literal(
+                crate::storage::exec::Value::Integer(-n),
+            )),
+            crate::storage::exec::Value::Real(x) => {
+                Ok(HavingValue::Literal(crate::storage::exec::Value::Real(-x)))
+            }
+            _ => Err(Unsupported {
+                what: "this HAVING operand",
+                why: "only numeric, text and NULL literals are supported",
+            }),
+        },
+        // Any other expression may be a grouping expression, e.g. `(n % 5)` — match it by text.
+        _ => group_column_value(expr, outputs, group_norm),
+    }
+}
+
+/// Reference a grouping column from `HAVING`, appending a hidden `Group` output for it.
+fn group_column_value(
+    expr: &Expr,
+    outputs: &mut Vec<OutputCol>,
+    group_norm: &[String],
+) -> std::result::Result<HavingValue, Unsupported> {
+    let norm = normalize_expr(expr);
+    match group_norm.iter().position(|g| *g == norm) {
+        Some(gi) => {
+            let index = outputs.len();
+            outputs.push(OutputCol::Group(gi));
+            Ok(HavingValue::Column(index))
+        }
+        None => Err(Unsupported {
+            what: "a HAVING column that is neither grouped nor aggregated",
+            why: "HAVING can only reference a grouping column or an aggregate",
+        }),
+    }
+}
+
+/// A literal expression as a [`Value`](crate::storage::exec::Value).
+fn literal_value(expr: &Expr) -> std::result::Result<crate::storage::exec::Value, Unsupported> {
+    use crate::storage::exec::Value;
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Err(Unsupported {
+            what: "this HAVING literal",
+            why: "only numeric, text and NULL literals are supported",
+        });
+    };
+    match value {
+        SqlValue::Number(n, _) => n
+            .parse::<i64>()
+            .map(Value::Integer)
+            .or_else(|_| n.parse::<f64>().map(Value::Real))
+            .map_err(|_| Unsupported {
+                what: "this HAVING number",
+                why: "it is not a valid integer or real",
+            }),
+        SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
+            Ok(Value::Text(s.clone()))
+        }
+        SqlValue::Boolean(b) => Ok(Value::Integer(i64::from(*b))),
+        SqlValue::Null => Ok(Value::Null),
+        _ => Err(Unsupported {
+            what: "this HAVING literal",
+            why: "only numeric, text and NULL literals are supported",
+        }),
+    }
 }
 
 /// Whether any expression in `query` is (or contains) a subquery — walked completely via

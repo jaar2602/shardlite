@@ -200,12 +200,15 @@ database holding identical data — SQLite's own answer is the oracle.
 Localized to `src/query/plan.rs` (new `plan_grouped` path + refusals), `src/query/merge.rs` (the
 `Grouped` merge arm), and one branch in `shard/mod.rs`. Plus the differential + refusal tests.
 
-**B — `HAVING`** (fast follow). Applied at the coordinator on complete groups via a small bounded
-evaluator over the `sqlparser` `Expr`: comparisons (`= != < <= > >=`) and boolean combinations of
-{a decomposable aggregate | a group column | a literal}, resolved against each group's computed
-values. Anything outside that grammar is refused. Stripped from the per-shard query in Phase 1
-(already dropped there). Tested the same way — `HAVING COUNT(*) > k`, `HAVING SUM(x) >= v` — against
-the single-shard twin.
+**B — `HAVING`** ✓ **done.** Applied at the coordinator on complete groups via a bounded evaluator
+(`HavingExpr`) over the `sqlparser` `Expr`: comparisons (`= != < <= > >=`), `AND`/`OR`/`NOT`, and
+`IS [NOT] NULL` over {a decomposable aggregate | a grouping column | a literal}, in SQL's
+three-valued logic (a NULL predicate excludes the group). Aggregates and columns `HAVING`
+references but the projection does not are added as *hidden* output columns and dropped from the
+result. Never pushed to a shard (a per-shard `HAVING` would drop partial groups). Anything outside
+the grammar is refused. Verified against the single-shard twin — `count`/`sum`/`avg`/`min`/`max`
+thresholds, `AND`/`OR`/`NOT`, grouping-column and `IS NOT NULL` predicates, and composition with
+`ORDER BY`/`LIMIT`; revert-verified by neutering the filter.
 
 ## Definition of done
 
@@ -288,6 +291,6 @@ central hash-join of both fully-materialised sides (correct, expensive, cap-gate
 ## Sequencing
 
 **A. `GROUP BY`** ✓ → **`DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** ✓ → **`INTERSECT`/`EXCEPT` +
-mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** (next) → **uncorrelated scalar
-subqueries** (the remaining central-materialisation case) → **co-located `JOIN`** as its own opt-in
-feature. Each step keeps parse-prove-refuse and adds a memory cap wherever it materialises.
+mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** ✓ → **uncorrelated scalar
+subqueries** (next — the remaining central-materialisation case) → **co-located `JOIN`** as its own
+opt-in feature. Each step keeps parse-prove-refuse and adds a memory cap wherever it materialises.
