@@ -2,3 +2,12 @@
 *.db
 *.db-wal
 *.db-shm
+
+# console build artifacts
+/console/server/target
+/console/web/node_modules
+/console/web/dist
+/console/web/*.tsbuildinfo
+/console/web/vite.config.js
+/console/web/vite.config.d.ts
+/console-data

@@ -1,6 +1,6 @@
 # meshdb — Progress Report
 
-**Updated:** 2026-07-21 · **Steps complete:** 9 of 12 · **Status:** replication converges; native TCP, HTTP, and JSON/TCP edges live; drivers in four languages (Phase 2 done); console is Phase 3
+**Updated:** 2026-07-21 · **Steps complete:** 9 of 12 · **Status:** replication converges; native TCP, HTTP, and JSON/TCP edges live; drivers in four languages (Phase 2); standalone web console built and verified (Phase 3)
 
 ---
 
@@ -872,6 +872,42 @@ serving **both** HTTP and JSON/TCP and asserts a full 20k-row stream over each: 
 JavaScript pass over HTTP **and** JSON/TCP; Rust over HTTP; Go is exercised where a toolchain
 is present (its HTTP and TCP clients are written to the same contract but unrun in this
 environment, stated rather than implied).
+
+### Standalone web console (Phase 3) — `console/`
+
+A separate app — its own binary, its own login, its own state — for managing and observing
+clusters, the way a database client manages many connections. Deliberately **not** part of the
+database binary: keeping it out of the 150 MB / 0.33 CPU database avoids a browser-facing surface
+and request load there, and a standalone backend owns its own login with no CORS. Design and
+confirmed scope in `docs/console-plan.md`; it adds **no meshdb core changes** — every feature is
+composition over endpoints the gateway already exposes.
+
+**Backend** (`console/server/`, its own Rust crate outside the workspace). Reaches clusters over
+the stable HTTP `/v1` edge, so it is decoupled from the exact meshdb build. Multi-user console
+login (Argon2id passwords, in-memory sessions, `admin`/`user` roles — admin gates user and
+connection management). A connection registry whose stored meshdb secrets are **sealed at rest**
+with ChaCha20-Poly1305 under a master passphrase (the file alone grants no cluster access; a wrong
+passphrase fails loudly, never silently as "no auth"). A **uniform streaming proxy**: whatever the
+browser asks of a connection goes to `/v1` with the same method and body, and the reply streams
+straight back — so the gateway's "1 row to 1 million rows" robustness carries end to end
+(**60,000 rows streamed through the console** in the smoke test, nothing materialised). A stats
+sampler polls each connection's `/v1/stats` into a bounded in-memory ring — the one bit of history
+the stateless database does not keep. The built SPA is embedded into the binary, so the console
+ships as one self-contained executable.
+
+**Frontend** (`console/web/`, React + TypeScript + Tailwind). The IBM Carbon look **mocked with
+Tailwind**, not the heavy `@carbon/react` library — a small hand-built primitive set (DataTable,
+Button, Tabs, SideNav, sparklines) carrying Carbon's g100 palette, blue-60, and IBM Plex. Views:
+Connections and Console-users (management), and per-connection SQL editor (streaming grid),
+Schema (via `sqlite_schema`), Cluster (topology + placement), Shards & frames (the WAL inspector),
+Stats (live sparklines), and meshdb Users.
+
+Verified end to end by `scripts/console_smoke.sh` (13 checks): the embedded SPA and its client-side
+routing fallback, login and session, multi-user role enforcement (a `user` may read connections
+but not administer), secrets absent from the on-disk file, the streaming proxy over a 60k-row
+result, atomic transactions, the frames report, and unauthenticated calls refused. 12 backend unit
+tests cover the crypto, user store, registry sealing, and sessions (including the revert-checked
+negatives: wrong passphrase fails closed, the last admin cannot be removed).
 
 ### Frame inspection: `meshdb frames`
 

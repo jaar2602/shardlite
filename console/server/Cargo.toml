@@ -1,0 +1,26 @@
+[package]
+name = "meshdb-console"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone web console for managing and observing meshdb clusters"
+publish = false
+
+[[bin]]
+name = "meshdb-console"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server — same one the meshdb gateway uses; sync, thread-per-connection.
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Outbound calls to a cluster's /v1 edge. json feature for send_json/into_json.
+ureq = { version = "2", features = ["json"] }
+# Console password hashing (Argon2id) and at-rest secret encryption (ChaCha20-Poly1305).
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+rand = "0.8"
+base64 = "0.22"
+# Embed the built SPA so the console ships as one binary.
+include_dir = "0.7"

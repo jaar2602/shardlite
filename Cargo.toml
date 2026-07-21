@@ -1,6 +1,6 @@
 # The driver crates under drivers/ are standalone; keep them out of this package.
 [workspace]
-exclude = ["drivers"]
+exclude = ["drivers", "console"]
 
 [package]
 name = "meshdb"
