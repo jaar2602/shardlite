@@ -30,7 +30,9 @@ tracing = "0.1.44"
 # Only the binary installs a subscriber, behind a feature so `cargo test` and library
 # consumers do not pull it in.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
-sqlparser = "0.62.0"
+# `visitor` enables a complete AST walk (visit_expressions), used to reject a grouped query that
+# hides a subquery — which, pushed to each shard, would aggregate per-shard and answer wrongly.
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 # Divergence detection. Chosen by the plan; fast enough that verifying a shard is bounded by
 # reading its rows rather than by hashing them.
 blake3 = "1"

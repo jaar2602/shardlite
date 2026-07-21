@@ -512,9 +512,16 @@ impl ShardManager {
 
         let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
 
+        // A grouped query runs a *rewritten* partial-aggregation query on each shard; every other
+        // plan runs the caller's SQL unchanged.
+        let shard_sql = match &plan {
+            crate::query::Plan::Grouped(g) => g.shard_sql.as_str(),
+            _ => sql,
+        };
+
         let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
         for s in 0..self.cfg.shard_count {
-            match self.query(ShardId(s), sql)? {
+            match self.query(ShardId(s), shard_sql)? {
                 Outcome::Ok(Executed::Rows(r)) => parts.push(r),
                 // A shard that has not been written to has no table yet; it contributes
                 // nothing rather than failing the whole query.

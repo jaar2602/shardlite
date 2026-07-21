@@ -5,10 +5,10 @@
 //! the only way to catch a merge that is plausible but wrong — which is the whole failure
 //! mode this planner exists to avoid.
 
-use meshdb::query::{Combine, Plan, plan};
+use meshdb::query::{Combine, OutputCol, Plan, plan};
 use meshdb::shard::{ShardConfig, ShardId, ShardManager};
 use meshdb::storage::Value;
-use meshdb::storage::exec::{QueryResult, Statement};
+use meshdb::storage::exec::{Executed, Outcome, QueryResult, Statement};
 use tempfile::TempDir;
 
 const ROWS: i64 = 400;
@@ -71,6 +71,120 @@ fn assert_matches_ground_truth(sharded: &ShardManager, single: &ShardManager, sq
         rows_of(&want),
         "fan-out disagreed with the single-shard answer for: {sql}"
     );
+}
+
+/// SQLite's *native* answer, run directly on one shard holding all the data — an oracle
+/// independent of the fan-out merge. This matters for grouped queries: `single.query_all_shards`
+/// would itself route through the two-phase merge, so it could not catch a bug in that merge.
+/// Running the query directly on SQLite can.
+fn native(single: &ShardManager, sql: &str) -> Vec<Vec<Value>> {
+    match single.query(ShardId(0), sql).unwrap() {
+        Outcome::Ok(Executed::Rows(r)) => r.rows,
+        other => panic!("native query did not return rows for `{sql}`: {other:?}"),
+    }
+}
+
+/// Sort rows by a stable, total key so two result sets can be compared as multisets — for a
+/// `GROUP BY` with no `ORDER BY`, the row order is unspecified, but the *set* of grouped rows
+/// must match SQLite exactly.
+fn sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by_key(|r| format!("{r:?}"));
+    rows
+}
+
+/// A grouped fan-out must produce the same *set* of grouped rows as native SQLite.
+fn assert_grouped(sharded: &ShardManager, single: &ShardManager, sql: &str) {
+    let got = sharded.query_all_shards(sql).unwrap().rows;
+    let want = native(single, sql);
+    assert_eq!(
+        sorted(got),
+        sorted(want),
+        "grouped fan-out disagreed with native SQLite for: {sql}"
+    );
+}
+
+/// A grouped fan-out with a deterministic total ordering must match native SQLite row for row,
+/// including after `LIMIT`.
+fn assert_grouped_ordered(sharded: &ShardManager, single: &ShardManager, sql: &str) {
+    let got = sharded.query_all_shards(sql).unwrap().rows;
+    let want = native(single, sql);
+    assert_eq!(
+        got, want,
+        "ordered grouped fan-out disagreed with native SQLite for: {sql}"
+    );
+}
+
+#[test]
+fn grouped_queries_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // Compared as multisets against native SQLite — the grouped values must be exact, regardless
+    // of row order. `n % 10` yields low-cardinality buckets including a NULL bucket (n is NULL
+    // every 17th row), so NULL grouping and every decomposable aggregate are exercised.
+    for sql in [
+        "SELECT n % 10 AS b, count(*) FROM t GROUP BY n % 10",
+        "SELECT n % 10, count(*), count(n), sum(n), min(n), max(n) FROM t GROUP BY n % 10",
+        "SELECT n % 10, avg(n) FROM t GROUP BY n % 10",
+        "SELECT n % 10, n % 3, count(*) FROM t GROUP BY n % 10, n % 3",
+        // The group key need not be selected.
+        "SELECT count(*) FROM t GROUP BY n % 10",
+        // With a WHERE that is pushed down.
+        "SELECT n % 10, count(*), avg(n) FROM t WHERE n > 300 GROUP BY n % 10",
+        // A text group key, and text MIN/MAX per group.
+        "SELECT substr(s, 1, 3) AS p, count(*), min(s), max(s) FROM t GROUP BY substr(s, 1, 3)",
+        // GROUP BY with no aggregate — a DISTINCT of the group key.
+        "SELECT n FROM t GROUP BY n",
+        // High-cardinality text key.
+        "SELECT s, count(*) FROM t GROUP BY s",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn grouped_ordering_and_limit_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // Each ORDER BY resolves to a total order (the group key is unique per row), so LIMIT is
+    // deterministic and a row-for-row comparison against native SQLite is sound.
+    for sql in [
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 ORDER BY b",
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 ORDER BY b DESC LIMIT 5",
+        // Order by an aggregate, with the unique group key as a tiebreak → still total.
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 ORDER BY c DESC, b LIMIT 4",
+        // Ordinal reference to the aggregate column.
+        "SELECT n % 10 AS b, sum(n) AS tot FROM t GROUP BY n % 10 ORDER BY 1",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn grouped_answers_are_invariant_to_shard_count() {
+    // The merge iterates groups in key order, so a grouped answer is deterministic regardless of
+    // how the data is spread. Removing the cross-shard re-aggregation would make the same query
+    // return duplicate per-shard group rows — so this is non-vacuous.
+    let queries = [
+        "SELECT n % 10, count(*), sum(n), min(n), max(n) FROM t GROUP BY n % 10",
+        "SELECT n % 10, avg(n) FROM t GROUP BY n % 10",
+        "SELECT n % 10 AS b, count(*) AS c FROM t GROUP BY n % 10 ORDER BY b",
+    ];
+
+    let mut baseline: Option<Vec<Vec<Vec<Value>>>> = None;
+    for shards in [1u32, 4, 16, 64] {
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (sharded, _single) = twin(&dirs, shards);
+        let answers: Vec<Vec<Vec<Value>>> = queries
+            .iter()
+            .map(|q| sorted(sharded.query_all_shards(q).unwrap().rows))
+            .collect();
+        match &baseline {
+            None => baseline = Some(answers),
+            Some(b) => assert_eq!(&answers, b, "grouped answer changed at {shards} shards"),
+        }
+    }
 }
 
 #[test]
@@ -185,7 +299,6 @@ fn queries_that_cannot_be_combined_are_refused() {
     // must error instead.
     for (sql, expect) in [
         ("SELECT avg(n) FROM t", "AVG"),
-        ("SELECT n, count(*) FROM t GROUP BY n", "GROUP BY"),
         ("SELECT DISTINCT n FROM t", "DISTINCT"),
         ("SELECT a.k FROM t a JOIN t b ON a.k = b.k", "join"),
         ("SELECT k FROM t LIMIT 10 OFFSET 5", "OFFSET"),
@@ -196,9 +309,31 @@ fn queries_that_cannot_be_combined_are_refused() {
         ),
         ("SELECT count(*), sum(n) FROM t", "alongside other columns"),
         ("SELECT group_concat(k) FROM t", "GROUP_CONCAT"),
+        // --- grouped queries that still cannot be answered correctly across shards ---
+        // A bare column that is neither grouped nor aggregated is an arbitrary row per shard.
         (
-            "SELECT n FROM t WHERE n > (SELECT avg(n) FROM t) GROUP BY n",
-            "GROUP BY",
+            "SELECT n, k FROM t GROUP BY n",
+            "neither grouped nor aggregated",
+        ),
+        // DISTINCT inside an aggregate double-counts across shards.
+        (
+            "SELECT n % 10, count(DISTINCT n) FROM t GROUP BY n % 10",
+            "DISTINCT",
+        ),
+        // HAVING filters groups that are only complete after the merge (a later increment).
+        (
+            "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING count(*) > 5",
+            "HAVING",
+        ),
+        // GROUP_CONCAT within a group has undefined cross-shard order.
+        (
+            "SELECT n % 10, group_concat(s) FROM t GROUP BY n % 10",
+            "GROUP_CONCAT",
+        ),
+        // A subquery would run per shard, not over the whole table — a silent wrong answer.
+        (
+            "SELECT n % 10, count(*) FROM t WHERE n > (SELECT avg(n) FROM t) GROUP BY n % 10",
+            "subquery",
         ),
     ] {
         let err = plan(sql).expect_err(&format!("{sql} should have been refused"));
@@ -263,6 +398,41 @@ fn plans_are_what_they_claim_to_be() {
             assert!(!keys[0].nulls_first);
         }
         other => panic!("expected a merge plan, got {other:?}"),
+    }
+
+    // A grouped query decomposes into a per-shard partial query plus a fold recipe.
+    match plan("SELECT n % 10 AS b, count(*), avg(n) FROM t GROUP BY n % 10 LIMIT 4").unwrap() {
+        Plan::Grouped(g) => {
+            assert_eq!(g.group_cols, vec![0]);
+            assert_eq!(g.limit, Some(4));
+            // b -> the group key; count(*) -> a summed partial; avg -> a sum/count pair.
+            assert!(matches!(g.outputs[0], OutputCol::Group(0)));
+            assert!(matches!(
+                g.outputs[1],
+                OutputCol::Combine {
+                    kind: Combine::Sum,
+                    col: 1
+                }
+            ));
+            assert!(matches!(
+                g.outputs[2],
+                OutputCol::Avg {
+                    sum_col: 2,
+                    count_col: 3
+                }
+            ));
+            // The per-shard query groups locally and carries AVG as SUM + COUNT.
+            let lower = g.shard_sql.to_lowercase();
+            assert!(lower.contains("group by"), "shard sql: {}", g.shard_sql);
+            assert!(lower.contains("sum(n)") && lower.contains("count(n)"));
+            // LIMIT is coordinator-only — it must not be pushed to the shards.
+            assert!(
+                !lower.contains("limit"),
+                "shard sql leaked LIMIT: {}",
+                g.shard_sql
+            );
+        }
+        other => panic!("expected a grouped plan, got {other:?}"),
     }
 }
 

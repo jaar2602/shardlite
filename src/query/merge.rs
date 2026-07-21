@@ -1,8 +1,10 @@
 //! Combining per-shard results into one.
 
+use std::collections::BTreeMap;
+
 use crate::storage::exec::{QueryResult, Value};
 
-use super::plan::{Combine, Plan, SortKey};
+use super::plan::{Combine, Grouped, OutputCol, Plan, SortKey};
 
 /// Combine per-shard results according to `plan`.
 ///
@@ -56,6 +58,109 @@ pub fn merge_results(plan: &Plan, parts: Vec<QueryResult>) -> QueryResult {
                 rows: vec![vec![combine_values(*combine, values)]],
             }
         }
+
+        Plan::Grouped(g) => merge_grouped(g, parts),
+    }
+}
+
+/// The coordinator half of two-phase aggregation: bucket every shard's partial rows by their
+/// group key, then fold each group into one final row per the recipe in `g.outputs`.
+fn merge_grouped(g: &Grouped, parts: Vec<QueryResult>) -> QueryResult {
+    // Group by the key columns. The key is ordered by `compare_values`, so `Integer(1)` and
+    // `Real(1.0)` land in the same group (as SQLite's GROUP BY would), and all NULLs group
+    // together. Partial rows are one-per-group-per-shard, so this holds at most (groups × shards)
+    // rows — no more than the plain Concat/Merge plans already materialise.
+    let mut groups: BTreeMap<GroupKey, Vec<Vec<Value>>> = BTreeMap::new();
+    for part in parts {
+        for row in part.rows {
+            let key: Vec<Value> = g
+                .group_cols
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
+            groups.entry(GroupKey(key)).or_default().push(row);
+        }
+    }
+
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    for (key, partials) in &groups {
+        let mut out: Vec<Value> = Vec::with_capacity(g.outputs.len());
+        for col in &g.outputs {
+            out.push(match col {
+                OutputCol::Group(i) => key.0.get(*i).cloned().unwrap_or(Value::Null),
+                OutputCol::Combine { kind, col } => {
+                    let vals = partials
+                        .iter()
+                        .map(|r| r.get(*col).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    combine_values(*kind, vals)
+                }
+                OutputCol::Avg { sum_col, count_col } => avg_of(partials, *sum_col, *count_col),
+            });
+        }
+        rows.push(out);
+    }
+
+    if !g.order_by.is_empty() {
+        rows.sort_by(|a, b| compare_rows(a, b, &g.order_by));
+    }
+    if let Some(n) = g.limit {
+        rows.truncate(n);
+    }
+
+    QueryResult {
+        columns: g.output_names.clone(),
+        rows,
+    }
+}
+
+/// Global `AVG` for one group: sum the partial `SUM`s, sum the partial `COUNT`s, divide. NULL
+/// when the total count is zero — matching SQLite's `AVG` of an all-NULL group.
+fn avg_of(partials: &[Vec<Value>], sum_col: usize, count_col: usize) -> Value {
+    let mut total_sum = 0.0f64;
+    let mut total_count: i64 = 0;
+    for row in partials {
+        match row.get(sum_col) {
+            Some(Value::Integer(i)) => total_sum += *i as f64,
+            Some(Value::Real(f)) => total_sum += *f,
+            _ => {} // NULL partial sum (an all-NULL shard group) contributes nothing.
+        }
+        if let Some(Value::Integer(c)) = row.get(count_col) {
+            total_count += *c;
+        }
+    }
+    if total_count == 0 {
+        Value::Null
+    } else {
+        Value::Real(total_sum / total_count as f64)
+    }
+}
+
+/// A group key ordered — and therefore made equal — by SQLite's value comparison, so shards that
+/// represent the same group differently (`Integer(1)` vs `Real(1.0)`, or via NULLs) still merge.
+/// `BTreeMap` uses only `Ord`, so equality here means "same group".
+struct GroupKey(Vec<Value>);
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for GroupKey {}
+impl PartialOrd for GroupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for GroupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (a, b) in self.0.iter().zip(other.0.iter()) {
+            let ord = compare_values(a, b);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        self.0.len().cmp(&other.0.len())
     }
 }
 
