@@ -69,8 +69,8 @@ pub fn merge_results(plan: &Plan, parts: Vec<QueryResult>) -> QueryResult {
         // Set operations and scalar-subquery substitution are handled by the coordinator before
         // any per-shard merge (see `ShardManager::eval_set_op` / the ScalarSubqueries branch).
         Plan::SetOp(_) => unreachable!("set operations are combined by eval_set_op, not merge"),
-        Plan::ScalarSubqueries => {
-            unreachable!("scalar subqueries are substituted before merge")
+        Plan::Subqueries => {
+            unreachable!("subqueries are substituted before merge")
         }
     }
 }

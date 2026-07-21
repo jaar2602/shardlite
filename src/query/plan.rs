@@ -22,7 +22,7 @@
 //! | `DISTINCT` | per-shard dedup, then dedup the union on the coordinator |
 //! | `OFFSET` (± `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
 //! | `UNION` / `INTERSECT` / `EXCEPT` (any mix) | fan out each branch, then combine on the coordinator |
-//! | scalar subquery `(SELECT …)` | evaluate it globally, substitute its value, re-plan the outer |
+//! | scalar / `IN` / `EXISTS` subquery | evaluate it globally, substitute its result, re-plan the outer |
 //! | co-located `JOIN` | join each shard's local rows; concatenate (see [`ShardKeys`]) |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
@@ -31,8 +31,9 @@
 //! table). `GROUP BY` is the same idea per group (see [`Grouped`]), and `HAVING` filters the
 //! complete groups on the coordinator; `DISTINCT` and `OFFSET` are coordinator-side reshapes of the
 //! concatenated rows (see [`PostProcess`]); a set operation evaluates each branch as its own
-//! fan-out and combines the results (see [`SetOp`]); a scalar subquery is evaluated on its own and
-//! its value substituted in before the outer query is planned (see [`substitute_scalar_subqueries`]).
+//! fan-out and combines the results (see [`SetOp`]); a scalar / `IN` / `EXISTS` subquery is
+//! evaluated on its own and its result (a value, a value list, or a boolean) substituted in before
+//! the outer query is planned (see [`substitute_subqueries`]).
 //!
 //! # What is refused, and why each one
 //!
@@ -44,9 +45,9 @@
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
-//! - **`IN` / `EXISTS` / `ANY` / `ALL` subqueries** — these return a set, not a single value to
-//!   substitute; a *correlated* subquery is refused too (it names the outer row and cannot run on
-//!   its own).
+//! - **`ANY` / `ALL` subqueries**, a **correlated** subquery (it names the outer row and cannot run
+//!   on its own), and a **derived table** (subquery in `FROM`, which needs coordinator-side
+//!   materialisation not yet built).
 //! - **CTEs** — can hide any of the above.
 //!
 //! # What it cannot fix
@@ -109,9 +110,10 @@ pub enum Plan {
     /// Evaluate each branch of a set operation as its own fan-out, then combine on the coordinator.
     /// Covers `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, in any mix.
     SetOp(Box<SetOp>),
-    /// The query contains scalar subqueries: evaluate each globally, substitute its value, then
-    /// re-plan and fan out the substituted query (see [`substitute_scalar_subqueries`]).
-    ScalarSubqueries,
+    /// The query contains subqueries (scalar `(SELECT …)`, `IN (SELECT …)`, or `EXISTS (…)`):
+    /// evaluate each globally, substitute its result, then re-plan and fan out the substituted
+    /// (subquery-free) query (see [`substitute_subqueries`]).
+    Subqueries,
 }
 
 /// A coordinator-side reshape of concatenated shard rows: optionally dedup them, sort them, skip
@@ -330,18 +332,18 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
         });
     }
 
-    // A scalar subquery is evaluated globally on its own and its value substituted in before the
-    // outer query is planned (two-pass). An IN / EXISTS / ANY / ALL subquery returns a set, not a
-    // value, and is refused. Either way a subquery is never pushed verbatim to a shard, where it
-    // would run against that shard alone and answer wrongly.
+    // A scalar `(SELECT …)`, `IN (SELECT …)` or `EXISTS (…)` subquery is evaluated globally on its
+    // own and its result (a value, a value list, or a boolean) substituted in before the outer
+    // query is planned (two-pass). `ANY` / `ALL` subqueries are refused. Either way a subquery is
+    // never pushed verbatim to a shard, where it would run against that shard alone.
     match classify_subqueries(query) {
         SubqueryClass::None => {}
-        SubqueryClass::ScalarOnly => return Ok(Plan::ScalarSubqueries),
-        SubqueryClass::SetValued => {
+        SubqueryClass::Substitutable => return Ok(Plan::Subqueries),
+        SubqueryClass::Unsupported => {
             return Err(Unsupported {
-                what: "an IN, EXISTS, ANY or ALL subquery",
-                why: "only a scalar subquery — one returning a single value — can be evaluated \
-                      separately and substituted; these return a set",
+                what: "an ANY or ALL subquery",
+                why: "only scalar, IN and EXISTS subqueries can be evaluated separately and \
+                      substituted",
             });
         }
     }
@@ -633,6 +635,16 @@ fn check_join(select: &Select, shard_keys: &ShardKeys) -> std::result::Result<()
     let Some(table) = select.from.first() else {
         return Ok(()); // no FROM at all (e.g. `SELECT 1`)
     };
+    // A derived table (subquery in FROM) would be pushed to each shard, where an inner aggregate or
+    // grouping is only a per-shard fragment — a silent wrong answer. It needs coordinator-side
+    // materialisation, which is not built yet, so refuse it.
+    if !matches!(&table.relation, TableFactor::Table { .. }) {
+        return Err(Unsupported {
+            what: "a subquery or table-valued function in FROM",
+            why: "a derived table needs coordinator-side materialisation, not built yet; run it \
+                  as a separate query",
+        });
+    }
     if table.joins.is_empty() {
         return Ok(()); // a single table — nothing to co-locate
     }
@@ -1166,50 +1178,53 @@ fn literal_value(expr: &Expr) -> std::result::Result<crate::storage::exec::Value
 
 /// Whether any expression in `query` is (or contains) a subquery — walked completely via
 /// sqlparser's visitor, so nothing nested is missed.
+/// The largest number of rows a subquery may materialise on the coordinator: a scalar or `IN`
+/// subquery returning more than this is refused rather than held in memory (an `IN` list that big
+/// is a bug, and an unbounded one an OOM).
+const MAX_SUBQUERY_ROWS: usize = 100_000;
+
 /// What subqueries a query contains, walked completely by sqlparser's visitor.
 enum SubqueryClass {
     /// No subqueries.
     None,
-    /// Only scalar subqueries (`Expr::Subquery`) — evaluable and substitutable.
-    ScalarOnly,
-    /// A set-valued subquery form (`IN` / `EXISTS` / `ANY` / `ALL`) — refused.
-    SetValued,
+    /// Only substitutable subqueries — scalar `(SELECT …)`, `IN (SELECT …)`, or `EXISTS (…)`.
+    Substitutable,
+    /// A subquery form that is not substitutable (`ANY` / `ALL`) — refused.
+    Unsupported,
 }
 
 fn classify_subqueries(query: &Query) -> SubqueryClass {
-    let mut has_scalar = false;
-    let mut set_valued = false;
+    let mut substitutable = false;
+    let mut unsupported = false;
     let _ = visit_expressions(query, |e| match e {
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
-            set_valued = true;
+        Expr::AnyOp { .. } | Expr::AllOp { .. } => {
+            unsupported = true;
             ControlFlow::Break(())
         }
-        Expr::Subquery(_) => {
-            has_scalar = true;
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            substitutable = true;
             ControlFlow::Continue(())
         }
         _ => ControlFlow::Continue(()),
     });
-    if set_valued {
-        SubqueryClass::SetValued
-    } else if has_scalar {
-        SubqueryClass::ScalarOnly
+    if unsupported {
+        SubqueryClass::Unsupported
+    } else if substitutable {
+        SubqueryClass::Substitutable
     } else {
         SubqueryClass::None
     }
 }
 
-/// Two-pass scalar-subquery evaluation: walk `sql` and, for each scalar subquery, call `eval` with
-/// its SQL and splice the returned value in as a literal, then return the rewritten SQL for the
-/// caller to re-plan and fan out. The walk is **post-order**, so a nested subquery is evaluated and
-/// substituted before its parent — the parent is then subquery-free when it is evaluated, and a
-/// correlated subquery surfaces naturally as a "no such column" error from `eval`.
-pub fn substitute_scalar_subqueries<F>(
-    sql: &str,
-    mut eval: F,
-) -> std::result::Result<String, String>
+/// Two-pass subquery evaluation: walk `sql` and, for each subquery, call `eval` with its SQL and
+/// splice its result in — a scalar `(SELECT …)` becomes a literal, `IN (SELECT …)` a literal list
+/// (or a boolean when empty), `EXISTS (…)` a boolean — then return the rewritten (subquery-free)
+/// SQL for the caller to re-plan and fan out. The walk is **post-order**, so a nested subquery is
+/// evaluated and substituted before its parent (the parent is then subquery-free when evaluated),
+/// and a correlated subquery surfaces naturally as a "no such column" error from `eval`.
+pub fn substitute_subqueries<F>(sql: &str, mut eval: F) -> std::result::Result<String, String>
 where
-    F: FnMut(&str) -> std::result::Result<crate::storage::exec::Value, String>,
+    F: FnMut(&str) -> std::result::Result<crate::storage::exec::QueryResult, String>,
 {
     let dialect = SQLiteDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
@@ -1218,22 +1233,92 @@ where
         .ok_or_else(|| "empty statement".to_string())?;
 
     let mut error: Option<String> = None;
-    let _ = visit_expressions_mut(stmt, |expr| {
-        if let Expr::Subquery(inner) = expr {
-            match eval(&inner.to_string()).and_then(|v| literal_to_expr(&v)) {
-                Ok(literal) => *expr = literal,
-                Err(e) => {
-                    error = Some(e);
-                    return ControlFlow::Break(());
-                }
-            }
+    let _ = visit_expressions_mut(stmt, |expr| match substitute_one(expr, &mut eval) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(e) => {
+            error = Some(e);
+            ControlFlow::Break(())
         }
-        ControlFlow::<()>::Continue(())
     });
     if let Some(e) = error {
         return Err(e);
     }
     Ok(stmt.to_string())
+}
+
+/// Replace one subquery expression in place with its evaluated result. A no-op for a non-subquery.
+fn substitute_one<F>(expr: &mut Expr, eval: &mut F) -> std::result::Result<(), String>
+where
+    F: FnMut(&str) -> std::result::Result<crate::storage::exec::QueryResult, String>,
+{
+    match expr {
+        // Scalar subquery → a single value (one column, at most one row; no rows is NULL).
+        Expr::Subquery(subquery) => {
+            let result = eval(&subquery.to_string())?;
+            if result.columns.len() != 1 {
+                return Err("a scalar subquery must return exactly one column".to_string());
+            }
+            let value = match result.rows.len() {
+                0 => crate::storage::exec::Value::Null,
+                1 => result.rows[0]
+                    .first()
+                    .cloned()
+                    .unwrap_or(crate::storage::exec::Value::Null),
+                n => {
+                    return Err(format!(
+                        "a scalar subquery must return at most one row, got {n}"
+                    ));
+                }
+            };
+            *expr = literal_to_expr(&value)?;
+        }
+        // IN subquery → a literal list; an empty result is a constant false (true when negated).
+        Expr::InSubquery {
+            expr: lhs,
+            subquery,
+            negated,
+        } => {
+            let result = eval(&subquery.to_string())?;
+            if result.columns.len() != 1 {
+                return Err("an IN subquery must return exactly one column".to_string());
+            }
+            if result.rows.len() > MAX_SUBQUERY_ROWS {
+                return Err(format!(
+                    "an IN subquery returned more than {MAX_SUBQUERY_ROWS} values, too many to \
+                     hold on the coordinator; narrow it with a WHERE filter"
+                ));
+            }
+            if result.rows.is_empty() {
+                *expr = bool_expr(*negated);
+            } else {
+                let list = result
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        literal_to_expr(row.first().unwrap_or(&crate::storage::exec::Value::Null))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                *expr = Expr::InList {
+                    expr: lhs.clone(),
+                    list,
+                    negated: *negated,
+                };
+            }
+        }
+        // EXISTS → a boolean; correlated forms error inside `eval` (unknown outer column).
+        Expr::Exists { subquery, negated } => {
+            let result = eval(&subquery.to_string())?;
+            let exists = !result.rows.is_empty();
+            *expr = bool_expr(exists != *negated);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A SQL boolean literal (`1` / `0`) as an expression.
+fn bool_expr(value: bool) -> Expr {
+    Expr::Value(SqlValue::Number(i64::from(value).to_string(), false).with_empty_span())
 }
 
 /// A [`Value`](crate::storage::exec::Value) as an sqlparser literal expression, for splicing into a

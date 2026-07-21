@@ -297,6 +297,34 @@ fn scalar_subqueries_match_a_single_shard() {
 }
 
 #[test]
+fn in_and_exists_subqueries_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // IN / EXISTS are evaluated globally and substituted (a value list / a boolean) before the
+    // outer fan-out. `n % 7` gives a small candidate set, so the IN list exercises real membership.
+    for sql in [
+        "SELECT count(*) FROM t WHERE n % 7 IN (SELECT n % 7 FROM t WHERE n > 500)",
+        "SELECT count(*) FROM t WHERE n % 7 NOT IN (SELECT n % 7 FROM t WHERE n < 100)",
+        // An empty IN result → no rows; NOT IN of empty → all rows.
+        "SELECT count(*) FROM t WHERE n IN (SELECT n FROM t WHERE n > 100000)",
+        "SELECT count(*) FROM t WHERE n NOT IN (SELECT n FROM t WHERE n > 100000)",
+        // Uncorrelated EXISTS / NOT EXISTS — a constant boolean.
+        "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM t WHERE n > 900)",
+        "SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE n > 100000)",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // IN combined with an ordered row result.
+    assert_grouped_ordered(
+        &sharded,
+        &single,
+        "SELECT k FROM t WHERE n IN (SELECT n FROM t WHERE n % 100 = 0 AND n > 0) ORDER BY k",
+    );
+}
+
+#[test]
 fn a_correlated_subquery_is_refused() {
     // A correlated subquery references the outer row; evaluated on its own it names a column that
     // is not in scope, which surfaces as an error rather than a wrong answer.
@@ -695,10 +723,10 @@ fn queries_that_cannot_be_combined_are_refused() {
             "SELECT count(*), n FROM t",
             "neither grouped nor aggregated",
         ),
-        // A set-valued subquery cannot be reduced to a single substituted value.
+        // A derived table (subquery in FROM) needs coordinator-side materialisation.
         (
-            "SELECT k FROM t WHERE n IN (SELECT n FROM t WHERE n > 20)",
-            "IN, EXISTS",
+            "SELECT count(*) FROM (SELECT n FROM t WHERE n > 20)",
+            "FROM",
         ),
         // --- grouped queries that still cannot be answered correctly across shards ---
         // A bare column that is neither grouped nor aggregated is an arbitrary row per shard.
