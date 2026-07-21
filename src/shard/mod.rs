@@ -99,6 +99,52 @@ pub fn shard_of(key: &[u8], shard_count: u32) -> ShardId {
     ShardId((h % shard_count as u64) as u32)
 }
 
+fn shard_keys_path(dir: &Path) -> PathBuf {
+    dir.join("shard_keys.txt")
+}
+
+/// Load declared shard keys from `shard_keys.txt` (whitespace-separated `table column` lines,
+/// `#` comments). A missing or malformed file yields an empty declaration — the safe default,
+/// where joins are refused.
+fn load_shard_keys(dir: &Path) -> crate::query::ShardKeys {
+    let mut keys = crate::query::ShardKeys::new();
+    if let Ok(content) = std::fs::read_to_string(shard_keys_path(dir)) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((table, column)) = line.split_once(char::is_whitespace) {
+                keys.insert(
+                    table.trim().to_ascii_lowercase(),
+                    column.trim().to_ascii_lowercase(),
+                );
+            }
+        }
+    }
+    keys
+}
+
+/// Write shard keys atomically (temp file then rename), so a crash cannot leave a torn file.
+fn persist_shard_keys(dir: &Path, keys: &crate::query::ShardKeys) -> crate::Result<()> {
+    let mut out = String::from("# meshdb co-partitioning: <table> <shard-key column>\n");
+    let mut entries: Vec<_> = keys.iter().collect();
+    entries.sort();
+    for (table, column) in entries {
+        out.push_str(table);
+        out.push('\t');
+        out.push_str(column);
+        out.push('\n');
+    }
+    let path = shard_keys_path(dir);
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, out.as_bytes())
+        .map_err(|e| crate::Error::Protocol(format!("writing shard keys: {e}")))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| crate::Error::Protocol(format!("renaming shard keys: {e}")))?;
+    Ok(())
+}
+
 /// Sizing for a sharded database.
 #[derive(Debug, Clone)]
 pub struct ShardConfig {
@@ -236,6 +282,9 @@ pub struct ShardManager {
     dir: PathBuf,
     manifest: Manifest,
     modes: std::sync::Arc<mode::ShardModes>,
+    /// Declared co-partitioning: table → shard-key column. Loaded from `shard_keys.json` and used
+    /// to allow co-located joins in cross-shard reads.
+    shard_keys: std::sync::RwLock<crate::query::ShardKeys>,
 }
 
 impl ShardManager {
@@ -334,6 +383,7 @@ impl ShardManager {
             std::sync::Arc::downgrade(&writers),
             std::sync::Arc::clone(&modes),
         )?;
+        let shard_keys = std::sync::RwLock::new(load_shard_keys(dir));
         Ok(Self {
             writers,
             readers,
@@ -341,6 +391,7 @@ impl ShardManager {
             dir: dir.to_path_buf(),
             manifest,
             modes,
+            shard_keys,
         })
     }
 
@@ -511,7 +562,7 @@ impl ShardManager {
     /// cross-shard atomicity in this design, so that is a property of the answer rather than
     /// a gap to be closed.
     pub fn query_all_shards(&self, sql: &str) -> crate::Result<crate::storage::exec::QueryResult> {
-        use crate::query::{merge_results, plan};
+        use crate::query::{merge_results, plan_with};
         use crate::storage::exec::{Executed, Outcome};
 
         // Checked before a single row is read. A schema change lands one shard at a time, so
@@ -519,7 +570,11 @@ impl ShardManager {
         // not a slower answer, they are a wrong one. Refusing is the only honest response.
         self.schema_agreement()?.check()?;
 
-        let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
+        // Declared co-partitioning is consulted so a co-located join is allowed.
+        let plan = {
+            let shard_keys = self.shard_keys.read().unwrap();
+            plan_with(sql, &shard_keys).map_err(|u| crate::Error::Unsupported(u.to_string()))?
+        };
 
         // A scalar subquery is evaluated globally on its own, its value substituted in, and the
         // rewritten (subquery-free) query re-run. Nested subqueries substitute bottom-up.
@@ -631,6 +686,31 @@ impl ShardManager {
                 "a scalar subquery must return at most one row, but `{subsql}` returns {n}"
             )),
         }
+    }
+
+    /// Declare a table's shard-key column — the column its rows are routed by. Two tables declared
+    /// on their shard keys may be joined in a cross-shard read, because a matching pair
+    /// (`a.key = b.key`) then routes to the same shard. This is the app **asserting** how it routes
+    /// those tables; meshdb trusts it, since it cannot verify placement. Persisted to
+    /// `shard_keys.txt` in the data directory.
+    pub fn declare_shard_key(&self, table: &str, column: &str) -> crate::Result<()> {
+        let mut keys = self.shard_keys.write().unwrap();
+        keys.insert(table.to_ascii_lowercase(), column.to_ascii_lowercase());
+        persist_shard_keys(&self.dir, &keys)
+    }
+
+    /// The declared shard key for a table, if any.
+    pub fn shard_key(&self, table: &str) -> Option<String> {
+        self.shard_keys
+            .read()
+            .unwrap()
+            .get(&table.to_ascii_lowercase())
+            .cloned()
+    }
+
+    /// A snapshot of every declared shard key (table → column).
+    pub fn shard_keys(&self) -> crate::query::ShardKeys {
+        self.shard_keys.read().unwrap().clone()
     }
 
     /// Run a statement against **every** shard.

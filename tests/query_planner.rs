@@ -310,6 +310,142 @@ fn a_correlated_subquery_is_refused() {
     assert!(!err.to_string().is_empty(), "{err}");
 }
 
+/// Two co-partitioned tables: `customers` routed by `cid`, `orders` routed by `cust`. A customer
+/// and all its orders therefore land on the same shard, so a join on `orders.cust = customers.cid`
+/// is co-located. Returns a sharded manager (with the co-partitioning declared) and a single-shard
+/// ground truth holding identical data.
+fn join_twin(dirs: &(TempDir, TempDir), shards: u32) -> (ShardManager, ShardManager) {
+    let sharded = ShardManager::open(dirs.0.path(), cfg(shards)).unwrap();
+    let single = ShardManager::open(dirs.1.path(), cfg(1)).unwrap();
+
+    for m in [&sharded, &single] {
+        m.execute_all_shards("CREATE TABLE customers (cid TEXT PRIMARY KEY, region TEXT) STRICT")
+            .unwrap();
+        m.execute_all_shards(
+            "CREATE TABLE orders (oid TEXT PRIMARY KEY, cust TEXT, amt INTEGER) STRICT",
+        )
+        .unwrap();
+        m.declare_shard_key("customers", "cid").unwrap();
+        m.declare_shard_key("orders", "cust").unwrap();
+    }
+
+    // 25 customers; orders exist only for c0..c19, so c20..c24 are unmatched (for LEFT JOIN).
+    for i in 0..25 {
+        let cid = format!("c{i}");
+        let stmt = Statement::with_params(
+            "INSERT INTO customers VALUES (?1, ?2)",
+            vec![Value::Text(cid.clone()), Value::Text(format!("r{}", i % 4))],
+        );
+        sharded
+            .execute_one(sharded.route(cid.as_bytes()), stmt.clone())
+            .unwrap();
+        single.execute_one(ShardId(0), stmt).unwrap();
+    }
+    for i in 0..100 {
+        let cust = format!("c{}", i % 20);
+        let stmt = Statement::with_params(
+            "INSERT INTO orders VALUES (?1, ?2, ?3)",
+            vec![
+                Value::Text(format!("o{i}")),
+                Value::Text(cust.clone()),
+                Value::Integer((i * 13 % 100) as i64),
+            ],
+        );
+        // Orders route by `cust` — the customer's shard key — so they co-locate with the customer.
+        sharded
+            .execute_one(sharded.route(cust.as_bytes()), stmt.clone())
+            .unwrap();
+        single.execute_one(ShardId(0), stmt).unwrap();
+    }
+    (sharded, single)
+}
+
+#[test]
+fn colocated_joins_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = join_twin(&dirs, 16);
+
+    // Each shard joins its local rows; because the tables are co-partitioned every match is local,
+    // so the concatenation equals the single-shard join. Compared against native SQLite.
+    for sql in [
+        // Plain inner join.
+        "SELECT o.oid, c.region FROM orders o JOIN customers c ON o.cust = c.cid",
+        // Join + WHERE + aggregate.
+        "SELECT count(*) FROM orders o JOIN customers c ON o.cust = c.cid WHERE o.amt > 50",
+        // Join + GROUP BY on a non-shard-key column (re-aggregated across shards).
+        "SELECT c.region, count(*), sum(o.amt) FROM orders o JOIN customers c \
+         ON o.cust = c.cid GROUP BY c.region",
+        // Join + extra ON condition (pushed down, not needed for co-location).
+        "SELECT count(*) FROM orders o JOIN customers c ON o.cust = c.cid AND o.amt > 30",
+        // LEFT JOIN: customers c20..c24 have no orders and appear with a zero count.
+        "SELECT c.cid, count(o.oid) FROM customers c LEFT JOIN orders o ON o.cust = c.cid \
+         GROUP BY c.cid",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // Ordered join result (deterministic — grouped by the unique region key).
+    assert_grouped_ordered(
+        &sharded,
+        &single,
+        "SELECT c.region, sum(o.amt) AS total FROM orders o JOIN customers c \
+         ON o.cust = c.cid GROUP BY c.region ORDER BY c.region",
+    );
+}
+
+#[test]
+fn colocated_join_answer_is_invariant_to_shard_count() {
+    // The same join over the same co-partitioned data must give the same answer however the data
+    // is spread — the strongest statement that the join genuinely spans shards correctly.
+    let sql = "SELECT c.region, count(*), sum(o.amt) FROM orders o JOIN customers c \
+               ON o.cust = c.cid GROUP BY c.region";
+    let mut baseline: Option<Vec<Vec<Value>>> = None;
+    for shards in [1u32, 4, 16, 64] {
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (sharded, _single) = join_twin(&dirs, shards);
+        let answer = sorted(sharded.query_all_shards(sql).unwrap().rows);
+        match &baseline {
+            None => baseline = Some(answer),
+            Some(b) => assert_eq!(&answer, b, "join answer changed at {shards} shards"),
+        }
+    }
+}
+
+#[test]
+fn non_colocated_joins_are_refused() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, _single) = join_twin(&dirs, 8);
+
+    for (sql, expect) in [
+        // Join on a non-shard-key column (orders is routed by cust, not oid).
+        (
+            "SELECT o.oid FROM orders o JOIN customers c ON o.oid = c.cid",
+            "shard keys",
+        ),
+        // Cross join (comma-separated tables).
+        ("SELECT o.oid FROM orders o, customers c", "cross join"),
+        // A second join whose ON is not on shard keys.
+        (
+            "SELECT o.oid FROM orders o JOIN customers c ON o.cust = c.cid \
+             JOIN orders o2 ON o2.oid = c.cid",
+            "shard keys",
+        ),
+        // NATURAL join has no explicit ON equality.
+        (
+            "SELECT o.oid FROM orders o NATURAL JOIN customers c",
+            "NATURAL",
+        ),
+    ] {
+        let err = sharded
+            .query_all_shards(sql)
+            .expect_err(&format!("{sql} should be refused"));
+        assert!(
+            err.to_string().contains(expect),
+            "refusal for `{sql}` should mention `{expect}`, got: {err}"
+        );
+    }
+}
+
 #[test]
 fn ordered_queries_match_a_single_shard() {
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());

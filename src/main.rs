@@ -65,6 +65,7 @@ fn main() -> ExitCode {
         "serve" => return serve_cmd(&args),
         "user" => return user_cmd(&args),
         "frames" => return frames_cmd(&args),
+        "shardkey" => return shardkey_cmd(&args),
         _ => {}
     }
 
@@ -836,6 +837,60 @@ fn enable_tls(
 
 /// Resolve the shard count the same way the main path does: the manifest decides for an
 /// existing directory, and `--shards` is required to create one.
+const SHARDKEY_USAGE: &str = "usage:
+  meshdb shardkey <dir> <table> <column>   declare a table's shard key (co-partitioning)
+  meshdb shardkey <dir> --list             list declared shard keys
+
+Two tables declared on their shard keys may be joined in a cross-shard read on those keys.
+This asserts how the app routes those tables — meshdb trusts it, as it cannot verify placement.";
+
+fn shardkey_cmd(args: &[String]) -> ExitCode {
+    // args[0] == "shardkey"
+    let pos = positionals(&args[1..]);
+    let Some(dir) = pos.first().map(std::path::PathBuf::from) else {
+        eprintln!("{SHARDKEY_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let shards = match resolve_shards(&dir, None) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    let db = match Db::open(&dir, shards) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // List when asked, or when only the directory was given.
+    if has_flag(args, "--list") || pos.len() < 3 {
+        let keys = db.shards().shard_keys();
+        if keys.is_empty() {
+            println!("no shard keys declared");
+        } else {
+            let mut entries: Vec<_> = keys.iter().collect();
+            entries.sort();
+            for (table, column) in entries {
+                println!("{table}\t{column}");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let (table, column) = (pos[1], pos[2]);
+    match db.shards().declare_shard_key(table, column) {
+        Ok(()) => {
+            println!("declared shard key: {table} -> {column}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn resolve_shards(
     dir: &std::path::Path,
     requested: Option<u32>,

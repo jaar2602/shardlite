@@ -270,16 +270,24 @@ revert-verified.
 | **Derived-table / `IN (SELECT …)` subquery** | Materialise the fan-out-safe inner centrally, run the outer over the (small) materialised set. | Same central primitive; cap-gated. Still refused. |
 | **Aggregate + bare column, no `GROUP BY`** | Mostly *subsumed by Increment A* — the fix is "add `GROUP BY`". The `MIN`/`MAX`-with-bare-columns rule is a decomposable **argmin/argmax** (each shard returns its extreme row; coordinator picks the global one) — a small optional feature. | The general bare-column form stays refused: nondeterministic even on one shard. |
 
-## Tier 3 — the architectural line
+## Tier 3 — the architectural line — **co-located `JOIN` done**
 
-**`JOIN`** is not a planner decision. meshdb never moves data between shards, so a join fans out
-cleanly only when matching rows are **co-located** — both tables sharded on the same key and joined
-on it. meshdb routes by an app-supplied key, so co-location is possible by convention but not
-*provable* today, which is exactly why the join is refused. The tractable path is an explicit
-**co-partitioning declaration**: the app asserts "these tables are co-sharded on this key", and
-meshdb trusts that to push `A_shard ⋈ B_shard` per shard and concatenate. General joins (different
-keys) need either a data shuffle — a subsystem the architecture deliberately excludes — or a
-central hash-join of both fully-materialised sides (correct, expensive, cap-gated).
+**`JOIN`** is not a planner decision — meshdb never moves data between shards, so a join fans out
+cleanly only when matching rows are **co-located**. That is now supported via an explicit
+**co-partitioning declaration**: `ShardManager::declare_shard_key(table, column)` (persisted to
+`shard_keys.txt`, also the `meshdb shardkey` CLI) records each table's shard-key column. A join on
+two tables' shard keys — `A.ka = B.kb` — is then allowed: matching rows route to the same shard, so
+each shard joins its local rows and the results concatenate, and WHERE / GROUP BY / aggregates
+compose on top exactly as for a single table (`check_join` in the planner; the join rides along in
+the shard SQL). INNER / LEFT / RIGHT / FULL are all safe (unmatched rows stay on their shard).
+
+This is the one place the planner **trusts rather than proves**: meshdb cannot verify the app
+actually co-located the data, so a false declaration yields a join that silently misses cross-shard
+matches (revert-verified: a non-co-located join returns empty). Documented loudly at every entry
+point. Refused: cross joins, joins on non-shard-key columns, joins touching an undeclared table,
+`USING`/`NATURAL`, and derived-table joins. General (non-co-located) joins still need a data shuffle
+— a subsystem the architecture deliberately excludes — or a central hash-join of both
+fully-materialised sides (correct, expensive, cap-gated); still refused.
 
 ## Correctly permanent (not gaps)
 
@@ -292,6 +300,7 @@ central hash-join of both fully-materialised sides (correct, expensive, cap-gate
 
 **A. `GROUP BY`** ✓ → **`DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** ✓ → **`INTERSECT`/`EXCEPT` +
 mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** ✓ → **uncorrelated scalar
-subqueries + bare `AVG`/multi-aggregate** ✓ → **co-located `JOIN`** (next — its own opt-in feature)
-and derived-table / `IN` subqueries. Each step keeps parse-prove-refuse and adds a memory cap
-wherever it materialises.
+subqueries + bare `AVG`/multi-aggregate** ✓ → **co-located `JOIN`** ✓ (opt-in via a co-partitioning
+declaration). Remaining: derived-table / `IN` subqueries (the central-materialisation primitive) and
+general non-co-located joins. Each step keeps parse-prove-refuse and adds a memory cap wherever it
+materialises.

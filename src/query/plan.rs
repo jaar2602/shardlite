@@ -23,6 +23,7 @@
 //! | `OFFSET` (± `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
 //! | `UNION` / `INTERSECT` / `EXCEPT` (any mix) | fan out each branch, then combine on the coordinator |
 //! | scalar subquery `(SELECT …)` | evaluate it globally, substitute its value, re-plan the outer |
+//! | co-located `JOIN` | join each shard's local rows; concatenate (see [`ShardKeys`]) |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
@@ -35,7 +36,9 @@
 //!
 //! # What is refused, and why each one
 //!
-//! - **`JOIN`** — rows that must meet live on different shards, and nothing moves them.
+//! - **A join that is not co-located** — rows that must meet may live on different shards, and
+//!   nothing moves them. A join *is* allowed when the tables are declared co-partitioned on their
+//!   join keys (see [`ShardKeys`]), so every matching pair routes to one shard.
 //! - **`COUNT(DISTINCT c)` and other `DISTINCT` aggregates** — the same value can appear on
 //!   several shards, so a per-shard distinct count double-counts.
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
@@ -55,11 +58,14 @@
 
 use std::ops::ControlFlow;
 
+use std::collections::HashMap;
+
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, GroupByWithModifier, LimitClause, OrderByKind, Query, Select,
-    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement, UnaryOperator,
-    Value as SqlValue, ValueWithSpan, visit_expressions, visit_expressions_mut,
+    FunctionArguments, GroupByExpr, GroupByWithModifier, JoinConstraint, JoinOperator, LimitClause,
+    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement as SqlStatement, TableFactor, UnaryOperator, Value as SqlValue, ValueWithSpan,
+    visit_expressions, visit_expressions_mut,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -264,8 +270,24 @@ impl std::fmt::Display for Unsupported {
     }
 }
 
-/// Decide how `sql` can be run across shards.
+/// The app's declaration of how tables are routed: table name → its shard-key column, both
+/// lowercased. A join on two tables' shard keys keeps every matching pair on one shard (they route
+/// to the same shard), so it is *co-located* and can be pushed to each shard and concatenated.
+///
+/// This is a **trust assertion**, not something meshdb can verify: the app is responsible for
+/// having routed those columns consistently. Declaring co-partitioning for tables that are not
+/// actually co-located yields a join that silently misses cross-shard matches — the one place the
+/// planner trusts rather than proves.
+pub type ShardKeys = std::collections::HashMap<String, String>;
+
+/// Decide how `sql` can be run across shards, with no co-partitioning declared — joins are refused.
 pub fn plan(sql: &str) -> std::result::Result<Plan, Unsupported> {
+    plan_with(sql, &ShardKeys::new())
+}
+
+/// Decide how `sql` can be run across shards. `shard_keys` declares which tables are co-partitioned
+/// (see [`ShardKeys`]); a join on their shard keys is allowed, every other join refused.
+pub fn plan_with(sql: &str, shard_keys: &ShardKeys) -> std::result::Result<Plan, Unsupported> {
     let dialect = SQLiteDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql).map_err(|_| Unsupported {
         what: "this statement",
@@ -290,10 +312,10 @@ pub fn plan(sql: &str) -> std::result::Result<Plan, Unsupported> {
         }
     };
 
-    plan_query(&query)
+    plan_query(&query, shard_keys)
 }
 
-fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
+fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan, Unsupported> {
     if query.with.is_some() {
         return Err(Unsupported {
             what: "a common table expression",
@@ -326,7 +348,8 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
 
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
-        // UNION / UNION ALL fan out; INTERSECT / EXCEPT do not (see plan_set_op).
+        // UNION / UNION ALL fan out; INTERSECT / EXCEPT do not (see plan_set_op). Each branch is
+        // re-planned on its own fan-out, so a co-located join inside a branch is validated there.
         SetExpr::SetOperation { .. } => return plan_set_op(query),
         _ => {
             return Err(Unsupported {
@@ -338,12 +361,12 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
 
     // DISTINCT dedups on the coordinator; it is no longer refused.
     if select.distinct.is_some() {
-        return plan_distinct(query, select);
+        return plan_distinct(query, select, shard_keys);
     }
     // A grouped query takes the dedicated two-phase path; a plain SELECT falls through.
     match &select.group_by {
         GroupByExpr::Expressions(exprs, modifiers) if !exprs.is_empty() => {
-            return plan_grouped(query, select, exprs, modifiers);
+            return plan_grouped(query, select, exprs, modifiers, shard_keys);
         }
         GroupByExpr::All(_) => {
             return Err(Unsupported {
@@ -359,16 +382,13 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
             why: "it filters groups, which are partial per shard",
         });
     }
-    if select.from.len() > 1 || select.from.first().is_some_and(|f| !f.joins.is_empty()) {
-        return Err(Unsupported {
-            what: "a join",
-            why: "rows that must meet may live on different shards, and nothing moves them \
-                  together",
-        });
-    }
+    // A join is refused unless it is co-located — a join on the tables' declared shard keys, so
+    // every matching pair lives on one shard. When co-located the join rides along in the shard
+    // SQL, and WHERE / GROUP BY / aggregates compose on top exactly as for a single table.
+    check_join(select, shard_keys)?;
 
     // A bare aggregate (no GROUP BY) is a group over the whole table.
-    if let Some(plan) = plan_bare_aggregate(query, select)? {
+    if let Some(plan) = plan_bare_aggregate(query, select, shard_keys)? {
         return Ok(plan);
     }
 
@@ -402,6 +422,7 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
 fn plan_bare_aggregate(
     query: &Query,
     select: &Select,
+    shard_keys: &ShardKeys,
 ) -> std::result::Result<Option<Plan>, Unsupported> {
     let mut has_aggregate = false;
     for item in &select.projection {
@@ -430,13 +451,17 @@ fn plan_bare_aggregate(
     }
 
     // Everything else — AVG, several aggregates, ordering — is a group over the whole table.
-    Ok(Some(plan_grouped(query, select, &[], &[])?))
+    Ok(Some(plan_grouped(query, select, &[], &[], shard_keys)?))
 }
 
 /// Plan a `SELECT DISTINCT`: each shard dedups locally (shrinking transfer), and the coordinator
 /// dedups the union of the shards' rows. It is `GROUP BY` on every selected column with no
 /// aggregate — the same dedup-on-merge primitive.
-fn plan_distinct(query: &Query, select: &Select) -> std::result::Result<Plan, Unsupported> {
+fn plan_distinct(
+    query: &Query,
+    select: &Select,
+    shard_keys: &ShardKeys,
+) -> std::result::Result<Plan, Unsupported> {
     if let Some(Distinct::On(_)) = &select.distinct {
         return Err(Unsupported {
             what: "DISTINCT ON",
@@ -456,10 +481,10 @@ fn plan_distinct(query: &Query, select: &Select) -> std::result::Result<Plan, Un
         if let SetExpr::Select(s) = without.body.as_mut() {
             s.distinct = None;
         }
-        return plan_query(&without);
+        return plan_query(&without, shard_keys);
     }
 
-    require_plain_select(select)?;
+    require_plain_select(select, shard_keys)?;
 
     let (limit, offset) = limit_and_offset(query)?;
     let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
@@ -560,10 +585,13 @@ fn build_set_tree<'a>(
     }
 }
 
-/// A projection that produces plain rows: no aggregate, grouping, `HAVING`, or join. Required of
-/// a `DISTINCT` query and of every `UNION` branch, where a per-shard aggregate or grouping would
-/// be only a fragment of the whole.
-fn require_plain_select(select: &Select) -> std::result::Result<(), Unsupported> {
+/// A projection that produces plain rows: no aggregate, grouping, or `HAVING` (a co-located join
+/// is allowed). Required of a `DISTINCT` query and of every `UNION` branch, where a per-shard
+/// aggregate or grouping would be only a fragment of the whole.
+fn require_plain_select(
+    select: &Select,
+    shard_keys: &ShardKeys,
+) -> std::result::Result<(), Unsupported> {
     if !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty()) {
         return Err(Unsupported {
             what: "GROUP BY combined with DISTINCT or a set operation",
@@ -576,13 +604,7 @@ fn require_plain_select(select: &Select) -> std::result::Result<(), Unsupported>
             why: "it filters groups that are partial per shard",
         });
     }
-    if select.from.len() > 1 || select.from.first().is_some_and(|f| !f.joins.is_empty()) {
-        return Err(Unsupported {
-            what: "a join",
-            why: "rows that must meet may live on different shards, and nothing moves them \
-                  together",
-        });
-    }
+    check_join(select, shard_keys)?;
     for item in &select.projection {
         if aggregate_of(item)?.is_some() {
             return Err(Unsupported {
@@ -593,6 +615,146 @@ fn require_plain_select(select: &Select) -> std::result::Result<(), Unsupported>
         }
     }
     Ok(())
+}
+
+/// Allow a **co-located** join — a join on the tables' declared shard keys, so every matching pair
+/// routes to one shard — and refuse every other join. A co-located join is not rewritten: it stays
+/// in the shard SQL (the `FROM` serialises the whole join), so each shard joins its local rows and
+/// the results concatenate. Refused: cross joins, joins on non-shard-key columns, joins touching an
+/// undeclared table, `USING`/`NATURAL`, non-equality conditions, and derived-table joins — in each
+/// the matching rows may live on different shards and nothing moves them together.
+fn check_join(select: &Select, shard_keys: &ShardKeys) -> std::result::Result<(), Unsupported> {
+    if select.from.len() > 1 {
+        return Err(Unsupported {
+            what: "a cross join (comma-separated tables)",
+            why: "it pairs rows regardless of key, so matching rows may live on different shards",
+        });
+    }
+    let Some(table) = select.from.first() else {
+        return Ok(()); // no FROM at all (e.g. `SELECT 1`)
+    };
+    if table.joins.is_empty() {
+        return Ok(()); // a single table — nothing to co-locate
+    }
+
+    // Each table alias → its declared shard-key column. A joined table with no declared shard key
+    // makes the join uncheckable and is refused.
+    let mut alias_key: HashMap<String, String> = HashMap::new();
+    add_join_relation(&table.relation, shard_keys, &mut alias_key)?;
+    for join in &table.joins {
+        add_join_relation(&join.relation, shard_keys, &mut alias_key)?;
+        let on = join_on_condition(&join.join_operator)?;
+        if !on_equates_shard_keys(on, &alias_key) {
+            return Err(Unsupported {
+                what: "a join that is not on the tables' shard keys",
+                why: "matching rows may live on different shards; join co-partitioned tables on \
+                      their declared shard keys",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Record a joined relation's alias → shard key, refusing a non-table relation or an undeclared
+/// table.
+fn add_join_relation(
+    relation: &TableFactor,
+    shard_keys: &ShardKeys,
+    alias_key: &mut HashMap<String, String>,
+) -> std::result::Result<(), Unsupported> {
+    let TableFactor::Table { name, alias, .. } = relation else {
+        return Err(Unsupported {
+            what: "a subquery or derived table in a join",
+            why: "only named, co-partitioned tables can be joined across shards",
+        });
+    };
+    let table_name = name.to_string().to_ascii_lowercase();
+    let shard_key = shard_keys.get(&table_name).ok_or(Unsupported {
+        what: "a join on a table with no declared shard key",
+        why: "declare the table's shard key (co-partitioning) before joining it across shards",
+    })?;
+    let alias_name = alias
+        .as_ref()
+        .map(|a| a.name.value.to_ascii_lowercase())
+        .unwrap_or(table_name);
+    alias_key.insert(alias_name, shard_key.to_ascii_lowercase());
+    Ok(())
+}
+
+/// The `ON` expression of a join, or a refusal for a join type or constraint that cannot be
+/// pushed down (`CROSS`, `USING`, `NATURAL`).
+fn join_on_condition(op: &JoinOperator) -> std::result::Result<&Expr, Unsupported> {
+    let constraint = match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => c,
+        _ => {
+            return Err(Unsupported {
+                what: "this join type",
+                why: "only INNER, LEFT, RIGHT and FULL joins on shard keys are supported",
+            });
+        }
+    };
+    match constraint {
+        JoinConstraint::On(expr) => Ok(expr),
+        _ => Err(Unsupported {
+            what: "a USING or NATURAL join",
+            why: "the join must have an explicit ON equality on the shard keys",
+        }),
+    }
+}
+
+/// Whether the `ON` condition guarantees the join is on the two tables' shard keys: some top-level
+/// `AND` conjunct is `X.a = Y.b` where `X`, `Y` are different tables and `a`, `b` are their shard
+/// keys. Extra conjuncts (e.g. `AND B.active`) are fine — they only filter and are pushed down.
+fn on_equates_shard_keys(on: &Expr, alias_key: &HashMap<String, String>) -> bool {
+    and_conjuncts(on).into_iter().any(|conj| {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conj
+            && let (Some((xa, xc)), Some((ya, yc))) = (compound_pair(left), compound_pair(right))
+        {
+            xa != ya
+                && alias_key.get(&xa).is_some_and(|k| *k == xc)
+                && alias_key.get(&ya).is_some_and(|k| *k == yc)
+        } else {
+            false
+        }
+    })
+}
+
+/// Split an expression into its top-level `AND` conjuncts (looking through parentheses).
+fn and_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut v = and_conjuncts(left);
+            v.extend(and_conjuncts(right));
+            v
+        }
+        Expr::Nested(inner) => and_conjuncts(inner),
+        other => vec![other],
+    }
+}
+
+/// A two-part qualified reference `alias.column`, lowercased.
+fn compound_pair(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((
+            parts[0].value.to_ascii_lowercase(),
+            parts[1].value.to_ascii_lowercase(),
+        )),
+        _ => None,
+    }
 }
 
 /// The caller's query rewritten for per-shard execution: `OFFSET` removed and any `LIMIT` set to
@@ -687,6 +849,7 @@ fn plan_grouped(
     select: &Select,
     group_exprs: &[Expr],
     modifiers: &[GroupByWithModifier],
+    shard_keys: &ShardKeys,
 ) -> std::result::Result<Plan, Unsupported> {
     if !modifiers.is_empty() {
         return Err(Unsupported {
@@ -694,13 +857,9 @@ fn plan_grouped(
             why: "these produce super-aggregate rows that a fan-out cannot reassemble",
         });
     }
-    if select.from.len() > 1 || select.from.first().is_some_and(|f| !f.joins.is_empty()) {
-        return Err(Unsupported {
-            what: "a join",
-            why: "rows that must meet may live on different shards, and nothing moves them \
-                  together",
-        });
-    }
+    // A co-located join is allowed; it rides along in the shard SQL below (the FROM serialises the
+    // whole join), and each shard groups its local join result.
+    check_join(select, shard_keys)?;
     let from = select.from.first().ok_or(Unsupported {
         what: "a grouped query with no FROM",
         why: "there is nothing to fan out",
