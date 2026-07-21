@@ -171,6 +171,9 @@ impl HttpGateway {
             (Method::Post, "/v1/query_all") => {
                 return self.handle_query_all(req, role);
             }
+            (Method::Post, "/v1/run") => {
+                return self.handle_run(req, role);
+            }
             (Method::Post, "/v1/execute") => {
                 return self.handle_execute(req, role);
             }
@@ -369,6 +372,32 @@ impl HttpGateway {
             );
             Ok(response_to_http(resp))
         });
+        respond_json(req, out);
+    }
+
+    /// `POST /v1/run` — auto-routed: the server picks the shard(s), so the client names none. A read
+    /// returns rows, a write the count. The permission follows the statement's verb (as
+    /// `auth::required` does for `Request::Run`), so it must be classified before the check.
+    fn handle_run(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| {
+            let body = read_body(&mut req)?;
+            let q: SqlBody = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            let need = match crate::db::first_keyword(&q.sql).as_str() {
+                "CREATE" | "DROP" | "ALTER" => Requirement::Admin,
+                "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => Requirement::Write,
+                _ => Requirement::Read,
+            };
+            self.check(role, need)?;
+            let resp = super::server::handle(
+                super::protocol::Request::Run {
+                    statement: Statement::new(&q.sql),
+                },
+                &self.shards,
+                &self.services,
+            );
+            Ok(response_to_http(resp))
+        })();
         respond_json(req, out);
     }
 
