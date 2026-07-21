@@ -1,10 +1,10 @@
 //! Combining per-shard results into one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::exec::{QueryResult, Value};
 
-use super::plan::{Combine, Grouped, OutputCol, Plan, SortKey};
+use super::plan::{Combine, Grouped, OutputCol, Plan, PostProcess, SortKey};
 
 /// Combine per-shard results according to `plan`.
 ///
@@ -60,7 +60,41 @@ pub fn merge_results(plan: &Plan, parts: Vec<QueryResult>) -> QueryResult {
         }
 
         Plan::Grouped(g) => merge_grouped(g, parts),
+
+        Plan::PostProcess(p) => merge_post_process(p, columns, parts),
     }
+}
+
+/// Concatenate every shard's rows, then optionally dedup, sort, skip `offset`, and truncate to
+/// `limit` — the coordinator half of `DISTINCT`, `UNION` / `UNION ALL`, and `OFFSET`.
+fn merge_post_process(
+    p: &PostProcess,
+    columns: Vec<String>,
+    parts: Vec<QueryResult>,
+) -> QueryResult {
+    let mut rows: Vec<Vec<Value>> = parts.into_iter().flat_map(|p| p.rows).collect();
+
+    if p.distinct {
+        // Collapse rows equal under SQLite value comparison (so Integer(1) and Real(1.0), and two
+        // NULLs, are one row), keeping first appearance. `BTreeSet` navigates by `GroupKey`'s Ord.
+        let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
+        rows.retain(|row| seen.insert(GroupKey(row.clone())));
+    }
+    if !p.order_by.is_empty() {
+        rows.sort_by(|a, b| compare_rows(a, b, &p.order_by));
+    }
+    if p.offset > 0 {
+        rows = if p.offset < rows.len() {
+            rows.split_off(p.offset)
+        } else {
+            Vec::new()
+        };
+    }
+    if let Some(n) = p.limit {
+        rows.truncate(n);
+    }
+
+    QueryResult { columns, rows }
 }
 
 /// The coordinator half of two-phase aggregation: bucket every shard's partial rows by their
@@ -103,6 +137,13 @@ fn merge_grouped(g: &Grouped, parts: Vec<QueryResult>) -> QueryResult {
 
     if !g.order_by.is_empty() {
         rows.sort_by(|a, b| compare_rows(a, b, &g.order_by));
+    }
+    if g.offset > 0 {
+        rows = if g.offset < rows.len() {
+            rows.split_off(g.offset)
+        } else {
+            Vec::new()
+        };
     }
     if let Some(n) = g.limit {
         rows.truncate(n);

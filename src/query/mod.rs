@@ -8,4 +8,4 @@ pub mod merge;
 pub mod plan;
 
 pub use merge::merge_results;
-pub use plan::{Combine, Grouped, OutputCol, Plan, SortKey, Unsupported, plan};
+pub use plan::{Combine, Grouped, OutputCol, Plan, PostProcess, SortKey, Unsupported, plan};

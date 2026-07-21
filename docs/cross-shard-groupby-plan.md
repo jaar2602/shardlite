@@ -236,7 +236,13 @@ The three primitives:
 3. **materialise-a-fan-out-safe-sub-result centrally** — pull a bounded, provably-safe sub-result
    fully to the coordinator and finish the operation there. New, and memory-cap-gated.
 
-## Tier 1 — same family as `GROUP BY` (easy; fold in next)
+## Tier 1 — same family as `GROUP BY` — **DONE** (`DISTINCT`, `UNION`/`UNION ALL`, `OFFSET`)
+
+Implemented on the `GROUP BY` machinery as a `Plan::PostProcess` reshape (dedup / sort / skip /
+truncate on the coordinator, with the per-shard query rewritten to strip `OFFSET` and widen
+`LIMIT` to `offset+limit`). Verified against native SQLite as an independent oracle; the dedup and
+re-aggregation paths are revert-verified. Still refused: `INTERSECT`/`EXCEPT`, mixing `UNION` with
+`UNION ALL`, `OFFSET` without `ORDER BY`, and any aggregate inside a `DISTINCT`/`UNION`.
 
 | Refusal | Approach | Cost / caveat |
 |---|---|---|

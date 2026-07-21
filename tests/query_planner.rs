@@ -294,6 +294,69 @@ fn the_shard_count_does_not_change_the_answer() {
 }
 
 #[test]
+fn distinct_matches_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // Unordered DISTINCT — compared as a multiset against native SQLite.
+    for sql in [
+        "SELECT DISTINCT n FROM t",
+        "SELECT DISTINCT n % 5 FROM t",
+        "SELECT DISTINCT n, s FROM t WHERE n IS NOT NULL",
+        "SELECT DISTINCT s FROM t",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // Ordered DISTINCT with LIMIT/OFFSET — distinct values are unique, so the order is total and
+    // the row-for-row comparison against native SQLite is sound.
+    for sql in [
+        "SELECT DISTINCT n FROM t WHERE n IS NOT NULL ORDER BY n LIMIT 10",
+        "SELECT DISTINCT n FROM t WHERE n IS NOT NULL ORDER BY n DESC LIMIT 5 OFFSET 3",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn union_matches_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // Multiset comparison against native SQLite. `n % 7` is low-cardinality, so the same value
+    // recurs on many shards — exercising UNION's cross-shard dedup (a per-shard union alone would
+    // leave duplicates) and UNION ALL's duplicate-keeping, including across the branch boundary.
+    for sql in [
+        "SELECT n % 7 FROM t WHERE n < 500 UNION SELECT n % 7 FROM t WHERE n > 200",
+        "SELECT n % 7 FROM t WHERE n < 500 UNION ALL SELECT n % 7 FROM t WHERE n > 200",
+        // `k` is a unique primary key: the no-cross-shard-duplicate path.
+        "SELECT k FROM t WHERE n < 300 UNION SELECT k FROM t WHERE n > 100",
+        // Three branches, all distinct UNION, over a low-cardinality key.
+        "SELECT n % 10 FROM t WHERE n < 200 UNION SELECT n % 10 FROM t WHERE n >= 200 AND n < 400 \
+         UNION SELECT n % 10 FROM t WHERE n >= 400",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn offset_matches_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // `k` is a unique primary key, so ORDER BY k is a total order and OFFSET is deterministic.
+    for sql in [
+        "SELECT k FROM t ORDER BY k LIMIT 10 OFFSET 5",
+        "SELECT k FROM t ORDER BY k DESC LIMIT 20 OFFSET 30",
+        "SELECT k, n FROM t ORDER BY k LIMIT 15 OFFSET 100",
+        // OFFSET past most rows — the tail of the table.
+        "SELECT k FROM t ORDER BY k LIMIT 5 OFFSET 395",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
 fn a_runaway_grouping_is_capped_not_ooming() {
     // A high-cardinality grouping — grouping by a near-unique column — would materialise a group
     // per row on the coordinator. A configurable cap turns that into a loud refusal instead of an
@@ -340,10 +403,24 @@ fn queries_that_cannot_be_combined_are_refused() {
     // must error instead.
     for (sql, expect) in [
         ("SELECT avg(n) FROM t", "AVG"),
-        ("SELECT DISTINCT n FROM t", "DISTINCT"),
         ("SELECT a.k FROM t a JOIN t b ON a.k = b.k", "join"),
+        // OFFSET is only answerable with a global order.
         ("SELECT k FROM t LIMIT 10 OFFSET 5", "OFFSET"),
-        ("SELECT k FROM t UNION SELECT k FROM t", "UNION"),
+        // INTERSECT / EXCEPT cannot be pushed down — a row can be on one side on one shard and
+        // the other side on another, so per-shard evaluation misses cross-shard matches.
+        ("SELECT k FROM t INTERSECT SELECT k FROM t", "INTERSECT"),
+        ("SELECT k FROM t EXCEPT SELECT k FROM t", "EXCEPT"),
+        // Mixing UNION and UNION ALL cannot be honoured in one coordinator pass.
+        (
+            "SELECT k FROM t UNION SELECT k FROM t UNION ALL SELECT k FROM t",
+            "mixing",
+        ),
+        // An aggregate under DISTINCT or in a UNION branch is a per-shard fragment.
+        ("SELECT DISTINCT count(*) FROM t", "aggregate"),
+        (
+            "SELECT count(*) FROM t UNION SELECT count(*) FROM t",
+            "aggregate",
+        ),
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
             "common table expression",
@@ -481,6 +558,43 @@ fn plans_are_what_they_claim_to_be() {
             );
         }
         other => panic!("expected a grouped plan, got {other:?}"),
+    }
+
+    // DISTINCT → a post-process that dedups; the shard query keeps DISTINCT.
+    match plan("SELECT DISTINCT n FROM t").unwrap() {
+        Plan::PostProcess(p) => {
+            assert!(p.distinct);
+            assert_eq!(p.offset, 0);
+            assert!(p.order_by.is_empty());
+            assert!(p.shard_sql.to_uppercase().contains("DISTINCT"));
+        }
+        other => panic!("expected a post-process plan, got {other:?}"),
+    }
+
+    // OFFSET → the shard LIMIT is widened to offset+limit and the OFFSET is stripped.
+    match plan("SELECT k FROM t ORDER BY k LIMIT 10 OFFSET 5").unwrap() {
+        Plan::PostProcess(p) => {
+            assert!(!p.distinct);
+            assert_eq!(p.offset, 5);
+            assert_eq!(p.limit, Some(10));
+            assert_eq!(p.order_by.len(), 1);
+            assert!(
+                p.shard_sql.contains("LIMIT 15"),
+                "shard sql: {}",
+                p.shard_sql
+            );
+            assert!(!p.shard_sql.to_uppercase().contains("OFFSET"));
+        }
+        other => panic!("expected a post-process plan, got {other:?}"),
+    }
+
+    // UNION ALL → a post-process that does not dedup.
+    match plan("SELECT k FROM t UNION ALL SELECT k FROM t").unwrap() {
+        Plan::PostProcess(p) => {
+            assert!(!p.distinct);
+            assert!(p.shard_sql.to_uppercase().contains("UNION ALL"));
+        }
+        other => panic!("expected a post-process plan, got {other:?}"),
     }
 }
 

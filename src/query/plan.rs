@@ -19,25 +19,31 @@
 //! | `MIN(c)` / `MAX(c)` | min of minima / max of maxima |
 //! | `GROUP BY g, …` | two-phase: per-shard partial groups, then re-aggregate by key |
 //! | `AVG(c)` (bare or grouped) | decompose to `SUM(c)`/`COUNT(c)`, divide at the coordinator |
+//! | `DISTINCT` | per-shard dedup, then dedup the union on the coordinator |
+//! | `UNION` / `UNION ALL` | per-shard evaluate, then concat (ALL) or dedup on the coordinator |
+//! | `OFFSET` (with `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
 //! carrying `SUM` and `COUNT` per shard and dividing once. `GROUP BY` is the same idea per
-//! group: each shard produces partial groups, the coordinator re-aggregates them by key (see
-//! [`Grouped`]).
+//! group (see [`Grouped`]); `DISTINCT`, `UNION`, and `OFFSET` are coordinator-side reshapes of the
+//! concatenated rows (see [`PostProcess`]).
 //!
 //! # What is refused, and why each one
 //!
 //! - **`JOIN`** — rows that must meet live on different shards, and nothing moves them.
 //! - **`HAVING`** — filtering groups across shards needs a coordinator-side evaluator, not yet
 //!   built (a later increment).
-//! - **`DISTINCT`**, incl. `COUNT(DISTINCT c)` — the same value can appear on several shards.
+//! - **`COUNT(DISTINCT c)` and other `DISTINCT` aggregates** — the same value can appear on
+//!   several shards, so a per-shard distinct count double-counts.
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
-//! - **`OFFSET`** — the rows skipped per shard are not the rows to skip globally.
+//! - **`OFFSET` without `ORDER BY`** — the rows skipped are undefined without a global order.
+//! - **`INTERSECT` / `EXCEPT`** — a row can be on one side on one shard and the other side on
+//!   another, so per-shard evaluation misses cross-shard matches.
 //! - **Subqueries** — each would run against one shard alone, not the whole table.
-//! - **Set operations, CTEs** — each can hide any of the above.
+//! - **CTEs** — can hide any of the above.
 //!
 //! # What it cannot fix
 //!
@@ -49,9 +55,10 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, OrderByKind, Query, Select, SelectItem, SetExpr,
-    Statement as SqlStatement, Value as SqlValue, ValueWithSpan, visit_expressions,
+    Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, GroupByWithModifier, LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement as SqlStatement, Value as SqlValue, ValueWithSpan,
+    visit_expressions,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -89,6 +96,25 @@ pub enum Plan {
     Aggregate { combine: Combine },
     /// Fan out a rewritten partial-aggregation query, then re-aggregate by group key.
     Grouped(Box<Grouped>),
+    /// Fan out a rewritten query, then dedup / sort / skip / truncate on the coordinator. Covers
+    /// `DISTINCT`, `UNION` / `UNION ALL`, and `OFFSET`.
+    PostProcess(Box<PostProcess>),
+}
+
+/// A coordinator-side reshape of concatenated shard rows: optionally dedup them, sort them, skip
+/// `offset`, then keep `limit`. The per-shard `shard_sql` is the caller's query with `OFFSET`
+/// removed and any `LIMIT` widened to `offset + limit` so each shard ships enough rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostProcess {
+    pub shard_sql: String,
+    /// Collapse rows equal under SQLite value comparison — `DISTINCT` and a distinct `UNION`.
+    pub distinct: bool,
+    /// Sort keys over the output columns (empty when there is no `ORDER BY`).
+    pub order_by: Vec<SortKey>,
+    /// Rows to skip after sorting — a global `OFFSET`.
+    pub offset: usize,
+    /// Rows to keep after skipping.
+    pub limit: Option<usize>,
 }
 
 /// A two-phase `GROUP BY`. Each shard runs `shard_sql` to produce its *partial* groups (SQLite
@@ -107,6 +133,8 @@ pub struct Grouped {
     pub output_names: Vec<String>,
     /// Sort keys over the *final* output columns (empty when there is no `ORDER BY`).
     pub order_by: Vec<SortKey>,
+    /// Groups to skip after ordering — a global `OFFSET`.
+    pub offset: usize,
     /// Applied at the coordinator after re-aggregation — never pushed to a shard, where a
     /// per-shard `LIMIT` would drop groups whose rows are spread across shards.
     pub limit: Option<usize>,
@@ -193,15 +221,21 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         });
     }
 
+    // A subquery anywhere would be pushed verbatim to each shard, where it runs against that shard
+    // alone rather than the whole table — a silent wrong answer. Refuse it in every plan (a UNION
+    // branch or a WHERE clause included). Walked completely by sqlparser's visitor.
+    if has_subquery(query) {
+        return Err(Unsupported {
+            what: "a subquery",
+            why: "it would run against each shard alone, not the whole table, so the merged \
+                  result would be wrong; compute the subquery separately and inline its value",
+        });
+    }
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
-        SetExpr::SetOperation { .. } => {
-            return Err(Unsupported {
-                what: "UNION, INTERSECT or EXCEPT",
-                why: "the operation is defined over whole result sets, and each shard holds \
-                      only a fragment of each side",
-            });
-        }
+        // UNION / UNION ALL fan out; INTERSECT / EXCEPT do not (see plan_set_op).
+        SetExpr::SetOperation { .. } => return plan_set_op(query),
         _ => {
             return Err(Unsupported {
                 what: "this query form",
@@ -210,23 +244,9 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         }
     };
 
-    // A subquery anywhere would be pushed verbatim to each shard, where it runs against that
-    // shard alone rather than the whole table — a silent wrong answer. Refuse it in every plan,
-    // not only the grouped one. Walked completely by sqlparser's visitor, so nothing nested is
-    // missed.
-    if has_subquery(query) {
-        return Err(Unsupported {
-            what: "a subquery",
-            why: "it would run against each shard alone, not the whole table, so the merged \
-                  result would be wrong; compute the subquery separately and inline its value",
-        });
-    }
+    // DISTINCT dedups on the coordinator; it is no longer refused.
     if select.distinct.is_some() {
-        return Err(Unsupported {
-            what: "DISTINCT",
-            why: "the same value can appear on several shards, so per-shard deduplication \
-                  leaves duplicates behind",
-        });
+        return plan_distinct(query, select);
     }
     // A grouped query takes the dedicated two-phase path; a plain SELECT falls through.
     match &select.group_by {
@@ -283,39 +303,278 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         });
     }
 
-    let limit = query
-        .limit_clause
-        .as_ref()
-        .and_then(literal_limit)
-        .transpose()?;
+    let (limit, offset) = limit_and_offset(query)?;
+    let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
 
-    match &query.order_by {
-        None => Ok(Plan::Concat { limit }),
-        Some(order) => {
-            let OrderByKind::Expressions(exprs) = &order.kind else {
+    // OFFSET needs a global order and coordinator-side skipping; it cannot be pushed per shard.
+    if offset > 0 {
+        if keys.is_empty() {
+            return Err(Unsupported {
+                what: "OFFSET without ORDER BY",
+                why: "the rows skipped per shard are not the rows to skip globally; add an \
+                      ORDER BY so the offset is well defined",
+            });
+        }
+        // Each shard ships its top (offset + limit) rows so the coordinator can skip then take.
+        return Ok(Plan::PostProcess(Box::new(PostProcess {
+            shard_sql: shard_sql_with_limit(query, limit.map(|n| n + offset)),
+            distinct: false,
+            order_by: keys,
+            offset,
+            limit,
+        })));
+    }
+
+    if keys.is_empty() {
+        Ok(Plan::Concat { limit })
+    } else {
+        Ok(Plan::Merge { keys, limit })
+    }
+}
+
+/// Plan a `SELECT DISTINCT`: each shard dedups locally (shrinking transfer), and the coordinator
+/// dedups the union of the shards' rows. It is `GROUP BY` on every selected column with no
+/// aggregate — the same dedup-on-merge primitive.
+fn plan_distinct(query: &Query, select: &Select) -> std::result::Result<Plan, Unsupported> {
+    if let Some(Distinct::On(_)) = &select.distinct {
+        return Err(Unsupported {
+            what: "DISTINCT ON",
+            why: "it keeps an arbitrary row per group, which a fan-out cannot reproduce",
+        });
+    }
+    require_plain_select(select)?;
+
+    let (limit, offset) = limit_and_offset(query)?;
+    let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
+    if offset > 0 && keys.is_empty() {
+        return Err(Unsupported {
+            what: "OFFSET without ORDER BY",
+            why: "the rows skipped per shard are not the rows to skip globally; add an ORDER BY",
+        });
+    }
+    // A widened LIMIT is only safe to push when ordered (each shard's top-k contains the global
+    // top-k); unordered, dedup the whole thing and limit at the coordinator.
+    let push = if keys.is_empty() {
+        None
+    } else {
+        limit.map(|n| n + offset)
+    };
+    Ok(Plan::PostProcess(Box::new(PostProcess {
+        shard_sql: shard_sql_with_limit(query, push),
+        distinct: true,
+        order_by: keys,
+        offset,
+        limit,
+    })))
+}
+
+/// Plan a `UNION` / `UNION ALL`: every shard evaluates the whole set operation over its own rows,
+/// and the coordinator concatenates (`UNION ALL`) or dedups (`UNION`). `INTERSECT` / `EXCEPT` are
+/// refused — a row can be on one side on one shard and the other side on another, so per-shard
+/// evaluation misses cross-shard matches. Mixing `UNION` and `UNION ALL` in one query is refused
+/// because their duplicate handling cannot both be honoured in a single coordinator pass.
+fn plan_set_op(query: &Query) -> std::result::Result<Plan, Unsupported> {
+    let mut leaves: Vec<&Select> = Vec::new();
+    let mut distinct: Option<bool> = None;
+    collect_union_leaves(query.body.as_ref(), &mut leaves, &mut distinct)?;
+    for &leaf in &leaves {
+        require_plain_select(leaf)?;
+    }
+    let first = *leaves.first().ok_or(Unsupported {
+        what: "an empty set operation",
+        why: "there is nothing to fan out",
+    })?;
+
+    let (limit, offset) = limit_and_offset(query)?;
+    // An ORDER BY on a compound select resolves against the first branch's output columns.
+    let keys = resolve_sort_keys(&query.order_by, &first.projection)?;
+    if offset > 0 && keys.is_empty() {
+        return Err(Unsupported {
+            what: "OFFSET without ORDER BY",
+            why: "the rows skipped per shard are not the rows to skip globally; add an ORDER BY",
+        });
+    }
+    let push = if keys.is_empty() {
+        None
+    } else {
+        limit.map(|n| n + offset)
+    };
+    Ok(Plan::PostProcess(Box::new(PostProcess {
+        shard_sql: shard_sql_with_limit(query, push),
+        distinct: distinct.unwrap_or(true),
+        order_by: keys,
+        offset,
+        limit,
+    })))
+}
+
+/// Flatten a set-operation tree into its leaf SELECTs, requiring every operator to be `UNION`
+/// with a consistent `ALL`/distinct quantifier.
+fn collect_union_leaves<'a>(
+    body: &'a SetExpr,
+    leaves: &mut Vec<&'a Select>,
+    distinct: &mut Option<bool>,
+) -> std::result::Result<(), Unsupported> {
+    match body {
+        SetExpr::Select(s) => {
+            leaves.push(s);
+            Ok(())
+        }
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if *op != SetOperator::Union {
                 return Err(Unsupported {
-                    what: "ORDER BY ALL",
-                    why: "the sort columns cannot be resolved to output columns",
-                });
-            };
-            let mut keys = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                let column =
-                    output_column_index(&e.expr, &select.projection).ok_or(Unsupported {
-                        what: "ORDER BY on an expression that is not in the select list",
-                        why: "a merge can only sort by values it can see in the rows, so the \
-                              sort column must be selected",
-                    })?;
-                let descending = e.options.asc == Some(false);
-                keys.push(SortKey {
-                    column,
-                    // SQLite's default: NULLs first ascending, last descending.
-                    nulls_first: e.options.nulls_first.unwrap_or(!descending),
-                    descending,
+                    what: "INTERSECT or EXCEPT",
+                    why: "a row can be on one side on one shard and the other side on another, so \
+                          per-shard evaluation misses cross-shard matches",
                 });
             }
-            Ok(Plan::Merge { keys, limit })
+            let is_distinct = !matches!(
+                set_quantifier,
+                SetQuantifier::All | SetQuantifier::AllByName
+            );
+            match distinct {
+                None => *distinct = Some(is_distinct),
+                Some(prev) if *prev == is_distinct => {}
+                Some(_) => {
+                    return Err(Unsupported {
+                        what: "mixing UNION and UNION ALL",
+                        why: "their duplicate handling differs and a single coordinator pass \
+                              cannot honour both; use one or the other",
+                    });
+                }
+            }
+            collect_union_leaves(left, leaves, distinct)?;
+            collect_union_leaves(right, leaves, distinct)
         }
+        _ => Err(Unsupported {
+            what: "this query form in a set operation",
+            why: "only plain SELECT branches can be fanned out",
+        }),
+    }
+}
+
+/// A projection that produces plain rows: no aggregate, grouping, `HAVING`, or join. Required of
+/// a `DISTINCT` query and of every `UNION` branch, where a per-shard aggregate or grouping would
+/// be only a fragment of the whole.
+fn require_plain_select(select: &Select) -> std::result::Result<(), Unsupported> {
+    if !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty()) {
+        return Err(Unsupported {
+            what: "GROUP BY combined with DISTINCT or a set operation",
+            why: "the grouping is partial per shard, so it cannot be pushed down here",
+        });
+    }
+    if select.having.is_some() {
+        return Err(Unsupported {
+            what: "HAVING here",
+            why: "it filters groups that are partial per shard",
+        });
+    }
+    if select.from.len() > 1 || select.from.first().is_some_and(|f| !f.joins.is_empty()) {
+        return Err(Unsupported {
+            what: "a join",
+            why: "rows that must meet may live on different shards, and nothing moves them \
+                  together",
+        });
+    }
+    for item in &select.projection {
+        if aggregate_of(item)?.is_some() {
+            return Err(Unsupported {
+                what: "an aggregate with DISTINCT or a set operation",
+                why: "a per-shard aggregate is only a fragment of the whole, so it cannot be \
+                      combined here",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The caller's query rewritten for per-shard execution: `OFFSET` removed and any `LIMIT` set to
+/// `limit` (already widened to include the offset), or removed when `limit` is `None`. `ORDER BY`
+/// is kept so a widened `LIMIT` still selects the right rows.
+fn shard_sql_with_limit(query: &Query, limit: Option<usize>) -> String {
+    let mut q = query.clone();
+    q.limit_clause = None;
+    let base = q.to_string();
+    match limit {
+        Some(n) => format!("{base} LIMIT {n}"),
+        None => base,
+    }
+}
+
+/// Resolve an `ORDER BY` to sort keys over `projection`, or an empty list when there is none.
+fn resolve_sort_keys(
+    order_by: &Option<sqlparser::ast::OrderBy>,
+    projection: &[SelectItem],
+) -> std::result::Result<Vec<SortKey>, Unsupported> {
+    let Some(order) = order_by else {
+        return Ok(Vec::new());
+    };
+    let OrderByKind::Expressions(exprs) = &order.kind else {
+        return Err(Unsupported {
+            what: "ORDER BY ALL",
+            why: "the sort columns cannot be resolved to output columns",
+        });
+    };
+    let mut keys = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let column = output_column_index(&e.expr, projection).ok_or(Unsupported {
+            what: "ORDER BY on an expression that is not in the select list",
+            why: "a merge can only sort by values it can see in the rows, so the sort column \
+                  must be selected (use an alias or an ordinal)",
+        })?;
+        let descending = e.options.asc == Some(false);
+        keys.push(SortKey {
+            column,
+            // SQLite's default: NULLs first ascending, last descending.
+            nulls_first: e.options.nulls_first.unwrap_or(!descending),
+            descending,
+        });
+    }
+    Ok(keys)
+}
+
+/// A query's `(LIMIT, OFFSET)` as literals. `OFFSET` is no longer a blanket refusal — an ordered
+/// query can honour it at the coordinator.
+fn limit_and_offset(query: &Query) -> std::result::Result<(Option<usize>, usize), Unsupported> {
+    let Some(clause) = &query.limit_clause else {
+        return Ok((None, 0));
+    };
+    let LimitClause::LimitOffset { limit, offset, .. } = clause else {
+        return Err(Unsupported {
+            what: "this LIMIT form",
+            why: "only a literal row count can be pushed down to each shard",
+        });
+    };
+    let lim = match limit {
+        None => None,
+        Some(e) => Some(literal_usize(e).ok_or(Unsupported {
+            what: "a non-literal LIMIT",
+            why: "only a literal row count can be pushed down to each shard",
+        })?),
+    };
+    let off = match offset {
+        None => 0,
+        Some(o) => literal_usize(&o.value).ok_or(Unsupported {
+            what: "a non-literal OFFSET",
+            why: "only a literal row offset is supported",
+        })?,
+    };
+    Ok((lim, off))
+}
+
+/// A non-negative integer literal, or `None` for anything else.
+fn literal_usize(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Number(n, _),
+            ..
+        }) => n.parse::<usize>().ok(),
+        _ => None,
     }
 }
 
@@ -422,40 +681,16 @@ fn plan_grouped(
         }
     }
 
-    // LIMIT is coordinator-only for a grouped query; ORDER BY resolves against final outputs.
-    let limit = query
-        .limit_clause
-        .as_ref()
-        .and_then(literal_limit)
-        .transpose()?;
-
-    let order_by = match &query.order_by {
-        None => Vec::new(),
-        Some(order) => {
-            let OrderByKind::Expressions(exprs) = &order.kind else {
-                return Err(Unsupported {
-                    what: "ORDER BY ALL",
-                    why: "the sort columns cannot be resolved to output columns",
-                });
-            };
-            let mut keys = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                let column =
-                    output_column_index(&e.expr, &select.projection).ok_or(Unsupported {
-                        what: "ORDER BY on an expression that is not in the select list",
-                        why: "a merge can only sort by values it can see in the rows, so the \
-                              sort column must be selected (use an alias or an ordinal)",
-                    })?;
-                let descending = e.options.asc == Some(false);
-                keys.push(SortKey {
-                    column,
-                    nulls_first: e.options.nulls_first.unwrap_or(!descending),
-                    descending,
-                });
-            }
-            keys
-        }
-    };
+    // LIMIT and OFFSET are coordinator-only for a grouped query; ORDER BY resolves against the
+    // final output columns.
+    let (limit, offset) = limit_and_offset(query)?;
+    let order_by = resolve_sort_keys(&query.order_by, &select.projection)?;
+    if offset > 0 && order_by.is_empty() {
+        return Err(Unsupported {
+            what: "OFFSET without ORDER BY",
+            why: "the groups skipped are undefined without a global order; add an ORDER BY",
+        });
+    }
 
     let where_clause = select
         .selection
@@ -476,6 +711,7 @@ fn plan_grouped(
         outputs,
         output_names: names,
         order_by,
+        offset,
         limit,
     })))
 }
@@ -670,34 +906,4 @@ fn output_column_index(expr: &Expr, projection: &[SelectItem]) -> Option<usize> 
         }
     }
     None
-}
-
-fn literal_limit(
-    clause: &sqlparser::ast::LimitClause,
-) -> Option<std::result::Result<usize, Unsupported>> {
-    let sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } = clause else {
-        return Some(Err(Unsupported {
-            what: "this LIMIT form",
-            why: "only a literal row count can be pushed down to each shard",
-        }));
-    };
-    if offset.is_some() {
-        return Some(Err(Unsupported {
-            what: "OFFSET",
-            why: "the rows skipped on each shard are not the rows to skip globally",
-        }));
-    }
-    match limit.as_ref()? {
-        Expr::Value(ValueWithSpan {
-            value: SqlValue::Number(n, _),
-            ..
-        }) => Some(n.parse::<usize>().map_err(|_| Unsupported {
-            what: "this LIMIT value",
-            why: "it is not a literal row count",
-        })),
-        _ => Some(Err(Unsupported {
-            what: "a non-literal LIMIT",
-            why: "only a literal row count can be pushed down to each shard",
-        })),
-    }
 }

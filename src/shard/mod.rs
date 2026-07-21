@@ -521,11 +521,12 @@ impl ShardManager {
 
         let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
 
-        // A grouped query runs a *rewritten* partial-aggregation query on each shard; every other
-        // plan runs the caller's SQL unchanged.
+        // Grouped and post-processed (DISTINCT / UNION / OFFSET) queries run a *rewritten* query
+        // on each shard; every other plan runs the caller's SQL unchanged.
         let grouped = matches!(&plan, crate::query::Plan::Grouped(_));
         let shard_sql = match &plan {
             crate::query::Plan::Grouped(g) => g.shard_sql.as_str(),
+            crate::query::Plan::PostProcess(p) => p.shard_sql.as_str(),
             _ => sql,
         };
 
