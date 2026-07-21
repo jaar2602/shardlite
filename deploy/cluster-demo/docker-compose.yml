@@ -1,0 +1,47 @@
+# A three-node meshdb cluster, each node in its own container, on one Docker network.
+#
+# The 12 shards are spread across the three nodes automatically (placement round-robins by
+# node id — 4 shards each). A client can connect to ANY node and run SQL against ANY shard:
+# the node it talks to routes writes to the shard's owner and gathers cross-shard reads from
+# every node. No client ever names a shard.
+#
+# Each node's --peers lists the OTHER two by their in-network address (node<N>:4600). One port
+# per node carries both client and peer traffic, by design. --http-insecure permits the
+# plaintext gateway (this is a local demo; put TLS / --users in front for anything real).
+name: meshdb-cluster
+
+x-node: &node
+  image: meshdb-demo:latest
+  restart: unless-stopped
+  networks: [mesh]
+
+services:
+  # Only node1 declares the build; node2/node3 reuse the same image tag. (If all three declared
+  # `build:` for one tag, compose races to write it and two of them fail with "already exists".)
+  node1:
+    <<: *node
+    build:
+      context: ../..
+      dockerfile: deploy/cluster-demo/Dockerfile
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 1 --peers 2=node2:4600,3=node3:4600
+    ports: ["8081:8080"]
+  node2:
+    <<: *node
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 2 --peers 1=node1:4600,3=node3:4600
+    ports: ["8082:8080"]
+  node3:
+    <<: *node
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 3 --peers 1=node1:4600,2=node2:4600
+    ports: ["8083:8080"]
+
+networks:
+  mesh: {}

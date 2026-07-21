@@ -1,0 +1,7 @@
+# Keep the Docker build context small — the meshdb binary needs only the crate sources.
+/target
+/console
+/drivers
+/.git
+**/node_modules
+**/*.log
