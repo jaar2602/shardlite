@@ -6,6 +6,7 @@
 
 pub mod merge;
 pub mod plan;
+pub mod route;
 
 pub use merge::{evaluate_set_tree, finalize_rows, merge_results};
 pub use plan::{
@@ -13,3 +14,4 @@ pub use plan::{
     PostProcess, SetKind, SetOp, SetTree, ShardKeys, SortKey, Unsupported, plan, plan_with,
     substitute_subqueries,
 };
+pub use route::{Route, route_statement};

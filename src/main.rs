@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use meshdb::db::Db;
+use meshdb::query::{Route, route_statement};
 use meshdb::shard::ShardId;
 use meshdb::shard::manifest::Manifest;
 use meshdb::storage::exec::{Executed, Outcome, QueryResult};
@@ -26,8 +27,11 @@ value you cannot revise should not be one you got by accident.
   16-64    typical; 64 covers roughly 100 MB to 1 TB
   256      maximum
 
-Note that statements other than DDL go to one shard at a time (see .shard), as
-there is no cross-shard query planner yet.
+A write is routed to the shard its declared shard key hashes to (see the
+`shardkey` command), so writes spread across shards automatically; a multi-row
+INSERT is split per shard. A point read/update/delete on the shard key reaches
+just the shard holding the row. Without a declared shard key a write falls back
+to the current shard (see .shard).
 
 shell commands:
   .help     show this message
@@ -40,14 +44,14 @@ shell commands:
 
 DDL (CREATE / DROP / ALTER) is applied to every shard automatically.
 
-Reads fan out across all shards and are merged. Shapes that cannot be combined
-correctly — JOIN, GROUP BY, DISTINCT, AVG, OFFSET — are refused rather than
-answered wrongly; run those against one shard with .shard N.
+Reads fan out across all shards and are merged. GROUP BY, DISTINCT, AVG, OFFSET,
+UNION/INTERSECT/EXCEPT, subqueries and JOINs (co-located, or materialised
+centrally) are all combined correctly. A shape that cannot be — GROUP_CONCAT, a
+correlated subquery, a source over the materialisation cap — is refused rather
+than answered wrongly; run those against one shard with .shard N.
 
 Note that a fan-out is not a consistent snapshot: each shard is read at its own
-moment, and there is no cross-shard atomicity in this design.
-
-Writes go to the current shard, since the CLI has no routing key.";
+moment, and there is no cross-shard atomicity in this design.";
 
 fn main() -> ExitCode {
     init_tracing();
@@ -352,6 +356,26 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
         };
     }
 
+    // Route by the declared shard key so a write spreads across shards instead of all landing on
+    // the current shard (0 by default), and a point read/update/delete reaches the one shard that
+    // holds the row. A statement with no declared key, or a non-point read, falls through
+    // (Passthrough) to the fan-out / current-shard path below.
+    if db.shard_count() > 1 {
+        match route_statement(sql, &db.shards().shard_keys(), db.shard_count()) {
+            Route::One(s) => return run_on_shard(db, ShardId(s), sql),
+            Route::Split(parts) => return run_split(db, &parts),
+            Route::All => return run_on_all(db, sql),
+            Route::Refuse(msg) => {
+                eprintln!("cannot route: {msg}");
+                eprintln!(
+                    "(declare the table's shard key with `meshdb shardkey <table> <column>`)"
+                );
+                return false;
+            }
+            Route::Passthrough => {}
+        }
+    }
+
     // Reads fan out by default; a shape that cannot be merged is refused rather than
     // silently answered from one shard. Writes must NOT come through here — the planner
     // refuses non-SELECT statements, so a write routed into the fan-out would be reported
@@ -375,6 +399,12 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
         }
     }
 
+    run_on_shard(db, shard, sql)
+}
+
+/// Run a statement on one shard and print its result. The shared tail of both the default path and
+/// an auto-routed single-shard statement.
+fn run_on_shard(db: &Db, shard: ShardId, sql: &str) -> bool {
     match db.run_on(shard, sql) {
         Ok(Outcome::Ok(Executed::Rows(result))) => {
             print_table(&result);
@@ -392,6 +422,61 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
         Ok(Outcome::Rejected(msg)) => {
             eprintln!("rejected: {msg}");
             false
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            false
+        }
+    }
+}
+
+/// Run a split multi-row INSERT — one rewritten statement per shard — reporting the combined effect.
+fn run_split(db: &Db, parts: &[(u32, String)]) -> bool {
+    let mut affected = 0u64;
+    for (shard, sub) in parts {
+        match db.run_on(ShardId(*shard), sub) {
+            Ok(Outcome::Ok(Executed::Changed(w))) => affected += w.rows_affected,
+            Ok(Outcome::Rejected(msg)) => {
+                eprintln!("rejected on shard {shard}: {msg}");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("error on shard {shard}: {e}");
+                return false;
+            }
+            Ok(_) => {}
+        }
+    }
+    println!(
+        "ok ({affected} row{} affected across {} shards)",
+        if affected == 1 { "" } else { "s" },
+        parts.len()
+    );
+    true
+}
+
+/// Apply a write to every shard, reporting the summed effect. Used for a write whose WHERE does not
+/// pin the shard key, so it must touch them all rather than silently miss rows.
+fn run_on_all(db: &Db, sql: &str) -> bool {
+    match db.run_all(sql) {
+        Ok(results) => {
+            let mut affected = 0u64;
+            for (id, o) in &results {
+                match o {
+                    Outcome::Ok(Executed::Changed(w)) => affected += w.rows_affected,
+                    Outcome::Rejected(msg) => {
+                        eprintln!("rejected on {id}: {msg}");
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            println!(
+                "ok ({affected} row{} affected across {} shards)",
+                if affected == 1 { "" } else { "s" },
+                results.len()
+            );
+            true
         }
         Err(e) => {
             eprintln!("error: {e}");
