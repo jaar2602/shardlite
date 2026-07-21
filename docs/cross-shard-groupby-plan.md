@@ -253,7 +253,7 @@ re-aggregation paths are revert-verified. Still refused: `INTERSECT`/`EXCEPT`, m
 | **`UNION` / `UNION ALL`** | Each shard computes its side(s) locally; coordinator concatenates. `UNION ALL` = pure concat; `UNION` = concat + dedup. Both sides must be fan-out-safe. | Recurse the planner into each side. |
 | **`OFFSET`** | Push `LIMIT offset+count` (no offset) to each shard, coordinator sorts, drops `offset`, takes `count`. `OFFSET` *without* `ORDER BY` is allowed too — the rows are unspecified, exactly as for a bare `LIMIT`, so the count is the contract. | Deep pagination ships `offset+count` rows per shard — keyset pagination stays the recommendation. |
 
-## Tier 2 — need the central-materialisation primitive (cap-gated)
+## Tier 2 — the central-materialisation primitive (cap-gated) — **done**
 
 **Set operations are DONE** — `INTERSECT` / `EXCEPT`, mixing `UNION` with `UNION ALL`, and set-op
 branches that are themselves aggregates or grouped queries. Rather than pushing the operation down
@@ -267,10 +267,10 @@ revert-verified.
 |---|---|---|
 | ~~**`INTERSECT` / `EXCEPT`**~~ **(done)** | Fan out each branch globally, combine on the coordinator via multi-pass — no pushdown, so cross-shard matches are not missed. | Holds both branch results on the coordinator (same as `Concat`); no separate cap yet. |
 | ~~**Uncorrelated scalar / `IN` / `EXISTS` subquery**~~ **(done)** | Two-pass: `substitute_subqueries` evaluates each subquery globally and splices its result in — a scalar becomes a literal, `IN (SELECT …)` a literal list (`Expr::InList`, or a constant boolean when empty), `EXISTS (…)` a boolean — bottom-up, so nesting works; the rewritten outer is re-planned and fanned out. A correlated subquery names the outer row and, run on its own, errors — refused naturally. The `IN` list is capped (`MAX_SUBQUERY_ROWS`) to bound coordinator memory. This also completed **bare `AVG` / multiple bare aggregates**. | Each subquery is one extra fan-out pass; a huge `IN` result is refused. |
-| **Derived-table subquery** (`FROM (SELECT …)`) | Materialise the fan-out-safe inner centrally, run the outer over the (small) materialised set. | Needs coordinator-side execution; **still refused** (previously a silent-wrong-answer hole, now an explicit refusal). |
+| ~~**Derived-table subquery** (`FROM (SELECT …)`)~~ **(done)** | `Plan::Central`: each `FROM` source is materialised globally (`query_all_shards`), loaded into a coordinator in-memory SQLite (`eval_central` + `load_central_table`), and the outer query runs there. A derived table contributes its inner SQL as one source. | Materialises each source on the coordinator; capped at `cfg.max_grouped_rows` — a source over the cap is refused. Verified against native SQLite; the load is revert-verified. |
 | **Aggregate + bare column, no `GROUP BY`** | Mostly *subsumed by Increment A* — the fix is "add `GROUP BY`". The `MIN`/`MAX`-with-bare-columns rule is a decomposable **argmin/argmax** (each shard returns its extreme row; coordinator picks the global one) — a small optional feature. | The general bare-column form stays refused: nondeterministic even on one shard. |
 
-## Tier 3 — the architectural line — **co-located `JOIN` done**
+## Tier 3 — the architectural line — **co-located `JOIN` (pushdown) + general `JOIN` (central) done**
 
 **`JOIN`** is not a planner decision — meshdb never moves data between shards, so a join fans out
 cleanly only when matching rows are **co-located**. That is now supported via an explicit
@@ -284,10 +284,14 @@ the shard SQL). INNER / LEFT / RIGHT / FULL are all safe (unmatched rows stay on
 This is the one place the planner **trusts rather than proves**: meshdb cannot verify the app
 actually co-located the data, so a false declaration yields a join that silently misses cross-shard
 matches (revert-verified: a non-co-located join returns empty). Documented loudly at every entry
-point. Refused: cross joins, joins on non-shard-key columns, joins touching an undeclared table,
-`USING`/`NATURAL`, and derived-table joins. General (non-co-located) joins still need a data shuffle
-— a subsystem the architecture deliberately excludes — or a central hash-join of both
-fully-materialised sides (correct, expensive, cap-gated); still refused.
+point.
+
+A join that is *not* co-located no longer refuses either — it falls through to `Plan::Central`
+(the same primitive as derived tables): each side is materialised globally and the join runs on the
+coordinator's in-memory SQLite. This is the "central hash-join of both fully-materialised sides"
+noted below — correct, expensive, and cap-gated at `cfg.max_grouped_rows` per source. It is the
+right default for the low-cardinality dimension joins meshdb targets; a genuine data shuffle for
+large-on-large joins remains deliberately out of scope.
 
 ## Correctly permanent (not gaps)
 
@@ -301,6 +305,8 @@ fully-materialised sides (correct, expensive, cap-gated); still refused.
 **A. `GROUP BY`** ✓ → **`DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** ✓ → **`INTERSECT`/`EXCEPT` +
 mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** ✓ → **uncorrelated scalar
 subqueries + bare `AVG`/multi-aggregate** ✓ → **co-located `JOIN`** ✓ (opt-in via a co-partitioning
-declaration). Remaining: derived-table / `IN` subqueries (the central-materialisation primitive) and
-general non-co-located joins. Each step keeps parse-prove-refuse and adds a memory cap wherever it
-materialises.
+declaration) → **central materialisation** ✓ (derived tables + general non-co-located joins, run on
+the coordinator's in-memory SQLite, cap-gated). Remaining refusals: `COUNT(DISTINCT)` / other
+`DISTINCT` aggregates, `GROUP_CONCAT` and non-decomposable aggregates, bare non-grouped columns,
+`ANY`/`ALL` and correlated subqueries, CTEs, and any source over the materialisation cap. Each step
+keeps parse-prove-refuse and adds a memory cap wherever it materialises.

@@ -5,7 +5,7 @@
 //! the only way to catch a merge that is plausible but wrong — which is the whole failure
 //! mode this planner exists to avoid.
 
-use meshdb::query::{Combine, OutputCol, Plan, SetKind, SetTree, plan};
+use meshdb::query::{Combine, OutputCol, Plan, SetKind, SetTree, ShardKeys, plan, plan_with};
 use meshdb::shard::{ShardConfig, ShardId, ShardManager};
 use meshdb::storage::Value;
 use meshdb::storage::exec::{Executed, Outcome, QueryResult, Statement};
@@ -439,39 +439,135 @@ fn colocated_join_answer_is_invariant_to_shard_count() {
     }
 }
 
-#[test]
-fn non_colocated_joins_are_refused() {
-    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let (sharded, _single) = join_twin(&dirs, 8);
-
-    for (sql, expect) in [
-        // Join on a non-shard-key column (orders is routed by cust, not oid).
-        (
-            "SELECT o.oid FROM orders o JOIN customers c ON o.oid = c.cid",
-            "shard keys",
-        ),
-        // Cross join (comma-separated tables).
-        ("SELECT o.oid FROM orders o, customers c", "cross join"),
-        // A second join whose ON is not on shard keys.
-        (
-            "SELECT o.oid FROM orders o JOIN customers c ON o.cust = c.cid \
-             JOIN orders o2 ON o2.oid = c.cid",
-            "shard keys",
-        ),
-        // NATURAL join has no explicit ON equality.
-        (
-            "SELECT o.oid FROM orders o NATURAL JOIN customers c",
-            "NATURAL",
-        ),
-    ] {
-        let err = sharded
-            .query_all_shards(sql)
-            .expect_err(&format!("{sql} should be refused"));
-        assert!(
-            err.to_string().contains(expect),
-            "refusal for `{sql}` should mention `{expect}`, got: {err}"
-        );
+/// Two tables with **no** co-partitioning declared, joined on a shared non-key column with real
+/// many-to-many matches — so any join between them falls back to central execution.
+fn central_twin(dirs: &(TempDir, TempDir), shards: u32) -> (ShardManager, ShardManager) {
+    let sharded = ShardManager::open(dirs.0.path(), cfg(shards)).unwrap();
+    let single = ShardManager::open(dirs.1.path(), cfg(1)).unwrap();
+    for m in [&sharded, &single] {
+        m.execute_all_shards(
+            "CREATE TABLE left_t (id INTEGER PRIMARY KEY, cat INTEGER, val INTEGER) STRICT",
+        )
+        .unwrap();
+        m.execute_all_shards(
+            "CREATE TABLE right_t (rid INTEGER PRIMARY KEY, cat INTEGER, w INTEGER) STRICT",
+        )
+        .unwrap();
+        // No shard keys declared: joins between these tables go through central execution.
     }
+    for i in 0..50i64 {
+        let stmt = Statement::with_params(
+            "INSERT INTO left_t VALUES (?1, ?2, ?3)",
+            vec![
+                Value::Integer(i),
+                Value::Integer(i % 5),
+                Value::Integer(i * 2),
+            ],
+        );
+        sharded
+            .execute_one(sharded.route(&i.to_le_bytes()), stmt.clone())
+            .unwrap();
+        single.execute_one(ShardId(0), stmt).unwrap();
+    }
+    for i in 0..10i64 {
+        let stmt = Statement::with_params(
+            "INSERT INTO right_t VALUES (?1, ?2, ?3)",
+            vec![
+                Value::Integer(i),
+                Value::Integer(i % 5),
+                Value::Integer(i * 3),
+            ],
+        );
+        sharded
+            .execute_one(sharded.route(&i.to_le_bytes()), stmt.clone())
+            .unwrap();
+        single.execute_one(ShardId(0), stmt).unwrap();
+    }
+    (sharded, single)
+}
+
+#[test]
+fn central_execution_matches_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = central_twin(&dirs, 16);
+
+    // A FROM that cannot be pushed down — a non-co-located join or a derived table — is answered by
+    // materialising each source on the coordinator and running the query there. Compared against
+    // native SQLite.
+    for sql in [
+        // Non-co-located join (on `cat`, not a declared shard key) + GROUP BY + aggregate.
+        "SELECT l.cat, count(*), sum(r.w) FROM left_t l JOIN right_t r ON l.cat = r.cat \
+         GROUP BY l.cat",
+        // Non-co-located join with a WHERE.
+        "SELECT count(*) FROM left_t l JOIN right_t r ON l.cat = r.cat WHERE l.val > 40",
+        // Cross join.
+        "SELECT count(*) FROM left_t, right_t",
+        // Derived table with an inner GROUP BY, filtered by the outer.
+        "SELECT s.cat FROM (SELECT cat, count(*) AS n FROM left_t GROUP BY cat) s WHERE s.n >= 10",
+        // Derived table joined with a real table.
+        "SELECT s.cat, s.total, r.w FROM (SELECT cat, sum(val) AS total FROM left_t GROUP BY cat) s \
+         JOIN right_t r ON s.cat = r.cat",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // Ordered central result (deterministic — cat is unique after the inner GROUP BY).
+    assert_grouped_ordered(
+        &sharded,
+        &single,
+        "SELECT s.cat, s.total FROM (SELECT cat, sum(val) AS total FROM left_t GROUP BY cat) s \
+         ORDER BY s.cat",
+    );
+}
+
+#[test]
+fn central_answer_is_invariant_to_shard_count() {
+    let sql = "SELECT l.cat, count(*), sum(r.w) FROM left_t l JOIN right_t r ON l.cat = r.cat \
+               GROUP BY l.cat";
+    let mut baseline: Option<Vec<Vec<Value>>> = None;
+    for shards in [1u32, 4, 16, 64] {
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (sharded, _single) = central_twin(&dirs, shards);
+        let answer = sorted(sharded.query_all_shards(sql).unwrap().rows);
+        match &baseline {
+            None => baseline = Some(answer),
+            Some(b) => assert_eq!(&answer, b, "central answer changed at {shards} shards"),
+        }
+    }
+}
+
+#[test]
+fn central_materialisation_over_the_cap_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let m = ShardManager::open(
+        dir.path(),
+        ShardConfig {
+            max_grouped_rows: 20,
+            ..cfg(8)
+        },
+    )
+    .unwrap();
+    m.execute_all_shards("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER) STRICT")
+        .unwrap();
+    m.execute_all_shards("CREATE TABLE b (id INTEGER PRIMARY KEY, x INTEGER) STRICT")
+        .unwrap();
+    for i in 0..50i64 {
+        for t in ["a", "b"] {
+            m.execute_one(
+                m.route(&i.to_le_bytes()),
+                Statement::with_params(
+                    format!("INSERT INTO {t} VALUES (?1, ?2)"),
+                    vec![Value::Integer(i), Value::Integer(i % 3)],
+                ),
+            )
+            .unwrap();
+        }
+    }
+    // Materialising `a` (50 rows) for the central join exceeds the cap of 20.
+    let err = m
+        .query_all_shards("SELECT count(*) FROM a JOIN b ON a.x = b.x")
+        .expect_err("central materialisation over the cap must be refused");
+    assert!(err.to_string().contains("central execution"), "{err}");
 }
 
 #[test]
@@ -712,7 +808,6 @@ fn queries_that_cannot_be_combined_are_refused() {
     // Each of these has a plausible-looking wrong answer available, which is exactly why it
     // must error instead.
     for (sql, expect) in [
-        ("SELECT a.k FROM t a JOIN t b ON a.k = b.k", "join"),
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
             "common table expression",
@@ -722,11 +817,6 @@ fn queries_that_cannot_be_combined_are_refused() {
         (
             "SELECT count(*), n FROM t",
             "neither grouped nor aggregated",
-        ),
-        // A derived table (subquery in FROM) needs coordinator-side materialisation.
-        (
-            "SELECT count(*) FROM (SELECT n FROM t WHERE n > 20)",
-            "FROM",
         ),
         // --- grouped queries that still cannot be answered correctly across shards ---
         // A bare column that is neither grouped nor aggregated is an arbitrary row per shard.
@@ -907,6 +997,24 @@ fn plans_are_what_they_claim_to_be() {
             ));
         }
         other => panic!("expected a set-op plan, got {other:?}"),
+    }
+
+    // Without a co-partitioning declaration, a join falls back to central execution.
+    match plan("SELECT x.k FROM t x JOIN t y ON x.k = y.k").unwrap() {
+        Plan::Central(_) => {}
+        other => panic!("expected central execution, got {other:?}"),
+    }
+    // A derived table is central too.
+    match plan("SELECT z.k FROM (SELECT k FROM t) z").unwrap() {
+        Plan::Central(_) => {}
+        other => panic!("expected central execution, got {other:?}"),
+    }
+    // But with the table declared co-partitioned on the join key, the join is pushed down.
+    let mut keys = ShardKeys::new();
+    keys.insert("t".to_string(), "k".to_string());
+    match plan_with("SELECT x.k FROM t x JOIN t y ON x.k = y.k", &keys).unwrap() {
+        Plan::Concat { .. } => {}
+        other => panic!("expected a pushed-down join (Concat), got {other:?}"),
     }
 }
 

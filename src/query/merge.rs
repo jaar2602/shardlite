@@ -72,6 +72,9 @@ pub fn merge_results(plan: &Plan, parts: Vec<QueryResult>) -> QueryResult {
         Plan::Subqueries => {
             unreachable!("subqueries are substituted before merge")
         }
+        Plan::Central(_) => {
+            unreachable!("central execution is handled by eval_central, not merge")
+        }
     }
 }
 

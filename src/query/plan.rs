@@ -24,6 +24,7 @@
 //! | `UNION` / `INTERSECT` / `EXCEPT` (any mix) | fan out each branch, then combine on the coordinator |
 //! | scalar / `IN` / `EXISTS` subquery | evaluate it globally, substitute its result, re-plan the outer |
 //! | co-located `JOIN` | join each shard's local rows; concatenate (see [`ShardKeys`]) |
+//! | any other `JOIN` / derived table (`FROM (SELECT …)`) | materialise each source, run the query on the coordinator (see [`Central`]) |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
@@ -35,19 +36,22 @@
 //! evaluated on its own and its result (a value, a value list, or a boolean) substituted in before
 //! the outer query is planned (see [`substitute_subqueries`]).
 //!
+//! A join that is *not* co-located, and a derived table in `FROM`, cannot be pushed down — but
+//! rather than refuse them, each `FROM` source is materialised globally and the query is run once
+//! on the coordinator (see [`Central`]). This is bounded: a source larger than the configured cap
+//! is refused rather than pulled into memory.
+//!
 //! # What is refused, and why each one
 //!
-//! - **A join that is not co-located** — rows that must meet may live on different shards, and
-//!   nothing moves them. A join *is* allowed when the tables are declared co-partitioned on their
-//!   join keys (see [`ShardKeys`]), so every matching pair routes to one shard.
 //! - **`COUNT(DISTINCT c)` and other `DISTINCT` aggregates** — the same value can appear on
 //!   several shards, so a per-shard distinct count double-counts.
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
-//! - **`ANY` / `ALL` subqueries**, a **correlated** subquery (it names the outer row and cannot run
-//!   on its own), and a **derived table** (subquery in `FROM`, which needs coordinator-side
-//!   materialisation not yet built).
+//! - **`ANY` / `ALL` subqueries** and a **correlated** subquery (it names the outer row and cannot
+//!   run on its own).
+//! - **A source larger than the materialisation cap** — central execution is bounded, so a `FROM`
+//!   source that exceeds the cap is refused rather than buffered without limit.
 //! - **CTEs** — can hide any of the above.
 //!
 //! # What it cannot fix
@@ -57,9 +61,8 @@
 //! another. There is no cross-shard atomicity in this design and there never will be, so
 //! this is a property of the answer, not a gap to close later.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-
-use std::collections::HashMap;
 
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
@@ -114,6 +117,27 @@ pub enum Plan {
     /// evaluate each globally, substitute its result, then re-plan and fan out the substituted
     /// (subquery-free) query (see [`substitute_subqueries`]).
     Subqueries,
+    /// The `FROM` cannot be pushed to each shard (a derived table, or a non-co-located / cross
+    /// join): materialise each source fully on the coordinator and run the query there. Correct but
+    /// memory-heavy — the fallback of last resort, cap-gated at execution.
+    Central(Box<Central>),
+}
+
+/// A query answered by materialising its `FROM` sources on the coordinator and running it against
+/// an in-memory SQLite. Each source is fanned out on its own and loaded into a table; `central_sql`
+/// then references those tables by name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Central {
+    /// The tables to materialise, each a `(coordinator table name, fan-out SQL)`.
+    pub sources: Vec<CentralSource>,
+    /// The query to run on the coordinator, with each source referenced by its table name.
+    pub central_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentralSource {
+    pub table: String,
+    pub sql: String,
 }
 
 /// A coordinator-side reshape of concatenated shard rows: optionally dedup them, sort them, skip
@@ -361,6 +385,14 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
         }
     };
 
+    // If the FROM cannot be pushed to each shard — a derived table, or a join that is not
+    // co-located — fall back to central execution: materialise each source on the coordinator and
+    // run the whole query there. Otherwise the FROM is a single table or a co-located join and the
+    // pushdown planning below applies.
+    if check_join(select, shard_keys).is_err() {
+        return plan_central(query);
+    }
+
     // DISTINCT dedups on the coordinator; it is no longer refused.
     if select.distinct.is_some() {
         return plan_distinct(query, select, shard_keys);
@@ -384,10 +416,8 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
             why: "it filters groups, which are partial per shard",
         });
     }
-    // A join is refused unless it is co-located — a join on the tables' declared shard keys, so
-    // every matching pair lives on one shard. When co-located the join rides along in the shard
-    // SQL, and WHERE / GROUP BY / aggregates compose on top exactly as for a single table.
-    check_join(select, shard_keys)?;
+    // The FROM is already known pushable (a single table or a co-located join, checked above), so
+    // the join — if any — rides along in the shard SQL and WHERE / aggregates compose on top.
 
     // A bare aggregate (no GROUP BY) is a group over the whole table.
     if let Some(plan) = plan_bare_aggregate(query, select, shard_keys)? {
@@ -766,6 +796,98 @@ fn compound_pair(expr: &Expr) -> Option<(String, String)> {
             parts[1].value.to_ascii_lowercase(),
         )),
         _ => None,
+    }
+}
+
+/// Build a central-execution plan for a query whose `FROM` cannot be pushed down. Each `FROM`
+/// source becomes a table to materialise on the coordinator — a real table via `SELECT * FROM t`, a
+/// derived table via its inner query — and the query is rewritten to reference each source by a
+/// plain table name.
+fn plan_central(query: &Query) -> std::result::Result<Plan, Unsupported> {
+    let mut central = query.clone();
+    let SetExpr::Select(select) = central.body.as_mut() else {
+        return Err(Unsupported {
+            what: "central execution of this query form",
+            why: "only a plain SELECT can be run centrally",
+        });
+    };
+
+    let mut sources: Vec<CentralSource> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for table in &mut select.from {
+        collect_central_source(&mut table.relation, &mut sources, &mut seen)?;
+        for join in &mut table.joins {
+            collect_central_source(&mut join.relation, &mut sources, &mut seen)?;
+        }
+    }
+    if sources.is_empty() {
+        return Err(Unsupported {
+            what: "a query with no source table to materialise",
+            why: "there is nothing to run centrally",
+        });
+    }
+
+    Ok(Plan::Central(Box::new(Central {
+        sources,
+        central_sql: central.to_string(),
+    })))
+}
+
+/// Record one `FROM` relation as a source to materialise, rewriting a derived table into a plain
+/// reference to its (aliased) name. A non-table, non-derived source (a table function) is refused.
+fn collect_central_source(
+    relation: &mut TableFactor,
+    sources: &mut Vec<CentralSource>,
+    seen: &mut HashSet<String>,
+) -> std::result::Result<(), Unsupported> {
+    match relation {
+        TableFactor::Table { name, .. } => {
+            let table = name.to_string();
+            if seen.insert(table.to_ascii_lowercase()) {
+                sources.push(CentralSource {
+                    sql: format!("SELECT * FROM {table}"),
+                    table,
+                });
+            }
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let alias = alias.as_ref().ok_or(Unsupported {
+                what: "a derived table without an alias",
+                why: "a subquery in FROM must be named with AS so it can be referenced",
+            })?;
+            let name = alias.name.value.clone();
+            if seen.insert(name.to_ascii_lowercase()) {
+                sources.push(CentralSource {
+                    table: name.clone(),
+                    sql: subquery.to_string(),
+                });
+            }
+            *relation = named_table(&name);
+        }
+        _ => {
+            return Err(Unsupported {
+                what: "this FROM source",
+                why: "only named tables and derived tables can be materialised for central \
+                      execution",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A `TableFactor::Table` referring to `name`, built by parsing a trivial query so the variant's
+/// many fields need not be constructed by hand. `name` is quoted so any identifier is accepted.
+fn named_table(name: &str) -> TableFactor {
+    let sql = format!("SELECT 1 FROM \"{}\"", name.replace('"', "\"\""));
+    let statements = Parser::parse_sql(&SQLiteDialect {}, &sql).expect("a trivial query parses");
+    match statements.into_iter().next() {
+        Some(SqlStatement::Query(query)) => match *query.body {
+            SetExpr::Select(select) => select.from.into_iter().next().expect("one table").relation,
+            _ => unreachable!("the trivial query is a SELECT"),
+        },
+        _ => unreachable!("the trivial query is a query statement"),
     }
 }
 

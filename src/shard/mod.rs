@@ -99,6 +99,50 @@ pub fn shard_of(key: &[u8], shard_count: u32) -> ShardId {
     ShardId((h % shard_count as u64) as u32)
 }
 
+/// Create a table in the coordinator connection carrying `result`'s columns (dynamically typed,
+/// like any SQLite table) and insert its rows. Duplicate column names are disambiguated so
+/// `CREATE TABLE` accepts them.
+fn load_central_table(
+    conn: &rusqlite::Connection,
+    table: &str,
+    result: &crate::storage::exec::QueryResult,
+) -> crate::Result<()> {
+    let mut used: Vec<String> = Vec::new();
+    let cols: Vec<String> = result
+        .columns
+        .iter()
+        .map(|c| {
+            let mut name = c.clone();
+            let mut i = 1;
+            while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+                name = format!("{c}_{i}");
+                i += 1;
+            }
+            used.push(name.clone());
+            quote_ident(&name)
+        })
+        .collect();
+
+    let create = format!("CREATE TABLE {} ({})", quote_ident(table), cols.join(", "));
+    conn.execute(&create, [])?;
+
+    if result.rows.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; result.columns.len()].join(", ");
+    let insert = format!("INSERT INTO {} VALUES ({placeholders})", quote_ident(table));
+    let mut stmt = conn.prepare(&insert)?;
+    for row in &result.rows {
+        stmt.execute(rusqlite::params_from_iter(row.iter()))?;
+    }
+    Ok(())
+}
+
+/// Wrap an identifier in double quotes so any name is a valid SQL identifier.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 fn shard_keys_path(dir: &Path) -> PathBuf {
     dir.join("shard_keys.txt")
 }
@@ -593,6 +637,12 @@ impl ShardManager {
             return self.eval_set_op(set_op);
         }
 
+        // A FROM that cannot be pushed down (a derived table or non-co-located join) is answered by
+        // materialising each source on the coordinator and running the query there.
+        if let crate::query::Plan::Central(central) = &plan {
+            return self.eval_central(central);
+        }
+
         // Grouped and post-processed (DISTINCT / OFFSET) queries run a *rewritten* query on each
         // shard; every other plan runs the caller's SQL unchanged.
         let grouped = matches!(&plan, crate::query::Plan::Grouped(_));
@@ -662,6 +712,39 @@ impl ShardManager {
         let mut rows = crate::query::evaluate_set_tree(&set_op.tree, &branch_results);
         crate::query::finalize_rows(&mut rows, &set_op.order_by, set_op.offset, set_op.limit);
         Ok(crate::storage::exec::QueryResult { columns, rows })
+    }
+
+    /// Answer a query whose FROM cannot be pushed down: materialise each source (fanned out on its
+    /// own, and capped) into a fresh in-memory SQLite, then run the query there. This holds whole
+    /// sub-results on the coordinator — the memory-heavy fallback — so each source is bounded by the
+    /// same cap as a grouped result.
+    fn eval_central(
+        &self,
+        central: &crate::query::Central,
+    ) -> crate::Result<crate::storage::exec::QueryResult> {
+        use crate::storage::exec::{self, Executed, SqlError, Statement};
+
+        let conn = rusqlite::Connection::open_in_memory()?;
+        for source in &central.sources {
+            let result = self.query_all_shards(&source.sql)?;
+            if result.rows.len() > self.cfg.max_grouped_rows {
+                return Err(crate::Error::Unsupported(format!(
+                    "materialising `{}` for central execution exceeded {} rows, too many to hold \
+                     on the coordinator; narrow the query or target a single shard",
+                    source.table, self.cfg.max_grouped_rows
+                )));
+            }
+            load_central_table(&conn, &source.table, &result)?;
+        }
+
+        match exec::run(&conn, &Statement::from(central.central_sql.as_str())) {
+            Ok(Executed::Rows(rows)) => Ok(rows),
+            Ok(Executed::Changed(_)) => Err(crate::Error::Unsupported(
+                "the central query did not return rows".into(),
+            )),
+            Err(SqlError::Logic(msg)) => Err(crate::Error::Unsupported(msg)),
+            Err(SqlError::Fatal(e)) => Err(crate::Error::Sqlite(e)),
+        }
     }
 
     /// Declare a table's shard-key column — the column its rows are routed by. Two tables declared
