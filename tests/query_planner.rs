@@ -571,6 +571,59 @@ fn central_materialisation_over_the_cap_is_refused() {
 }
 
 #[test]
+fn distinct_aggregates_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // A DISTINCT aggregate cannot be combined from per-shard partials — the same value lands on
+    // many shards, so summing per-shard `count(DISTINCT …)` double-counts. It is answered by
+    // materialising the (narrowed, pre-DISTINCT'd) column on the coordinator and computing there.
+    // Every expression below is deliberately LOW cardinality (`n % 10` etc.) so values genuinely
+    // repeat across all 16 shards — a globally-unique column would make the double-count invisible.
+    for sql in [
+        // Bare DISTINCT aggregates over the whole table.
+        "SELECT count(DISTINCT n % 10) FROM t",
+        "SELECT sum(DISTINCT n % 10) FROM t",
+        "SELECT avg(DISTINCT n % 10) FROM t",
+        "SELECT min(DISTINCT n % 10), max(DISTINCT n % 10) FROM t",
+        // With a pushed-down WHERE.
+        "SELECT count(DISTINCT n % 10) FROM t WHERE n > 300",
+        // A text column (distinct 2-char prefixes).
+        "SELECT count(DISTINCT substr(s, 1, 2)) FROM t",
+        // Two DISTINCT aggregates at once (both multiplicity-insensitive → DISTINCT pre-shrink).
+        "SELECT count(DISTINCT n % 10), count(DISTINCT n % 7) FROM t",
+        // DISTINCT mixed with a plain aggregate → duplicates matter, so no DISTINCT pre-shrink.
+        "SELECT count(*), count(DISTINCT n % 10) FROM t",
+        "SELECT sum(n), count(DISTINCT n % 10) FROM t",
+        // Grouped DISTINCT aggregate.
+        "SELECT n % 3, count(DISTINCT n % 10) FROM t GROUP BY n % 3",
+        "SELECT n % 3, count(DISTINCT n % 10), count(*) FROM t GROUP BY n % 3",
+        // HAVING that filters on a DISTINCT aggregate.
+        "SELECT n % 3, count(*) FROM t GROUP BY n % 3 HAVING count(DISTINCT n % 10) > 5",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn distinct_aggregate_answer_is_invariant_to_shard_count() {
+    let sql = "SELECT count(DISTINCT n % 10) FROM t";
+    let mut baseline: Option<Vec<Vec<Value>>> = None;
+    for shards in [1u32, 4, 16, 64] {
+        let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (sharded, _single) = twin(&dirs, shards);
+        let answer = sharded.query_all_shards(sql).unwrap().rows;
+        match &baseline {
+            None => baseline = Some(answer),
+            Some(b) => assert_eq!(
+                &answer, b,
+                "distinct-aggregate answer changed at {shards} shards"
+            ),
+        }
+    }
+}
+
+#[test]
 fn ordered_queries_match_a_single_shard() {
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (sharded, single) = twin(&dirs, 16);
@@ -824,11 +877,6 @@ fn queries_that_cannot_be_combined_are_refused() {
             "SELECT n, k FROM t GROUP BY n",
             "neither grouped nor aggregated",
         ),
-        // DISTINCT inside an aggregate double-counts across shards.
-        (
-            "SELECT n % 10, count(DISTINCT n) FROM t GROUP BY n % 10",
-            "DISTINCT",
-        ),
         // A HAVING operand that is neither a grouping column nor an aggregate.
         (
             "SELECT n % 10, count(*) FROM t GROUP BY n % 10 HAVING s > 5",
@@ -1016,6 +1064,24 @@ fn plans_are_what_they_claim_to_be() {
         Plan::Concat { .. } => {}
         other => panic!("expected a pushed-down join (Concat), got {other:?}"),
     }
+
+    // A DISTINCT aggregate cannot be summed from per-shard partials — it must go to central
+    // execution, NOT the associative Aggregate fast path (which would double-count).
+    match plan("SELECT count(DISTINCT n) FROM t").unwrap() {
+        Plan::Central(_) => {}
+        other => panic!("expected central execution for count(DISTINCT), got {other:?}"),
+    }
+    match plan("SELECT g, count(DISTINCT c) FROM t GROUP BY g").unwrap() {
+        Plan::Central(_) => {}
+        other => panic!("expected central execution for grouped count(DISTINCT), got {other:?}"),
+    }
+    // A plain (non-DISTINCT) aggregate still takes the fast associative path.
+    assert_eq!(
+        plan("SELECT count(n) FROM t").unwrap(),
+        Plan::Aggregate {
+            combine: Combine::Sum
+        }
+    );
 }
 
 #[test]

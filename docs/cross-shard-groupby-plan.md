@@ -268,6 +268,7 @@ revert-verified.
 | ~~**`INTERSECT` / `EXCEPT`**~~ **(done)** | Fan out each branch globally, combine on the coordinator via multi-pass — no pushdown, so cross-shard matches are not missed. | Holds both branch results on the coordinator (same as `Concat`); no separate cap yet. |
 | ~~**Uncorrelated scalar / `IN` / `EXISTS` subquery**~~ **(done)** | Two-pass: `substitute_subqueries` evaluates each subquery globally and splices its result in — a scalar becomes a literal, `IN (SELECT …)` a literal list (`Expr::InList`, or a constant boolean when empty), `EXISTS (…)` a boolean — bottom-up, so nesting works; the rewritten outer is re-planned and fanned out. A correlated subquery names the outer row and, run on its own, errors — refused naturally. The `IN` list is capped (`MAX_SUBQUERY_ROWS`) to bound coordinator memory. This also completed **bare `AVG` / multiple bare aggregates**. | Each subquery is one extra fan-out pass; a huge `IN` result is refused. |
 | ~~**Derived-table subquery** (`FROM (SELECT …)`)~~ **(done)** | `Plan::Central`: each `FROM` source is materialised globally (`query_all_shards`), loaded into a coordinator in-memory SQLite (`eval_central` + `load_central_table`), and the outer query runs there. A derived table contributes its inner SQL as one source. | Materialises each source on the coordinator; capped at `cfg.max_grouped_rows` — a source over the cap is refused. Verified against native SQLite; the load is revert-verified. |
+| ~~**`COUNT/SUM/AVG/MIN/MAX(DISTINCT c)`**~~ **(done)** | Route to `Plan::Central` (via `plan_central_grouped`): the coordinator materialises just the referenced column, pre-`DISTINCT`'d per shard when every aggregate is multiplicity-insensitive, and computes the aggregate once. Fixes a latent silent-wrong-answer bug — bare `count(DISTINCT c)` previously took the associative fast path and *summed* per-shard distinct counts. Bare and grouped, single or several DISTINCT aggregates, with `WHERE` / `HAVING`. | Materialised on the coordinator, capped at `cfg.max_grouped_rows`. DISTINCT pre-shrink ships distinct values, not rows; a plain aggregate mixed in disables it. Verified against native SQLite; both the routing and the pre-shrink safety check are revert-verified. |
 | **Aggregate + bare column, no `GROUP BY`** | Mostly *subsumed by Increment A* — the fix is "add `GROUP BY`". The `MIN`/`MAX`-with-bare-columns rule is a decomposable **argmin/argmax** (each shard returns its extreme row; coordinator picks the global one) — a small optional feature. | The general bare-column form stays refused: nondeterministic even on one shard. |
 
 ## Tier 3 — the architectural line — **co-located `JOIN` (pushdown) + general `JOIN` (central) done**
@@ -306,7 +307,9 @@ large-on-large joins remains deliberately out of scope.
 mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** ✓ → **uncorrelated scalar
 subqueries + bare `AVG`/multi-aggregate** ✓ → **co-located `JOIN`** ✓ (opt-in via a co-partitioning
 declaration) → **central materialisation** ✓ (derived tables + general non-co-located joins, run on
-the coordinator's in-memory SQLite, cap-gated). Remaining refusals: `COUNT(DISTINCT)` / other
-`DISTINCT` aggregates, `GROUP_CONCAT` and non-decomposable aggregates, bare non-grouped columns,
-`ANY`/`ALL` and correlated subqueries, CTEs, and any source over the materialisation cap. Each step
-keeps parse-prove-refuse and adds a memory cap wherever it materialises.
+the coordinator's in-memory SQLite, cap-gated) → **`DISTINCT` aggregates** ✓ (`count/sum/avg/min/max
+(DISTINCT c)`, routed to central with per-shard pre-`DISTINCT` — also fixing a latent bare-`count
+(DISTINCT)` double-count). Remaining refusals: `GROUP_CONCAT` and other non-coordinator-computable
+aggregates, bare non-grouped columns, `ANY`/`ALL` and correlated subqueries, CTEs, and any source
+over the materialisation cap. Each step keeps parse-prove-refuse and adds a memory cap wherever it
+materialises.

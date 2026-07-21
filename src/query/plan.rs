@@ -25,6 +25,7 @@
 //! | scalar / `IN` / `EXISTS` subquery | evaluate it globally, substitute its result, re-plan the outer |
 //! | co-located `JOIN` | join each shard's local rows; concatenate (see [`ShardKeys`]) |
 //! | any other `JOIN` / derived table (`FROM (SELECT …)`) | materialise each source, run the query on the coordinator (see [`Central`]) |
+//! | `COUNT/SUM/AVG/MIN/MAX(DISTINCT c)` | materialise the (pre-`DISTINCT`'d) column centrally, compute once (see [`Central`]) |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
@@ -36,16 +37,17 @@
 //! evaluated on its own and its result (a value, a value list, or a boolean) substituted in before
 //! the outer query is planned (see [`substitute_subqueries`]).
 //!
-//! A join that is *not* co-located, and a derived table in `FROM`, cannot be pushed down — but
-//! rather than refuse them, each `FROM` source is materialised globally and the query is run once
-//! on the coordinator (see [`Central`]). This is bounded: a source larger than the configured cap
-//! is refused rather than pulled into memory.
+//! A join that is *not* co-located, a derived table in `FROM`, and a `DISTINCT` aggregate cannot be
+//! pushed down — but rather than refuse them, the source rows are materialised globally and the
+//! query is run once on the coordinator (see [`Central`]). A `DISTINCT` aggregate materialises just
+//! the referenced column, pre-`DISTINCT`'d per shard when every aggregate is insensitive to row
+//! multiplicity, so a `count(DISTINCT c)` over a large table ships distinct values, not rows. This
+//! is bounded: a source larger than the configured cap is refused rather than pulled into memory.
 //!
 //! # What is refused, and why each one
 //!
-//! - **`COUNT(DISTINCT c)` and other `DISTINCT` aggregates** — the same value can appear on
-//!   several shards, so a per-shard distinct count double-counts.
-//! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
+//! - **`GROUP_CONCAT`, and any aggregate not listed above** — order-dependent (its cross-shard
+//!   concatenation order is undefined) or simply not a shape the coordinator can compute.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
 //! - **`ANY` / `ALL` subqueries** and a **correlated** subquery (it names the outer row and cannot
@@ -473,10 +475,14 @@ fn plan_bare_aggregate(
         return Ok(None);
     }
 
-    // Fast path: one associative aggregate, no ORDER BY / LIMIT.
+    // Fast path: one associative, non-DISTINCT aggregate, no ORDER BY / LIMIT. A DISTINCT aggregate
+    // must NOT take this path — summing per-shard `count(DISTINCT c)` double-counts a value that
+    // appears on more than one shard — so it falls through to plan_grouped, which routes it to
+    // central execution.
     if select.projection.len() == 1
         && query.order_by.is_none()
         && query.limit_clause.is_none()
+        && !item_is_distinct_aggregate(&select.projection[0])
         && let Some(combine) = aggregate_of(&select.projection[0]).ok().flatten()
     {
         return Ok(Some(Plan::Aggregate { combine }));
@@ -1009,6 +1015,7 @@ fn plan_grouped(
     let mut outputs: Vec<OutputCol> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut next = k;
+    let mut needs_central = false;
 
     for item in &select.projection {
         let expr = match item {
@@ -1030,10 +1037,17 @@ fn plan_grouped(
         };
         names.push(output_name(item, expr));
 
-        if let Expr::Function(f) = expr
-            && push_aggregate(f, &mut partial, &mut outputs, &mut next)?.is_some()
-        {
-            continue;
+        if let Expr::Function(f) = expr {
+            // A DISTINCT aggregate cannot be combined from per-shard partials; the whole query is
+            // run on the coordinator instead (decided after the loop, so a bare column below is
+            // still refused rather than silently materialised).
+            if is_distinct_aggregate(f) {
+                needs_central = true;
+                continue;
+            }
+            if push_aggregate(f, &mut partial, &mut outputs, &mut next)?.is_some() {
+                continue;
+            }
         }
 
         // Not an aggregate: it must be one of the grouping expressions.
@@ -1048,6 +1062,18 @@ fn plan_grouped(
                 });
             }
         }
+    }
+
+    // A DISTINCT aggregate anywhere (projection or HAVING) forces central execution: materialise the
+    // rows on the coordinator and let SQLite compute the aggregate once. Bare-column reassembly is
+    // already validated above, so an unreassemblable projection still refuses.
+    if needs_central
+        || select
+            .having
+            .as_ref()
+            .is_some_and(expr_has_distinct_aggregate)
+    {
+        return plan_central_grouped(query, select);
     }
 
     // The projection columns are the visible ones; HAVING may append hidden columns after them.
@@ -1098,6 +1124,148 @@ fn plan_grouped(
         offset,
         limit,
     })))
+}
+
+/// Whether a projection item is a DISTINCT aggregate — such an aggregate must never take the
+/// associative fast path, where summing per-shard partials would double-count.
+fn item_is_distinct_aggregate(item: &SelectItem) -> bool {
+    let expr = match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+        _ => return false,
+    };
+    matches!(expr, Expr::Function(f) if is_distinct_aggregate(f))
+}
+
+/// The aggregate's argument list carries a `DISTINCT` marker (`count(DISTINCT c)`).
+fn aggregate_is_distinct(f: &sqlparser::ast::Function) -> bool {
+    matches!(&f.args, FunctionArguments::List(list)
+        if list.duplicate_treatment == Some(DuplicateTreatment::Distinct))
+}
+
+/// A DISTINCT aggregate over one of the built-in combinable names. It cannot be combined from
+/// per-shard partials (the same value can appear on several shards), but the coordinator can
+/// compute it once over the materialised rows.
+fn is_distinct_aggregate(f: &sqlparser::ast::Function) -> bool {
+    aggregate_is_distinct(f)
+        && matches!(
+            f.name.to_string().to_ascii_uppercase().as_str(),
+            "COUNT" | "SUM" | "TOTAL" | "MIN" | "MAX" | "AVG"
+        )
+}
+
+/// Whether an expression tree contains a DISTINCT aggregate — routes a `HAVING count(DISTINCT c) …`
+/// to central execution.
+fn expr_has_distinct_aggregate(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if let Expr::Function(f) = e
+            && is_distinct_aggregate(f)
+        {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Plan a grouped/aggregate query that uses a DISTINCT aggregate by running it on the coordinator
+/// over materialised rows. For a single table the source is narrowed to just the referenced columns,
+/// and pre-`DISTINCT`'d when every aggregate is insensitive to row multiplicity — collapsing the
+/// materialised set from row count to distinct cardinality, which is what keeps a `count(DISTINCT c)`
+/// over a large table under the materialisation cap. A join defers to the generic central path,
+/// which materialises each source as `SELECT *`.
+fn plan_central_grouped(query: &Query, select: &Select) -> std::result::Result<Plan, Unsupported> {
+    let single_table = match select.from.first() {
+        Some(t) if select.from.len() == 1 && t.joins.is_empty() => match &t.relation {
+            TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(table) = single_table else {
+        return plan_central(query);
+    };
+
+    let cols = referenced_columns(query);
+    let projection = if cols.is_empty() {
+        "*".to_string()
+    } else {
+        cols.join(", ")
+    };
+    let distinct = if distinct_preshrink_safe(select) {
+        "DISTINCT "
+    } else {
+        ""
+    };
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|e| format!(" WHERE {e}"))
+        .unwrap_or_default();
+    let source_sql = format!("SELECT {distinct}{projection} FROM {table}{where_clause}");
+
+    Ok(Plan::Central(Box::new(Central {
+        sources: vec![CentralSource {
+            sql: source_sql,
+            table,
+        }],
+        central_sql: query.to_string(),
+    })))
+}
+
+/// Every column identifier referenced anywhere in the query, quoted and de-duplicated in first-seen
+/// order — used to project a central source down to just the columns the coordinator query reads.
+fn referenced_columns(query: &Query) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let _ = visit_expressions(query, |e| {
+        let name = match e {
+            Expr::Identifier(id) => Some(id.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+            _ => None,
+        };
+        if let Some(name) = name
+            && seen.insert(name.clone())
+        {
+            cols.push(format!("\"{}\"", name.replace('"', "\"\"")));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    cols
+}
+
+/// DISTINCT pre-shrink of the source is valid only when every aggregate is insensitive to how many
+/// times a row appears — all aggregates are DISTINCT, or MIN / MAX. A plain COUNT / SUM / AVG / TOTAL
+/// (including `COUNT(*)`) counts multiplicity, so duplicate rows must be kept.
+fn distinct_preshrink_safe(select: &Select) -> bool {
+    fn sensitive(f: &sqlparser::ast::Function) -> bool {
+        !aggregate_is_distinct(f)
+            && matches!(
+                f.name.to_string().to_ascii_uppercase().as_str(),
+                "COUNT" | "SUM" | "TOTAL" | "AVG"
+            )
+    }
+    let mut safe = true;
+    {
+        let mut check = |e: &Expr| {
+            if let Expr::Function(f) = e
+                && sensitive(f)
+            {
+                safe = false;
+            }
+            ControlFlow::<()>::Continue(())
+        };
+        for item in &select.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                let _ = visit_expressions(e, &mut check);
+            }
+        }
+        if let Some(h) = &select.having {
+            let _ = visit_expressions(h, &mut check);
+        }
+    }
+    safe
 }
 
 /// Add the partial column(s) and output entry for an aggregate function, advancing the partial
