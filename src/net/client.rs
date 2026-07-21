@@ -16,6 +16,16 @@ use super::protocol::{
 /// Writes buffer on the server; [`Self::commit`] applies them atomically and returns the
 /// durable acknowledgement. Dropping without committing rolls back — nothing was applied, so
 /// rollback is simply discarding the buffer.
+/// The result of a routed [`Client::run`]: rows from a read, or the count from a write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunResult {
+    Rows(QueryResult),
+    Changed {
+        rows_affected: u64,
+        last_insert_rowid: i64,
+    },
+}
+
 pub struct Transaction<'a> {
     client: &'a mut Client,
     shard: u32,
@@ -302,6 +312,26 @@ impl Client {
             statement: Statement::new(sql),
         })? {
             Response::Rows { columns, rows } => Ok(QueryResult { columns, rows }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Run one statement without naming a shard — the server routes it by the table's shard key.
+    /// This is the "just connect and run SQL" path: a read returns rows, a write returns the count
+    /// affected, and the caller never has to know the cluster is sharded. DDL, a keyed write, a
+    /// point read, a fan-out read and a multi-shard write are all handled server-side.
+    pub fn run(&mut self, sql: &str) -> Result<RunResult> {
+        match self.round_trip(Request::Run {
+            statement: Statement::new(sql),
+        })? {
+            Response::Rows { columns, rows } => Ok(RunResult::Rows(QueryResult { columns, rows })),
+            Response::Changed {
+                rows_affected,
+                last_insert_rowid,
+            } => Ok(RunResult::Changed {
+                rows_affected,
+                last_insert_rowid,
+            }),
             other => Err(unexpected(other)),
         }
     }

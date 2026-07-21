@@ -77,6 +77,14 @@ pub fn required(req: &Request) -> Requirement {
 
         Request::Execute { .. } | Request::Transaction { .. } => Requirement::Write,
 
+        // A routed statement is whatever its verb is: DDL reshapes every shard (an operator
+        // action), a write needs Write, everything else is a read.
+        Request::Run { statement } => match crate::db::first_keyword(&statement.sql).as_str() {
+            "CREATE" | "DROP" | "ALTER" => Requirement::Admin,
+            "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => Requirement::Write,
+            _ => Requirement::Read,
+        },
+
         // Cluster-wide DDL reshapes every shard; that is an operator action, not a client one.
         Request::ExecuteAll { .. } | Request::SchemaApply { .. } => Requirement::Admin,
 

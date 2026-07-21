@@ -27,7 +27,7 @@ pub mod server;
 pub mod transport;
 
 pub use auth::{AuthConfig, Role};
-pub use client::Client;
+pub use client::{Client, RunResult};
 pub use forward::{ForwardStats, Router};
 #[cfg(feature = "http")]
 pub use http_gateway::{HttpConfig, HttpGateway};

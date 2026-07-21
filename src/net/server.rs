@@ -888,6 +888,24 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             }
         }
 
+        // Run one statement, letting the server route it to the shard(s) that hold its rows — the
+        // client names no shard. Same bound parameters limitation as QueryAll: the router reads the
+        // shard key from the SQL text, so a routed statement cannot carry parameters yet.
+        Request::Run { statement } => {
+            if !statement.params.is_empty() {
+                return Response::Error {
+                    message: "a routed statement cannot carry bound parameters yet; the router \
+                              reads the shard key from the SQL text, so it cannot see them"
+                        .into(),
+                    retryable: false,
+                };
+            }
+            match shards.run_routed(statement) {
+                Ok(o) => outcome_to_response(o),
+                Err(e) => error_response(e),
+            }
+        }
+
         // The COMMIT of a client transaction: all-or-nothing, and durable before it returns.
         Request::Transaction { shard, statements } => {
             match shards.execute_txn(ShardId(shard), statements) {

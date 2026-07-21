@@ -177,7 +177,7 @@ pub fn first_keyword(sql: &str) -> String {
 /// Transaction control is the important case, and it is a trap rather than an oversight:
 /// SQLite reports `BEGIN` as **read-only**, so without this guard it would route to a
 /// reader connection, appear to succeed, and do nothing at all.
-fn reject_unsupported(sql: &str) -> Result<()> {
+pub(crate) fn reject_unsupported(sql: &str) -> Result<()> {
     let reason = match first_keyword(sql).as_str() {
         "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => {
             "the writer owns transaction boundaries. A client-held transaction would pin \

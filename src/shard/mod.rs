@@ -143,6 +143,30 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Fold several write outcomes (a split INSERT, or an all-shard write) into one: sum the rows
+/// affected, and surface the first rejection rather than reporting a partial success as a whole one.
+fn combine_writes(
+    outs: impl Iterator<Item = crate::storage::exec::Outcome>,
+) -> crate::storage::exec::Outcome {
+    use crate::storage::exec::{Executed, Outcome, WriteOutcome};
+    let mut rows_affected = 0u64;
+    let mut last_insert_rowid = 0i64;
+    for o in outs {
+        match o {
+            Outcome::Ok(Executed::Changed(w)) => {
+                rows_affected += w.rows_affected;
+                last_insert_rowid = w.last_insert_rowid;
+            }
+            Outcome::Ok(Executed::Rows(_)) => {}
+            Outcome::Rejected(m) => return Outcome::Rejected(m),
+        }
+    }
+    Outcome::Ok(Executed::Changed(WriteOutcome {
+        rows_affected,
+        last_insert_rowid,
+    }))
+}
+
 fn shard_keys_path(dir: &Path) -> PathBuf {
     dir.join("shard_keys.txt")
 }
@@ -897,6 +921,71 @@ impl ShardManager {
         }
 
         Ok(out)
+    }
+
+    /// Run one client statement, routing it to the shard(s) that hold its rows — the "just connect
+    /// and run SQL" entry point, so a client never names a shard. DDL reaches every shard (and a
+    /// CREATE TABLE adopts its primary key as the shard key); a keyed write lands on its shard (a
+    /// multi-row INSERT is split); a keyless write that must touch every shard does; a point read
+    /// hits one shard, any other read fans out. A statement that cannot be routed safely is refused.
+    ///
+    /// This operates on the shards this node holds locally, exactly like [`Self::query_all_shards`]
+    /// and [`Self::execute_all_shards`] — it does not forward to a remote primary, so it is correct
+    /// for a node that holds all shards (standalone, or a full replica), which is the same scope the
+    /// cross-shard read layer already assumes.
+    pub fn run_routed(
+        &self,
+        statement: impl Into<crate::storage::exec::Statement>,
+    ) -> crate::Result<crate::storage::exec::Outcome> {
+        use crate::query::Route;
+        use crate::storage::exec::{Executed, Outcome};
+
+        let statement = statement.into();
+        crate::db::reject_unsupported(&statement.sql)?;
+        let kw = crate::db::first_keyword(&statement.sql);
+
+        // DDL reaches every shard (execute_all_shards also adopts a new table's primary key).
+        if matches!(kw.as_str(), "CREATE" | "DROP" | "ALTER") {
+            let results = self.execute_all_shards(statement)?;
+            return Ok(combine_writes(results.into_iter().map(|(_, o)| o)));
+        }
+
+        let is_write = matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE");
+        match crate::query::route_statement(
+            &statement.sql,
+            &self.shard_keys(),
+            self.cfg.shard_count,
+        ) {
+            Route::One(s) => {
+                if is_write {
+                    self.execute_one(ShardId(s), statement)
+                } else {
+                    self.query(ShardId(s), statement)
+                }
+            }
+            Route::Split(parts) => {
+                let mut outs = Vec::with_capacity(parts.len());
+                for (s, sub) in parts {
+                    outs.push(self.execute_one(ShardId(s), sub)?);
+                }
+                Ok(combine_writes(outs.into_iter()))
+            }
+            Route::All => {
+                let results = self.execute_all_shards(statement)?;
+                Ok(combine_writes(results.into_iter().map(|(_, o)| o)))
+            }
+            Route::Passthrough => {
+                if is_write {
+                    // A write to a table with no shard key goes to one shard deterministically
+                    // rather than being duplicated across all of them.
+                    self.execute_one(ShardId(0), statement)
+                } else {
+                    let rows = self.query_all_shards(&statement.sql)?;
+                    Ok(Outcome::Ok(Executed::Rows(rows)))
+                }
+            }
+            Route::Refuse(msg) => Err(crate::Error::Unsupported(msg)),
+        }
     }
 
     pub fn writer_stats(&self) -> WriterFleetStats {

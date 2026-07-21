@@ -16,7 +16,7 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest single message. Snapshot chunks are the biggest legitimate payload, so this sits
 /// comfortably above the chunk size while still refusing anything absurd.
@@ -57,6 +57,10 @@ pub enum Request {
     },
     /// Run a read across every shard, merged.
     QueryAll { statement: Statement },
+    /// Run one statement, routed by its shard key — the server picks the shard(s). This is how a
+    /// client runs SQL without knowing the cluster is sharded: a keyed write lands on its shard, a
+    /// point read hits one shard, any other read fans out, and DDL reaches every shard.
+    Run { statement: Statement },
     /// Run a write against one shard.
     Execute {
         shard: u32,
