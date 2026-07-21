@@ -19,8 +19,9 @@
 use std::collections::BTreeMap;
 
 use sqlparser::ast::{
-    BinaryOperator, Delete, Expr, FromTable, ObjectName, Query, SetExpr, Statement as SqlStatement,
-    TableFactor, TableObject, TableWithJoins, UnaryOperator, Value as SqlValue, ValueWithSpan,
+    BinaryOperator, ColumnOption, Delete, Expr, FromTable, ObjectName, Query, SetExpr,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Value as SqlValue, ValueWithSpan,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -42,6 +43,48 @@ pub enum Route {
     Refuse(String),
     /// No routing opinion; the caller uses its default (fan out a read, or the current shard).
     Passthrough,
+}
+
+/// The `(table, column)` a `CREATE TABLE` declares as a single-column primary key, if any — so the
+/// primary key can be adopted as the shard key automatically. A composite primary key, or a table
+/// with none, returns `None` (nothing to route on without a choice). Anything but a `CREATE TABLE`
+/// returns `None`.
+pub fn primary_key_of(sql: &str) -> Option<(String, String)> {
+    let mut stmts = Parser::parse_sql(&SQLiteDialect {}, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let SqlStatement::CreateTable(ct) = stmts.pop().unwrap() else {
+        return None;
+    };
+    let table = last_ident(&ct.name);
+
+    // Column-level `id ... PRIMARY KEY`. More than one so-marked column is not a single key.
+    let mut column_pks = ct.columns.iter().filter(|c| {
+        c.options
+            .iter()
+            .any(|o| matches!(o.option, ColumnOption::PrimaryKey(_)))
+    });
+    if let Some(col) = column_pks.next() {
+        return match column_pks.next() {
+            Some(_) => None,
+            None => Some((table, col.name.value.clone())),
+        };
+    }
+
+    // Table-level `PRIMARY KEY (col)` — single column only.
+    for c in &ct.constraints {
+        if let TableConstraint::PrimaryKey(pk) = c {
+            return match pk.columns.as_slice() {
+                [only] => match &only.column.expr {
+                    Expr::Identifier(id) => Some((table, id.value.clone())),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Decide where a single statement should run, given the declared shard keys.

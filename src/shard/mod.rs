@@ -886,6 +886,16 @@ impl ShardManager {
             let id = ShardId(s);
             out.push((id, self.writers.execute_one(id, statement.clone())?));
         }
+
+        // A CREATE TABLE with a single-column primary key adopts that column as the shard key, so
+        // writes route by it automatically with no separate `shardkey` declaration. An explicit
+        // prior declaration wins (it may shard by a non-PK column), so it is never overwritten.
+        if let Some((table, column)) = crate::query::route::primary_key_of(&statement.sql)
+            && self.shard_key(&table).is_none()
+        {
+            self.declare_shard_key(&table, &column)?;
+        }
+
         Ok(out)
     }
 

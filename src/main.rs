@@ -27,11 +27,12 @@ value you cannot revise should not be one you got by accident.
   16-64    typical; 64 covers roughly 100 MB to 1 TB
   256      maximum
 
-A write is routed to the shard its declared shard key hashes to (see the
-`shardkey` command), so writes spread across shards automatically; a multi-row
-INSERT is split per shard. A point read/update/delete on the shard key reaches
-just the shard holding the row. Without a declared shard key a write falls back
-to the current shard (see .shard).
+A table's PRIMARY KEY is adopted as its shard key when the table is created, so
+writes route by it and spread across shards automatically — no extra step. A
+multi-row INSERT is split per shard; a point read/update/delete on the key
+reaches just the shard holding the row. The `shardkey` command overrides this
+to shard by a different column. A table with neither falls back to the current
+shard (see .shard).
 
 shell commands:
   .help     show this message

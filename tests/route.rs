@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use meshdb::query::route::primary_key_of;
 use meshdb::query::{Route, ShardKeys, route_statement};
 use meshdb::shard::{ShardConfig, ShardId, ShardManager, shard_of};
 use meshdb::storage::exec::Statement;
@@ -189,6 +190,85 @@ fn an_unroutable_insert_is_refused_not_misrouted() {
         Route::Refuse(msg) => assert!(msg.contains("list its columns"), "{msg}"),
         other => panic!("expected refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn the_primary_key_is_read_as_the_shard_key() {
+    // Column-level PRIMARY KEY.
+    assert_eq!(
+        primary_key_of("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT) STRICT"),
+        Some(("users".to_string(), "id".to_string()))
+    );
+    // Table-level single-column PRIMARY KEY.
+    assert_eq!(
+        primary_key_of("CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))"),
+        Some(("t".to_string(), "a".to_string()))
+    );
+    // A composite primary key is not a single routing key.
+    assert_eq!(
+        primary_key_of("CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a, b))"),
+        None
+    );
+    // No primary key, and non-CREATE statements.
+    assert_eq!(primary_key_of("CREATE TABLE t (a INTEGER, b TEXT)"), None);
+    assert_eq!(primary_key_of("INSERT INTO t (a) VALUES (1)"), None);
+}
+
+#[test]
+fn creating_a_table_auto_declares_its_primary_key_and_routes() {
+    // The whole "no shard awareness" path: create a table with a PK, and writes route by it with
+    // no `declare_shard_key` call at all.
+    let dir = TempDir::new().unwrap();
+    let m = ShardManager::open(
+        dir.path(),
+        ShardConfig {
+            shard_count: SHARDS,
+            writer_threads: 2,
+            reader_threads: 2,
+            ..ShardConfig::floor()
+        },
+    )
+    .unwrap();
+    assert_eq!(m.shard_key("users"), None, "nothing declared yet");
+
+    m.execute_all_shards("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT) STRICT")
+        .unwrap();
+
+    // The primary key was adopted as the shard key automatically...
+    assert_eq!(m.shard_key("users").as_deref(), Some("id"));
+    // ...so a plain INSERT routes to the shard its key hashes to, with no declaration step.
+    assert_eq!(
+        route_statement(
+            "INSERT INTO users (id, name) VALUES ('alice', 'a')",
+            &m.shard_keys(),
+            SHARDS
+        ),
+        Route::One(text_shard("alice"))
+    );
+}
+
+#[test]
+fn an_explicit_shard_key_is_not_overwritten_by_the_primary_key() {
+    let dir = TempDir::new().unwrap();
+    let m = ShardManager::open(
+        dir.path(),
+        ShardConfig {
+            shard_count: SHARDS,
+            writer_threads: 2,
+            reader_threads: 2,
+            ..ShardConfig::floor()
+        },
+    )
+    .unwrap();
+    // A deliberate choice to shard by a non-PK column must survive table creation.
+    m.declare_shard_key("orders", "customer").unwrap();
+    m.execute_all_shards("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT) STRICT")
+        .unwrap();
+    assert_eq!(
+        m.shard_key("orders").as_deref(),
+        Some("customer"),
+        "explicit declaration must win over the primary key"
+    );
 }
 
 #[test]
