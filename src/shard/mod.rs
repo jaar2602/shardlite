@@ -343,6 +343,29 @@ impl ShardConfig {
 }
 
 /// A sharded database: routing, writers, and readers over a directory of shard files.
+/// Lets a fan-out reach shards this node does not own, so cross-shard reads and routed writes work
+/// across hosts. Installed by the networking layer via [`ShardManager::set_peer_router`]; without
+/// one — the embedded CLI, or a standalone node — every shard is local and nothing forwards.
+///
+/// It is deliberately defined here rather than in `net`: `ShardManager` cannot depend on the
+/// networking layer (that would be a cycle), so the seam is a trait the net layer implements.
+pub trait PeerRouter: Send + Sync {
+    /// Whether this node owns `shard` and should run it against its local file.
+    fn is_local(&self, shard: ShardId) -> bool;
+    /// Run a read on `shard`'s owner node and return its outcome.
+    fn query_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> crate::Result<crate::storage::exec::Outcome>;
+    /// Run a write on `shard`'s owner node and return its outcome.
+    fn execute_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> crate::Result<crate::storage::exec::Outcome>;
+}
+
 pub struct ShardManager {
     writers: std::sync::Arc<WriterFleet>,
     readers: ReaderFleet,
@@ -353,6 +376,9 @@ pub struct ShardManager {
     /// Declared co-partitioning: table → shard-key column. Loaded from `shard_keys.json` and used
     /// to allow co-located joins in cross-shard reads.
     shard_keys: std::sync::RwLock<crate::query::ShardKeys>,
+    /// Set once by the networking layer to forward work for shards owned by other nodes. Absent on
+    /// a standalone node or the embedded CLI, where every shard is local.
+    peer: std::sync::OnceLock<std::sync::Arc<dyn PeerRouter>>,
 }
 
 impl ShardManager {
@@ -460,7 +486,15 @@ impl ShardManager {
             manifest,
             modes,
             shard_keys,
+            peer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the peer router so fan-outs and routed statements reach shards owned by other nodes.
+    /// Called once during networked startup; a second call is ignored (the router does not change
+    /// over a node's life).
+    pub fn set_peer_router(&self, peer: std::sync::Arc<dyn PeerRouter>) {
+        let _ = self.peer.set(peer);
     }
 
     /// Hand `shard`'s file to the replication path.
@@ -609,7 +643,15 @@ impl ShardManager {
         shard: ShardId,
         sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<crate::storage::exec::Outcome> {
-        self.writers.execute_one(shard, sql)
+        let statement = sql.into();
+        // A shard this node does not own is run on its owner. This one seam makes every fan-out
+        // built on execute_one (execute_all_shards, run_routed) work across hosts.
+        if let Some(peer) = self.peer.get()
+            && !peer.is_local(shard)
+        {
+            return peer.execute_remote(shard, statement);
+        }
+        self.writers.execute_one(shard, statement)
     }
 
     pub fn query(
@@ -617,7 +659,15 @@ impl ShardManager {
         shard: ShardId,
         sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<crate::storage::exec::Outcome> {
-        self.readers.query(shard, sql)
+        let statement = sql.into();
+        // Likewise for reads: a non-owned shard is read from its owner, so query_all_shards and the
+        // point reads in run_routed gather the right rows across hosts.
+        if let Some(peer) = self.peer.get()
+            && !peer.is_local(shard)
+        {
+            return peer.query_remote(shard, statement);
+        }
+        self.readers.query(shard, statement)
     }
 
     /// Answer a read across every shard.
@@ -908,7 +958,9 @@ impl ShardManager {
         let mut out = Vec::with_capacity(self.cfg.shard_count as usize);
         for s in 0..self.cfg.shard_count {
             let id = ShardId(s);
-            out.push((id, self.writers.execute_one(id, statement.clone())?));
+            // Through execute_one so a shard owned by another node is applied there — DDL reaches
+            // every shard across hosts, not just this node's.
+            out.push((id, self.execute_one(id, statement.clone())?));
         }
 
         // A CREATE TABLE with a single-column primary key adopts that column as the shard key, so

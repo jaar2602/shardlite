@@ -188,7 +188,7 @@ fn serve_conn(
                     write_error(&mut writer, 403, "not permitted")?;
                     continue;
                 }
-                stream_query(&mut writer, shards, &frame)?;
+                stream_query(&mut writer, shards, services, &frame)?;
             }
             "info" => reply(&mut writer, json::info_json(shards))?,
             "stats" => reply(&mut writer, json::fleet_stats_json(shards))?,
@@ -256,10 +256,11 @@ fn reply(w: &mut TcpStream, body: serde_json::Value) -> std::io::Result<()> {
     write_frame(w, &serde_json::json!({ "result": body }))
 }
 
-/// A read query, streamed frame by frame.
+/// A read query against one shard, streamed frame by frame.
 fn stream_query(
     writer: &mut TcpStream,
     shards: &ShardManager,
+    services: &NodeServices,
     frame: &serde_json::Value,
 ) -> std::io::Result<()> {
     let shard = frame.get("shard").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -273,6 +274,43 @@ fn stream_query(
         Ok(s) => s,
         Err(e) => return write_error(writer, 400, &e),
     };
+    // A shard this node does not own is answered by its owner, not the local (replica or empty)
+    // file. Streaming across the wire is not worth it for one shard, so forward through the shared
+    // handler and re-emit its rows as frames.
+    if services
+        .router
+        .as_ref()
+        .is_some_and(|r| !r.is_mine(crate::shard::ShardId(shard)))
+    {
+        let resp = super::server::handle(
+            Request::Query {
+                shard,
+                statement: stmt,
+                consistency: super::protocol::ReadConsistency::Linearizable,
+            },
+            shards,
+            services,
+        );
+        return match resp {
+            Response::Rows { columns, rows } => {
+                write_frame(writer, &serde_json::json!({ "columns": columns }))?;
+                for r in rows {
+                    let cells: Vec<serde_json::Value> = r.iter().map(json::value_to_json).collect();
+                    write_frame(writer, &serde_json::json!({ "row": cells }))?;
+                }
+                write_frame(writer, &serde_json::json!({ "end": true }))
+            }
+            other => {
+                let status = json::response_status(&other);
+                let body = json::response_json_body(other);
+                let msg = body
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("error");
+                write_error(writer, status, msg)
+            }
+        };
+    }
     match shards.query_stream(crate::shard::ShardId(shard), stmt, STREAM_DEPTH) {
         Err(e) => write_error(writer, error_status(&e), &e.to_string()),
         Ok(rx) => {
@@ -322,6 +360,21 @@ fn build_request(
             },
             Requirement::Read,
         )),
+        // Auto-routed: the server picks the shard(s). A read returns rows, a write the count. Its
+        // permission follows its verb, matching `auth::required`.
+        "run" => {
+            let need = match crate::db::first_keyword(&sql).as_str() {
+                "CREATE" | "DROP" | "ALTER" => Requirement::Admin,
+                "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => Requirement::Write,
+                _ => Requirement::Read,
+            };
+            Ok((
+                Request::Run {
+                    statement: json::statement_from(&sql, &params)?,
+                },
+                need,
+            ))
+        }
         "execute" => Ok((
             Request::Execute {
                 shard,

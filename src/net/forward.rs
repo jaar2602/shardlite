@@ -172,6 +172,70 @@ impl Router {
     }
 }
 
+/// The bridge that lets [`ShardManager`](crate::shard::ShardManager) fan-outs reach shards owned by
+/// other nodes: a non-local shard's read or write is sent to its owner and its answer turned back
+/// into an [`Outcome`](crate::storage::exec::Outcome), so a forwarded shard is indistinguishable
+/// from a local one to the fan-out above.
+impl crate::shard::PeerRouter for Router {
+    fn is_local(&self, shard: ShardId) -> bool {
+        self.is_mine(shard)
+    }
+
+    fn query_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> Result<crate::storage::exec::Outcome> {
+        // Linearizable so each shard's partial is its latest committed state, read from the owner
+        // (the leader) — the same currency a local read of an owned shard would have.
+        let resp = self.forward(
+            shard,
+            Request::Query {
+                shard: shard.0,
+                statement,
+                consistency: super::protocol::ReadConsistency::Linearizable,
+            },
+        )?;
+        response_to_outcome(resp)
+    }
+
+    fn execute_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> Result<crate::storage::exec::Outcome> {
+        let resp = self.forward(
+            shard,
+            Request::Execute {
+                shard: shard.0,
+                statements: vec![statement],
+            },
+        )?;
+        response_to_outcome(resp)
+    }
+}
+
+fn response_to_outcome(resp: Response) -> Result<crate::storage::exec::Outcome> {
+    use crate::storage::exec::{Executed, Outcome, QueryResult, WriteOutcome};
+    match resp {
+        Response::Rows { columns, rows } => {
+            Ok(Outcome::Ok(Executed::Rows(QueryResult { columns, rows })))
+        }
+        Response::Changed {
+            rows_affected,
+            last_insert_rowid,
+        } => Ok(Outcome::Ok(Executed::Changed(WriteOutcome {
+            rows_affected,
+            last_insert_rowid,
+        }))),
+        Response::Rejected { message } => Ok(Outcome::Rejected(message)),
+        Response::Error { message, .. } => Err(Error::Protocol(message)),
+        other => Err(Error::Protocol(format!(
+            "unexpected response to a forwarded shard operation: {other:?}"
+        ))),
+    }
+}
+
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
