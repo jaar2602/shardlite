@@ -718,6 +718,22 @@ const SERVE_USAGE: &str = "usage: meshdb serve <data-dir> [options]
   --max-conn N       connection cap (default 256)
   --tls-cert FILE    PEM certificate; enables TLS (requires the `tls` build feature)
   --tls-key FILE     PEM private key for the certificate
+  --http ADDR        also serve the HTTP gateway on ADDR
+  --json-tcp ADDR    also serve the JSON-over-TCP protocol on ADDR
+
+Clustering (deploy across hosts):
+  --node-id N        this node's id; turns on cluster mode
+  --peers LIST       other members as id=addr,id=addr,... (their --listen addresses)
+
+  Shards are spread across members automatically (placement round-robins by node
+  id). A client connected to any node can run SQL against any shard: the server
+  routes writes to the owning node and gathers cross-shard reads from all of them.
+  This is placement-only — each shard is single-copy on its owner (no replicas).
+
+  Example (3 nodes):
+    meshdb serve /data --shards 12 --listen A:4600 --node-id 1 --peers 2=B:4600,3=C:4600
+    meshdb serve /data --shards 12 --listen B:4600 --node-id 2 --peers 1=A:4600,3=C:4600
+    meshdb serve /data --shards 12 --listen C:4600 --node-id 3 --peers 1=A:4600,2=B:4600
 
 Without --users the server accepts any connection and warns that it is open.
 Without --tls-cert connections are plaintext.";
@@ -804,20 +820,6 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    let manager = match meshdb::shard::ShardManager::open(
-        &dir,
-        meshdb::shard::ShardConfig {
-            shard_count: shards,
-            ..meshdb::shard::ShardConfig::floor()
-        },
-    ) {
-        Ok(m) => std::sync::Arc::new(m),
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // Authentication, if a users file was given.
     let auth = match flag(args, "--users") {
         Some(path) => match meshdb::net::AuthConfig::open(std::path::Path::new(path)) {
@@ -830,6 +832,54 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         None => None,
     };
 
+    // --node-id turns this into a cluster member; without it the node is standalone. --peers gives
+    // the other members as `id=addr` pairs, which are also the addresses this node forwards to.
+    let node_id = flag(args, "--node-id").and_then(|v| v.parse::<u64>().ok());
+    let peers = match flag(args, "--peers") {
+        Some(s) => match parse_peers(s) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => std::collections::BTreeMap::new(),
+    };
+    if node_id.is_none() && !peers.is_empty() {
+        eprintln!("error: --peers requires --node-id");
+        return ExitCode::FAILURE;
+    }
+
+    let (manager, services, cluster) = match node_id {
+        Some(id) => match build_cluster(&dir, shards, id, peers, auth) {
+            Ok((m, svc, c)) => (m, svc, Some(c)),
+            Err(e) => {
+                eprintln!("error: forming cluster: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let m = match meshdb::shard::ShardManager::open(
+                &dir,
+                meshdb::shard::ShardConfig {
+                    shard_count: shards,
+                    ..meshdb::shard::ShardConfig::floor()
+                },
+            ) {
+                Ok(m) => std::sync::Arc::new(m),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let services = meshdb::net::NodeServices {
+                auth,
+                ..Default::default()
+            };
+            (m, services, None)
+        }
+    };
+
     let mut cfg = meshdb::net::ServerConfig {
         addr: listen.clone(),
         ..meshdb::net::ServerConfig::default()
@@ -838,10 +888,6 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         cfg.max_connections = n;
     }
 
-    let services = meshdb::net::NodeServices {
-        auth,
-        ..Default::default()
-    };
     let server = match meshdb::net::Server::bind_with(manager, services, cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -888,7 +934,17 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         }
     }
 
-    eprintln!("meshdb serving {shards} shards on {listen}");
+    // Start the election/heartbeat loop for a clustered node. It runs alongside the server, which
+    // answers peers' vote and heartbeat RPCs; placement (which node owns which shard) follows.
+    if let Some(cluster) = &cluster {
+        let c = std::sync::Arc::clone(cluster);
+        std::thread::spawn(move || c.run(std::time::Duration::from_millis(300)));
+    }
+
+    match node_id {
+        Some(id) => eprintln!("meshdb serving {shards} shards on {listen} as cluster node {id}"),
+        None => eprintln!("meshdb serving {shards} shards on {listen}"),
+    }
     match server.serve() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -896,6 +952,112 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse `--peers` — a comma-separated list of `id=addr` for the OTHER cluster members.
+fn parse_peers(s: &str) -> std::result::Result<std::collections::BTreeMap<u64, String>, String> {
+    let mut peers = std::collections::BTreeMap::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (id, addr) = part
+            .split_once('=')
+            .ok_or_else(|| format!("bad peer `{part}`, expected id=addr"))?;
+        let id = id
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("bad peer id in `{part}`"))?;
+        peers.insert(id, addr.trim().to_string());
+    }
+    Ok(peers)
+}
+
+/// Assemble a clustered node: a capture-on manager gated by a [`Fence`] so it only writes shards it
+/// leads, an election over the static peer set, a `ClusterNode` whose placement round-robins shards
+/// across the live members, and a `Router` installed as the manager's peer router so cross-shard
+/// fan-outs and routed statements reach shards owned by other nodes.
+///
+/// This is a *placement-only* cluster: each shard lives single-copy on its owner (no follower
+/// replicas, no quorum wait). It delivers multi-write scale-out across hosts; data-level HA
+/// (replicas + quorum ack) is a further step, not wired here.
+#[allow(clippy::type_complexity)]
+fn build_cluster(
+    dir: &std::path::Path,
+    shards: u32,
+    id: u64,
+    peers: std::collections::BTreeMap<u64, String>,
+    auth: Option<std::sync::Arc<meshdb::net::AuthConfig>>,
+) -> std::result::Result<
+    (
+        std::sync::Arc<meshdb::shard::ShardManager>,
+        meshdb::net::NodeServices,
+        std::sync::Arc<meshdb::cluster::ClusterNode>,
+    ),
+    String,
+> {
+    use meshdb::cluster::{
+        ClusterNode, DurabilitySource, Election, ElectionConfig, Fence, TermStore,
+    };
+    use meshdb::replication::{FrameLog, FrameLogConfig};
+    use meshdb::shard::{PeerRouter, ShardConfig, ShardId, ShardManager, WriteGate};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let frames = Arc::new(FrameLog::new(FrameLogConfig {
+        total_bytes: 8 * 1024 * 1024,
+        shard_count: shards,
+    }));
+    let fence = Arc::new(Fence::new(id, 0));
+    let manager = Arc::new(
+        ShardManager::open_clustered(
+            dir,
+            ShardConfig {
+                shard_count: shards,
+                capture: true,
+                ..ShardConfig::floor()
+            },
+            Some(frames.clone()),
+            None, // no quorum wait: placement-only, each shard single-copy on its owner
+            Some(Arc::clone(&fence) as Arc<dyn WriteGate>),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+
+    let terms = TermStore::open(&dir.join("cluster")).map_err(|e| e.to_string())?;
+    let election = Election::new(
+        ElectionConfig {
+            node: id,
+            peers: peers.keys().copied().collect(),
+            election_timeout: Duration::from_millis(1500),
+            heartbeat_interval: Duration::from_millis(300),
+        },
+        terms,
+        Instant::now(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let cluster = Arc::new(
+        ClusterNode::new(
+            id,
+            election,
+            Arc::clone(&fence),
+            peers,
+            Arc::clone(&manager) as Arc<dyn DurabilitySource>,
+            (0..shards).map(ShardId).collect(),
+        )
+        .with_modes(Arc::clone(manager.modes())),
+    );
+
+    let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
+    // The seam that makes fan-outs cross-host: shards this node does not own are forwarded here.
+    manager.set_peer_router(Arc::clone(&router) as Arc<dyn PeerRouter>);
+
+    let services = meshdb::net::NodeServices {
+        auth,
+        frames: Some(frames),
+        cluster: Some(Arc::clone(&cluster)),
+        router: Some(router),
+        ..Default::default()
+    };
+    Ok((manager, services, cluster))
 }
 
 #[cfg(feature = "tls")]

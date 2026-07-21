@@ -34,7 +34,7 @@ use crate::shard::ShardManager;
 
 use super::auth::{self, Requirement, Role};
 use super::json;
-use super::protocol::Request;
+use super::protocol::{Request, Response};
 use super::server::NodeServices;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
