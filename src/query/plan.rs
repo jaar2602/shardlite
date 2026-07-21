@@ -36,7 +36,8 @@
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
 //! - **`OFFSET`** — the rows skipped per shard are not the rows to skip globally.
-//! - **Subqueries, set operations, CTEs** — each can hide any of the above.
+//! - **Subqueries** — each would run against one shard alone, not the whole table.
+//! - **Set operations, CTEs** — each can hide any of the above.
 //!
 //! # What it cannot fix
 //!
@@ -209,6 +210,17 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         }
     };
 
+    // A subquery anywhere would be pushed verbatim to each shard, where it runs against that
+    // shard alone rather than the whole table — a silent wrong answer. Refuse it in every plan,
+    // not only the grouped one. Walked completely by sqlparser's visitor, so nothing nested is
+    // missed.
+    if has_subquery(query) {
+        return Err(Unsupported {
+            what: "a subquery",
+            why: "it would run against each shard alone, not the whole table, so the merged \
+                  result would be wrong; compute the subquery separately and inline its value",
+        });
+    }
     if select.distinct.is_some() {
         return Err(Unsupported {
             what: "DISTINCT",
@@ -319,15 +331,6 @@ fn plan_grouped(
         return Err(Unsupported {
             what: "ROLLUP, CUBE or GROUPING SETS",
             why: "these produce super-aggregate rows that a fan-out cannot reassemble",
-        });
-    }
-    // A subquery anywhere in a grouped query would be pushed verbatim to each shard, where it
-    // would aggregate over that shard alone — a silent wrong answer. Refuse rather than approximate.
-    if has_subquery(query) {
-        return Err(Unsupported {
-            what: "a subquery in a grouped query",
-            why: "it would run against each shard alone, not the whole table, so the grouped \
-                  result would be wrong; compute the subquery separately",
         });
     }
     if select.having.is_some() {

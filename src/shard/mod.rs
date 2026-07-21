@@ -156,6 +156,14 @@ pub struct ShardConfig {
     /// exists so a benchmark can attribute the win to batching rather than merely to
     /// serializing writers.
     pub max_batch: usize,
+
+    /// Upper bound on the partial group rows the coordinator will hold while merging a
+    /// cross-shard `GROUP BY`. A pathological high-cardinality grouping — grouping by a
+    /// near-unique column — would otherwise materialise a group per row on the coordinator;
+    /// past this it refuses loudly rather than exhausting memory. Counted during fan-out so the
+    /// rows are never collected in the first place. Applies only to grouped fan-outs, and only
+    /// on the coordinator; a single-shard query is unaffected.
+    pub max_grouped_rows: usize,
 }
 
 impl ShardConfig {
@@ -175,6 +183,7 @@ impl ShardConfig {
             open_readers_per_thread: 8,
             write_queue_depth: 1024,
             max_batch: 64,
+            max_grouped_rows: 1_000_000,
             capture: false,
             max_retained_bytes: crate::vfs::wal::DEFAULT_MAX_RETAINED_BYTES,
             snapshot_hold_max_wal: 256 * 1024 * 1024,
@@ -514,15 +523,33 @@ impl ShardManager {
 
         // A grouped query runs a *rewritten* partial-aggregation query on each shard; every other
         // plan runs the caller's SQL unchanged.
+        let grouped = matches!(&plan, crate::query::Plan::Grouped(_));
         let shard_sql = match &plan {
             crate::query::Plan::Grouped(g) => g.shard_sql.as_str(),
             _ => sql,
         };
 
         let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
+        let mut grouped_rows = 0usize;
         for s in 0..self.cfg.shard_count {
             match self.query(ShardId(s), shard_sql)? {
-                Outcome::Ok(Executed::Rows(r)) => parts.push(r),
+                Outcome::Ok(Executed::Rows(r)) => {
+                    // Bound coordinator memory: refuse a runaway grouping before its partial rows
+                    // are collected, rather than merging them and risking an OOM.
+                    if grouped {
+                        grouped_rows += r.rows.len();
+                        if grouped_rows > self.cfg.max_grouped_rows {
+                            return Err(crate::Error::Unsupported(format!(
+                                "the grouped query produced more than {} partial group rows \
+                                 across shards, more than the coordinator will hold in memory; \
+                                 add a WHERE filter, reduce the group cardinality, or target a \
+                                 single shard",
+                                self.cfg.max_grouped_rows
+                            )));
+                        }
+                    }
+                    parts.push(r);
+                }
                 // A shard that has not been written to has no table yet; it contributes
                 // nothing rather than failing the whole query.
                 Outcome::Rejected(msg) if msg.contains("no such table") => {}

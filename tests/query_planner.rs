@@ -294,6 +294,47 @@ fn the_shard_count_does_not_change_the_answer() {
 }
 
 #[test]
+fn a_runaway_grouping_is_capped_not_ooming() {
+    // A high-cardinality grouping — grouping by a near-unique column — would materialise a group
+    // per row on the coordinator. A configurable cap turns that into a loud refusal instead of an
+    // OOM, while a low-cardinality grouping under the cap still answers.
+    let dir = TempDir::new().unwrap();
+    let m = ShardManager::open(
+        dir.path(),
+        ShardConfig {
+            max_grouped_rows: 25,
+            ..cfg(8)
+        },
+    )
+    .unwrap();
+    m.execute_all_shards("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER) STRICT")
+        .unwrap();
+    for i in 0..50 {
+        let key = format!("k{i}");
+        m.execute_one(
+            m.route(key.as_bytes()),
+            Statement::with_params(
+                "INSERT INTO t VALUES (?1, ?2)",
+                vec![Value::Text(key.clone()), Value::Integer(i)],
+            ),
+        )
+        .unwrap();
+    }
+
+    // 50 distinct values of n → 50 partial group rows, over the cap of 25.
+    let err = m
+        .query_all_shards("SELECT n, count(*) FROM t GROUP BY n")
+        .expect_err("a 50-group query must be capped at 25");
+    assert!(err.to_string().contains("partial group rows"), "{err}");
+
+    // Grouping into two buckets stays well under the cap and still answers.
+    let ok = m
+        .query_all_shards("SELECT n % 2, count(*) FROM t GROUP BY n % 2")
+        .unwrap();
+    assert_eq!(ok.rows.len(), 2);
+}
+
+#[test]
 fn queries_that_cannot_be_combined_are_refused() {
     // Each of these has a plausible-looking wrong answer available, which is exactly why it
     // must error instead.
@@ -331,6 +372,13 @@ fn queries_that_cannot_be_combined_are_refused() {
             "GROUP_CONCAT",
         ),
         // A subquery would run per shard, not over the whole table — a silent wrong answer.
+        // This holds for a plain SELECT, not only a grouped one: the WHERE subquery below would
+        // compare each row against that shard's own avg, never the global one.
+        (
+            "SELECT k FROM t WHERE n > (SELECT avg(n) FROM t)",
+            "subquery",
+        ),
+        ("SELECT (SELECT count(*) FROM t) AS c, k FROM t", "subquery"),
         (
             "SELECT n % 10, count(*) FROM t WHERE n > (SELECT avg(n) FROM t) GROUP BY n % 10",
             "subquery",
