@@ -5,7 +5,7 @@
 //! the only way to catch a merge that is plausible but wrong — which is the whole failure
 //! mode this planner exists to avoid.
 
-use meshdb::query::{Combine, OutputCol, Plan, plan};
+use meshdb::query::{Combine, OutputCol, Plan, SetKind, SetTree, plan};
 use meshdb::shard::{ShardConfig, ShardId, ShardManager};
 use meshdb::storage::Value;
 use meshdb::storage::exec::{Executed, Outcome, QueryResult, Statement};
@@ -357,6 +357,60 @@ fn offset_matches_a_single_shard() {
 }
 
 #[test]
+fn set_operations_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // Each branch is fanned out independently and the results combined; compared as multisets
+    // against native SQLite. Low-cardinality keys (`n % 7`, `n % 5`) make the same value recur on
+    // many shards, so cross-shard set semantics are actually exercised.
+    for sql in [
+        // INTERSECT / EXCEPT — the pushdown-impossible cases, now correct via central combine.
+        "SELECT n % 7 FROM t WHERE n < 500 INTERSECT SELECT n % 7 FROM t WHERE n > 200",
+        "SELECT n % 7 FROM t WHERE n IS NOT NULL EXCEPT SELECT n % 7 FROM t WHERE n > 500",
+        // Mixed operators in one query (left-associative, like SQLite).
+        "SELECT n % 5 FROM t WHERE n < 300 UNION SELECT n % 5 FROM t WHERE n >= 300 \
+         EXCEPT SELECT n % 5 FROM t WHERE n = 0",
+        // An aggregate in each branch — computed globally before combining.
+        "SELECT count(*) FROM t WHERE n < 500 UNION SELECT count(*) FROM t WHERE n >= 500",
+        "SELECT max(n) FROM t WHERE n < 500 UNION ALL SELECT max(n) FROM t WHERE n >= 500",
+        // A grouped query as a branch.
+        "SELECT count(*) FROM t GROUP BY n % 3 UNION SELECT count(*) FROM t GROUP BY n % 4",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // Ordered set operations resolve to a total order (unique values of n % 7), so a row-for-row
+    // comparison against native SQLite is sound.
+    for sql in [
+        "SELECT n % 7 FROM t WHERE n < 500 INTERSECT SELECT n % 7 FROM t WHERE n > 200 ORDER BY 1",
+        "SELECT n % 7 FROM t WHERE n IS NOT NULL EXCEPT SELECT n % 7 FROM t WHERE n > 500 \
+         ORDER BY 1 DESC",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn unordered_offset_returns_the_right_count() {
+    // OFFSET without ORDER BY is allowed — the rows are unspecified (as for a bare LIMIT), so the
+    // contract is the row *count*, not which rows.
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, _single) = twin(&dirs, 16);
+
+    let page = sharded
+        .query_all_shards("SELECT k FROM t LIMIT 10 OFFSET 5")
+        .unwrap();
+    assert_eq!(page.rows.len(), 10);
+
+    // OFFSET past most of the table returns the remainder.
+    let tail = sharded
+        .query_all_shards("SELECT k FROM t LIMIT 100 OFFSET 395")
+        .unwrap();
+    assert_eq!(tail.rows.len() as i64, ROWS - 395);
+}
+
+#[test]
 fn a_runaway_grouping_is_capped_not_ooming() {
     // A high-cardinality grouping — grouping by a near-unique column — would materialise a group
     // per row on the coordinator. A configurable cap turns that into a loud refusal instead of an
@@ -404,23 +458,6 @@ fn queries_that_cannot_be_combined_are_refused() {
     for (sql, expect) in [
         ("SELECT avg(n) FROM t", "AVG"),
         ("SELECT a.k FROM t a JOIN t b ON a.k = b.k", "join"),
-        // OFFSET is only answerable with a global order.
-        ("SELECT k FROM t LIMIT 10 OFFSET 5", "OFFSET"),
-        // INTERSECT / EXCEPT cannot be pushed down — a row can be on one side on one shard and
-        // the other side on another, so per-shard evaluation misses cross-shard matches.
-        ("SELECT k FROM t INTERSECT SELECT k FROM t", "INTERSECT"),
-        ("SELECT k FROM t EXCEPT SELECT k FROM t", "EXCEPT"),
-        // Mixing UNION and UNION ALL cannot be honoured in one coordinator pass.
-        (
-            "SELECT k FROM t UNION SELECT k FROM t UNION ALL SELECT k FROM t",
-            "mixing",
-        ),
-        // An aggregate under DISTINCT or in a UNION branch is a per-shard fragment.
-        ("SELECT DISTINCT count(*) FROM t", "aggregate"),
-        (
-            "SELECT count(*) FROM t UNION SELECT count(*) FROM t",
-            "aggregate",
-        ),
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
             "common table expression",
@@ -588,13 +625,36 @@ fn plans_are_what_they_claim_to_be() {
         other => panic!("expected a post-process plan, got {other:?}"),
     }
 
-    // UNION ALL → a post-process that does not dedup.
+    // UNION ALL → a set-op plan: two branches combined by a keep-duplicates UNION.
     match plan("SELECT k FROM t UNION ALL SELECT k FROM t").unwrap() {
-        Plan::PostProcess(p) => {
-            assert!(!p.distinct);
-            assert!(p.shard_sql.to_uppercase().contains("UNION ALL"));
+        Plan::SetOp(s) => {
+            assert_eq!(s.branches.len(), 2);
+            assert!(matches!(
+                s.tree,
+                SetTree::Op {
+                    op: SetKind::Union,
+                    all: true,
+                    ..
+                }
+            ));
         }
-        other => panic!("expected a post-process plan, got {other:?}"),
+        other => panic!("expected a set-op plan, got {other:?}"),
+    }
+
+    // INTERSECT → a set-op plan with a distinct intersect.
+    match plan("SELECT k FROM t WHERE n < 5 INTERSECT SELECT k FROM t WHERE n > 2").unwrap() {
+        Plan::SetOp(s) => {
+            assert_eq!(s.branches.len(), 2);
+            assert!(matches!(
+                s.tree,
+                SetTree::Op {
+                    op: SetKind::Intersect,
+                    all: false,
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected a set-op plan, got {other:?}"),
     }
 }
 

@@ -248,13 +248,21 @@ re-aggregation paths are revert-verified. Still refused: `INTERSECT`/`EXCEPT`, m
 |---|---|---|
 | **`DISTINCT`** (`SELECT DISTINCT a, b`) | It *is* `GROUP BY a, b` with no aggregate: push `SELECT DISTINCT` to each shard (local dedup), then coordinator dedups the merge with the same `compare_values` equality. | Reuses Increment A's grouping path almost verbatim. `COUNT(DISTINCT x)` stays refused (double-counts). |
 | **`UNION` / `UNION ALL`** | Each shard computes its side(s) locally; coordinator concatenates. `UNION ALL` = pure concat; `UNION` = concat + dedup. Both sides must be fan-out-safe. | Recurse the planner into each side. |
-| **`OFFSET`** (with `ORDER BY`) | Push `LIMIT offset+count` (no offset) to each shard, coordinator sorts, drops `offset`, takes `count`. | Deep pagination ships `offset+count` rows per shard — keyset pagination stays the recommendation. `OFFSET` without `ORDER BY` is globally undefined → refuse. |
+| **`OFFSET`** | Push `LIMIT offset+count` (no offset) to each shard, coordinator sorts, drops `offset`, takes `count`. `OFFSET` *without* `ORDER BY` is allowed too — the rows are unspecified, exactly as for a bare `LIMIT`, so the count is the contract. | Deep pagination ships `offset+count` rows per shard — keyset pagination stays the recommendation. |
 
 ## Tier 2 — need the central-materialisation primitive (cap-gated)
 
+**Set operations are DONE** — `INTERSECT` / `EXCEPT`, mixing `UNION` with `UNION ALL`, and set-op
+branches that are themselves aggregates or grouped queries. Rather than pushing the operation down
+(which misses cross-shard matches), the planner emits a `Plan::SetOp`: each leaf `SELECT` is fanned
+out as its own full cross-shard query, and the coordinator combines the branch results with SQLite
+set semantics (`ShardManager::eval_set_op` + `evaluate_set_tree`). Because each branch is evaluated
+globally first, an aggregate branch is correct too. Verified against native SQLite; the combine is
+revert-verified.
+
 | Refusal | Approach | Cost / caveat |
 |---|---|---|
-| **`INTERSECT` / `EXCEPT`** | Not push-down-able — a row can be in `A` on one shard and `B` on another, so per-shard `A∩B` misses cross-shard matches. Materialise both fan-out-safe sides on the coordinator and do the set-op there. | Memory-bound in both sides; cap-gated. |
+| ~~**`INTERSECT` / `EXCEPT`**~~ **(done)** | Fan out each branch globally, combine on the coordinator via multi-pass — no pushdown, so cross-shard matches are not missed. | Holds both branch results on the coordinator (same as `Concat`); no separate cap yet. |
 | **Uncorrelated scalar subquery** (`WHERE x > (SELECT AVG(x) FROM t)`) | Two-pass: compute the inner across shards, substitute the literal, re-plan and re-fan-out the outer. | Needs multi-pass planning + value substitution. |
 | **Derived-table / `IN (SELECT …)` subquery** | Materialise the fan-out-safe inner centrally, run the outer over the (small) materialised set. | Same central primitive; cap-gated. |
 | **Aggregate + bare column, no `GROUP BY`** | Mostly *subsumed by Increment A* — the fix is "add `GROUP BY`". The `MIN`/`MAX`-with-bare-columns rule is a decomposable **argmin/argmax** (each shard returns its extreme row; coordinator picks the global one) — a small optional feature. | The general bare-column form stays refused: nondeterministic even on one shard. |
@@ -279,7 +287,7 @@ central hash-join of both fully-materialised sides (correct, expensive, cap-gate
 
 ## Sequencing
 
-**A. `GROUP BY`** (this document) → **fold in `DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** (nearly
-free on A's machinery) → **B. `HAVING`** → **the central-materialisation primitive**
-(`INTERSECT`/`EXCEPT` + uncorrelated scalar subqueries) → **co-located `JOIN`** as its own opt-in
+**A. `GROUP BY`** ✓ → **`DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** ✓ → **`INTERSECT`/`EXCEPT` +
+mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** (next) → **uncorrelated scalar
+subqueries** (the remaining central-materialisation case) → **co-located `JOIN`** as its own opt-in
 feature. Each step keeps parse-prove-refuse and adds a memory cap wherever it materialises.

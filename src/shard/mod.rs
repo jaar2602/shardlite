@@ -521,8 +521,14 @@ impl ShardManager {
 
         let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
 
-        // Grouped and post-processed (DISTINCT / UNION / OFFSET) queries run a *rewritten* query
-        // on each shard; every other plan runs the caller's SQL unchanged.
+        // A set operation evaluates each branch as its own full fan-out, then combines the
+        // results on the coordinator — so a branch may itself be an aggregate or grouped query.
+        if let crate::query::Plan::SetOp(set_op) = &plan {
+            return self.eval_set_op(set_op);
+        }
+
+        // Grouped and post-processed (DISTINCT / OFFSET) queries run a *rewritten* query on each
+        // shard; every other plan runs the caller's SQL unchanged.
         let grouped = matches!(&plan, crate::query::Plan::Grouped(_));
         let shard_sql = match &plan {
             crate::query::Plan::Grouped(g) => g.shard_sql.as_str(),
@@ -568,6 +574,28 @@ impl ShardManager {
         }
 
         Ok(merge_results(&plan, parts))
+    }
+
+    /// Evaluate a set operation: fan out each branch independently (so an aggregate or grouped
+    /// branch is computed globally), then combine the branch results with SQLite set semantics and
+    /// apply the outer ORDER BY / OFFSET / LIMIT. Recursion is one level deep — branches are plain
+    /// leaf queries, never themselves set operations.
+    fn eval_set_op(
+        &self,
+        set_op: &crate::query::SetOp,
+    ) -> crate::Result<crate::storage::exec::QueryResult> {
+        let mut branch_results = Vec::with_capacity(set_op.branches.len());
+        for branch in &set_op.branches {
+            branch_results.push(self.query_all_shards(branch)?);
+        }
+        let columns = branch_results
+            .first()
+            .map(|r| r.columns.clone())
+            .unwrap_or_default();
+
+        let mut rows = crate::query::evaluate_set_tree(&set_op.tree, &branch_results);
+        crate::query::finalize_rows(&mut rows, &set_op.order_by, set_op.offset, set_op.limit);
+        Ok(crate::storage::exec::QueryResult { columns, rows })
     }
 
     /// Run a statement against **every** shard.

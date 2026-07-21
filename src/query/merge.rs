@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::exec::{QueryResult, Value};
 
-use super::plan::{Combine, Grouped, OutputCol, Plan, PostProcess, SortKey};
+use super::plan::{Combine, Grouped, OutputCol, Plan, PostProcess, SetKind, SetTree, SortKey};
 
 /// Combine per-shard results according to `plan`.
 ///
@@ -62,6 +62,10 @@ pub fn merge_results(plan: &Plan, parts: Vec<QueryResult>) -> QueryResult {
         Plan::Grouped(g) => merge_grouped(g, parts),
 
         Plan::PostProcess(p) => merge_post_process(p, columns, parts),
+
+        // Set operations are evaluated branch-by-branch by the coordinator (see
+        // `ShardManager::eval_set_op`) and never reach the per-shard merge path.
+        Plan::SetOp(_) => unreachable!("set operations are combined by eval_set_op, not merge"),
     }
 }
 
@@ -75,26 +79,129 @@ fn merge_post_process(
     let mut rows: Vec<Vec<Value>> = parts.into_iter().flat_map(|p| p.rows).collect();
 
     if p.distinct {
-        // Collapse rows equal under SQLite value comparison (so Integer(1) and Real(1.0), and two
-        // NULLs, are one row), keeping first appearance. `BTreeSet` navigates by `GroupKey`'s Ord.
-        let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
-        rows.retain(|row| seen.insert(GroupKey(row.clone())));
+        dedup_rows(&mut rows);
     }
-    if !p.order_by.is_empty() {
-        rows.sort_by(|a, b| compare_rows(a, b, &p.order_by));
+    finalize_rows(&mut rows, &p.order_by, p.offset, p.limit);
+    QueryResult { columns, rows }
+}
+
+/// Sort (if there are keys), skip `offset`, then truncate to `limit` — the tail every
+/// coordinator-side plan shares.
+pub fn finalize_rows(
+    rows: &mut Vec<Vec<Value>>,
+    order_by: &[SortKey],
+    offset: usize,
+    limit: Option<usize>,
+) {
+    if !order_by.is_empty() {
+        rows.sort_by(|a, b| compare_rows(a, b, order_by));
     }
-    if p.offset > 0 {
-        rows = if p.offset < rows.len() {
-            rows.split_off(p.offset)
+    if offset > 0 {
+        *rows = if offset < rows.len() {
+            rows.split_off(offset)
         } else {
             Vec::new()
         };
     }
-    if let Some(n) = p.limit {
+    if let Some(n) = limit {
         rows.truncate(n);
     }
+}
 
-    QueryResult { columns, rows }
+/// Collapse rows equal under SQLite value comparison (so `Integer(1)` and `Real(1.0)`, and two
+/// NULLs, are one row), keeping first appearance. `BTreeSet` navigates by `GroupKey`'s `Ord`.
+fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
+    rows.retain(|row| seen.insert(GroupKey(row.clone())));
+}
+
+/// Evaluate a set-operation tree over branch results (each already a full fan-out). Rows are cloned
+/// out of the branch results and combined with SQLite's `UNION`/`INTERSECT`/`EXCEPT` semantics.
+pub fn evaluate_set_tree(tree: &SetTree, branches: &[QueryResult]) -> Vec<Vec<Value>> {
+    match tree {
+        SetTree::Leaf(i) => branches.get(*i).map(|b| b.rows.clone()).unwrap_or_default(),
+        SetTree::Op {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            let l = evaluate_set_tree(left, branches);
+            let r = evaluate_set_tree(right, branches);
+            apply_set_op(*op, *all, l, r)
+        }
+    }
+}
+
+/// Multiplicities of each distinct row (by value equality).
+fn row_counts(rows: &[Vec<Value>]) -> BTreeMap<GroupKey, usize> {
+    let mut counts: BTreeMap<GroupKey, usize> = BTreeMap::new();
+    for row in rows {
+        *counts.entry(GroupKey(row.clone())).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Combine two branch results under one set operator, honouring `ALL` (multiset) vs distinct
+/// semantics exactly as SQLite does.
+fn apply_set_op(
+    op: SetKind,
+    all: bool,
+    mut left: Vec<Vec<Value>>,
+    right: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    match op {
+        SetKind::Union => {
+            left.extend(right);
+            if !all {
+                dedup_rows(&mut left);
+            }
+            left
+        }
+        SetKind::Intersect => {
+            let mut budget = row_counts(&right);
+            let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
+            let mut out = Vec::new();
+            for row in left {
+                let key = GroupKey(row.clone());
+                if all {
+                    // Keep min(countL, countR) copies: consume the right budget per occurrence.
+                    if let Some(remaining) = budget.get_mut(&key)
+                        && *remaining > 0
+                    {
+                        *remaining -= 1;
+                        out.push(row);
+                    }
+                } else if budget.contains_key(&key) && seen.insert(key) {
+                    // Distinct rows present in both sides.
+                    out.push(row);
+                }
+            }
+            out
+        }
+        SetKind::Except => {
+            let mut budget = row_counts(&right);
+            let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
+            let mut out = Vec::new();
+            for row in left {
+                let key = GroupKey(row.clone());
+                if all {
+                    // Keep max(0, countL - countR) copies: consume the right budget first.
+                    if let Some(remaining) = budget.get_mut(&key)
+                        && *remaining > 0
+                    {
+                        *remaining -= 1;
+                        continue;
+                    }
+                    out.push(row);
+                } else if !budget.contains_key(&key) && seen.insert(key) {
+                    // Distinct rows in the left not present in the right.
+                    out.push(row);
+                }
+            }
+            out
+        }
+    }
 }
 
 /// The coordinator half of two-phase aggregation: bucket every shard's partial rows by their
@@ -135,19 +242,7 @@ fn merge_grouped(g: &Grouped, parts: Vec<QueryResult>) -> QueryResult {
         rows.push(out);
     }
 
-    if !g.order_by.is_empty() {
-        rows.sort_by(|a, b| compare_rows(a, b, &g.order_by));
-    }
-    if g.offset > 0 {
-        rows = if g.offset < rows.len() {
-            rows.split_off(g.offset)
-        } else {
-            Vec::new()
-        };
-    }
-    if let Some(n) = g.limit {
-        rows.truncate(n);
-    }
+    finalize_rows(&mut rows, &g.order_by, g.offset, g.limit);
 
     QueryResult {
         columns: g.output_names.clone(),

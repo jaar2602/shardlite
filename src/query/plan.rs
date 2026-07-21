@@ -20,14 +20,15 @@
 //! | `GROUP BY g, …` | two-phase: per-shard partial groups, then re-aggregate by key |
 //! | `AVG(c)` (bare or grouped) | decompose to `SUM(c)`/`COUNT(c)`, divide at the coordinator |
 //! | `DISTINCT` | per-shard dedup, then dedup the union on the coordinator |
-//! | `UNION` / `UNION ALL` | per-shard evaluate, then concat (ALL) or dedup on the coordinator |
-//! | `OFFSET` (with `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
+//! | `OFFSET` (± `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
+//! | `UNION` / `INTERSECT` / `EXCEPT` (any mix) | fan out each branch, then combine on the coordinator |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
 //! carrying `SUM` and `COUNT` per shard and dividing once. `GROUP BY` is the same idea per
-//! group (see [`Grouped`]); `DISTINCT`, `UNION`, and `OFFSET` are coordinator-side reshapes of the
-//! concatenated rows (see [`PostProcess`]).
+//! group (see [`Grouped`]); `DISTINCT` and `OFFSET` are coordinator-side reshapes of the
+//! concatenated rows (see [`PostProcess`]); a set operation evaluates each branch as its own
+//! fan-out and combines the results (see [`SetOp`]), so a branch may itself be an aggregate.
 //!
 //! # What is refused, and why each one
 //!
@@ -39,9 +40,6 @@
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
-//! - **`OFFSET` without `ORDER BY`** — the rows skipped are undefined without a global order.
-//! - **`INTERSECT` / `EXCEPT`** — a row can be on one side on one shard and the other side on
-//!   another, so per-shard evaluation misses cross-shard matches.
 //! - **Subqueries** — each would run against one shard alone, not the whole table.
 //! - **CTEs** — can hide any of the above.
 //!
@@ -97,8 +95,11 @@ pub enum Plan {
     /// Fan out a rewritten partial-aggregation query, then re-aggregate by group key.
     Grouped(Box<Grouped>),
     /// Fan out a rewritten query, then dedup / sort / skip / truncate on the coordinator. Covers
-    /// `DISTINCT`, `UNION` / `UNION ALL`, and `OFFSET`.
+    /// `DISTINCT` and `OFFSET`.
     PostProcess(Box<PostProcess>),
+    /// Evaluate each branch of a set operation as its own fan-out, then combine on the coordinator.
+    /// Covers `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, in any mix.
+    SetOp(Box<SetOp>),
 }
 
 /// A coordinator-side reshape of concatenated shard rows: optionally dedup them, sort them, skip
@@ -115,6 +116,42 @@ pub struct PostProcess {
     pub offset: usize,
     /// Rows to keep after skipping.
     pub limit: Option<usize>,
+}
+
+/// A set operation (`UNION` / `INTERSECT` / `EXCEPT`, in any mix), evaluated by fanning out each
+/// branch as its own full cross-shard query and then combining the results. Because each branch is
+/// evaluated globally first, a branch may be anything fan-out-safe — including an aggregate or a
+/// grouped query — and the combine is correct across shards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOp {
+    /// The SQL of each leaf `SELECT`, left to right; `tree` refers to these by index.
+    pub branches: Vec<String>,
+    /// How to combine the branch results.
+    pub tree: SetTree,
+    /// Sort keys over the output columns (the first branch's), empty when there is no `ORDER BY`.
+    pub order_by: Vec<SortKey>,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+/// The shape of a set-operation expression, over branch indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetTree {
+    Leaf(usize),
+    Op {
+        op: SetKind,
+        /// `ALL` keeps duplicates; otherwise the operation is distinct.
+        all: bool,
+        left: Box<SetTree>,
+        right: Box<SetTree>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetKind {
+    Union,
+    Intersect,
+    Except,
 }
 
 /// A two-phase `GROUP BY`. Each shard runs `shard_sql` to produce its *partial* groups (SQLite
@@ -306,16 +343,10 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
     let (limit, offset) = limit_and_offset(query)?;
     let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
 
-    // OFFSET needs a global order and coordinator-side skipping; it cannot be pushed per shard.
+    // OFFSET is skipped on the coordinator; each shard ships its top (offset+limit) rows. Without
+    // an ORDER BY the rows skipped and returned are unspecified — exactly as for a bare LIMIT — but
+    // still a valid answer, so it is allowed rather than refused.
     if offset > 0 {
-        if keys.is_empty() {
-            return Err(Unsupported {
-                what: "OFFSET without ORDER BY",
-                why: "the rows skipped per shard are not the rows to skip globally; add an \
-                      ORDER BY so the offset is well defined",
-            });
-        }
-        // Each shard ships its top (offset + limit) rows so the coordinator can skip then take.
         return Ok(Plan::PostProcess(Box::new(PostProcess {
             shard_sql: shard_sql_with_limit(query, limit.map(|n| n + offset)),
             distinct: false,
@@ -342,16 +373,26 @@ fn plan_distinct(query: &Query, select: &Select) -> std::result::Result<Plan, Un
             why: "it keeps an arbitrary row per group, which a fan-out cannot reproduce",
         });
     }
+
+    // A DISTINCT over aggregates is redundant — an aggregate query yields at most one row per
+    // group — so plan it as the underlying aggregate. The shard still runs the DISTINCT form
+    // (harmless: `SELECT DISTINCT count(*)` per shard is just that shard's count).
+    let has_aggregate = select
+        .projection
+        .iter()
+        .any(|item| matches!(aggregate_of(item), Ok(Some(_)) | Err(_)));
+    if has_aggregate {
+        let mut without = query.clone();
+        if let SetExpr::Select(s) = without.body.as_mut() {
+            s.distinct = None;
+        }
+        return plan_query(&without);
+    }
+
     require_plain_select(select)?;
 
     let (limit, offset) = limit_and_offset(query)?;
     let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
-    if offset > 0 && keys.is_empty() {
-        return Err(Unsupported {
-            what: "OFFSET without ORDER BY",
-            why: "the rows skipped per shard are not the rows to skip globally; add an ORDER BY",
-        });
-    }
     // A widened LIMIT is only safe to push when ordered (each shard's top-k contains the global
     // top-k); unordered, dedup the whole thing and limit at the coordinator.
     let push = if keys.is_empty() {
@@ -368,57 +409,47 @@ fn plan_distinct(query: &Query, select: &Select) -> std::result::Result<Plan, Un
     })))
 }
 
-/// Plan a `UNION` / `UNION ALL`: every shard evaluates the whole set operation over its own rows,
-/// and the coordinator concatenates (`UNION ALL`) or dedups (`UNION`). `INTERSECT` / `EXCEPT` are
-/// refused — a row can be on one side on one shard and the other side on another, so per-shard
-/// evaluation misses cross-shard matches. Mixing `UNION` and `UNION ALL` in one query is refused
-/// because their duplicate handling cannot both be honoured in a single coordinator pass.
+/// Plan any set operation (`UNION` / `INTERSECT` / `EXCEPT`, in any mix) as multi-pass: each leaf
+/// `SELECT` becomes its own branch to fan out independently, and `tree` records how to combine
+/// them. Because each branch is evaluated globally before combining, a branch may itself be an
+/// aggregate or grouped query — the per-shard fragmentation that makes a pushed-down set operation
+/// wrong does not arise.
 fn plan_set_op(query: &Query) -> std::result::Result<Plan, Unsupported> {
-    let mut leaves: Vec<&Select> = Vec::new();
-    let mut distinct: Option<bool> = None;
-    collect_union_leaves(query.body.as_ref(), &mut leaves, &mut distinct)?;
-    for &leaf in &leaves {
-        require_plain_select(leaf)?;
-    }
-    let first = *leaves.first().ok_or(Unsupported {
+    let mut branches: Vec<String> = Vec::new();
+    let mut leaf_selects: Vec<&Select> = Vec::new();
+    let tree = build_set_tree(query.body.as_ref(), &mut branches, &mut leaf_selects)?;
+
+    let first = *leaf_selects.first().ok_or(Unsupported {
         what: "an empty set operation",
-        why: "there is nothing to fan out",
+        why: "there is nothing to combine",
     })?;
 
     let (limit, offset) = limit_and_offset(query)?;
     // An ORDER BY on a compound select resolves against the first branch's output columns.
-    let keys = resolve_sort_keys(&query.order_by, &first.projection)?;
-    if offset > 0 && keys.is_empty() {
-        return Err(Unsupported {
-            what: "OFFSET without ORDER BY",
-            why: "the rows skipped per shard are not the rows to skip globally; add an ORDER BY",
-        });
-    }
-    let push = if keys.is_empty() {
-        None
-    } else {
-        limit.map(|n| n + offset)
-    };
-    Ok(Plan::PostProcess(Box::new(PostProcess {
-        shard_sql: shard_sql_with_limit(query, push),
-        distinct: distinct.unwrap_or(true),
-        order_by: keys,
+    let order_by = resolve_sort_keys(&query.order_by, &first.projection)?;
+
+    Ok(Plan::SetOp(Box::new(SetOp {
+        branches,
+        tree,
+        order_by,
         offset,
         limit,
     })))
 }
 
-/// Flatten a set-operation tree into its leaf SELECTs, requiring every operator to be `UNION`
-/// with a consistent `ALL`/distinct quantifier.
-fn collect_union_leaves<'a>(
+/// Walk a set-operation expression into a [`SetTree`] over branch indices, collecting each leaf's
+/// SQL (for independent fan-out) and its `Select` (for output-column resolution).
+fn build_set_tree<'a>(
     body: &'a SetExpr,
-    leaves: &mut Vec<&'a Select>,
-    distinct: &mut Option<bool>,
-) -> std::result::Result<(), Unsupported> {
+    branches: &mut Vec<String>,
+    leaf_selects: &mut Vec<&'a Select>,
+) -> std::result::Result<SetTree, Unsupported> {
     match body {
         SetExpr::Select(s) => {
-            leaves.push(s);
-            Ok(())
+            let index = branches.len();
+            branches.push(s.to_string());
+            leaf_selects.push(s);
+            Ok(SetTree::Leaf(index))
         }
         SetExpr::SetOperation {
             op,
@@ -426,34 +457,35 @@ fn collect_union_leaves<'a>(
             left,
             right,
         } => {
-            if *op != SetOperator::Union {
+            // `BY NAME` matches columns by name rather than position — different semantics, and
+            // non-standard; refuse it rather than treat it as positional.
+            if matches!(
+                set_quantifier,
+                SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+            ) {
                 return Err(Unsupported {
-                    what: "INTERSECT or EXCEPT",
-                    why: "a row can be on one side on one shard and the other side on another, so \
-                          per-shard evaluation misses cross-shard matches",
+                    what: "a BY NAME set operation",
+                    why: "columns are combined by position across shards, not by name",
                 });
             }
-            let is_distinct = !matches!(
-                set_quantifier,
-                SetQuantifier::All | SetQuantifier::AllByName
-            );
-            match distinct {
-                None => *distinct = Some(is_distinct),
-                Some(prev) if *prev == is_distinct => {}
-                Some(_) => {
-                    return Err(Unsupported {
-                        what: "mixing UNION and UNION ALL",
-                        why: "their duplicate handling differs and a single coordinator pass \
-                              cannot honour both; use one or the other",
-                    });
-                }
-            }
-            collect_union_leaves(left, leaves, distinct)?;
-            collect_union_leaves(right, leaves, distinct)
+            let kind = match op {
+                SetOperator::Union => SetKind::Union,
+                SetOperator::Intersect => SetKind::Intersect,
+                SetOperator::Except | SetOperator::Minus => SetKind::Except,
+            };
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            let left = Box::new(build_set_tree(left, branches, leaf_selects)?);
+            let right = Box::new(build_set_tree(right, branches, leaf_selects)?);
+            Ok(SetTree::Op {
+                op: kind,
+                all,
+                left,
+                right,
+            })
         }
         _ => Err(Unsupported {
             what: "this query form in a set operation",
-            why: "only plain SELECT branches can be fanned out",
+            why: "only plain SELECT branches can be combined",
         }),
     }
 }
@@ -685,12 +717,6 @@ fn plan_grouped(
     // final output columns.
     let (limit, offset) = limit_and_offset(query)?;
     let order_by = resolve_sort_keys(&query.order_by, &select.projection)?;
-    if offset > 0 && order_by.is_empty() {
-        return Err(Unsupported {
-            what: "OFFSET without ORDER BY",
-            why: "the groups skipped are undefined without a global order; add an ORDER BY",
-        });
-    }
 
     let where_clause = select
         .selection
