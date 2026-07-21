@@ -125,13 +125,10 @@ fn an_uncombinable_query_is_refused_over_the_wire_too() {
     c.execute_all("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER) STRICT")
         .unwrap();
 
-    let err = c.query_all("SELECT avg(n) FROM t").unwrap_err();
+    let err = c.query_all("SELECT group_concat(k) FROM t").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("AVG"), "{msg}");
-    assert!(
-        msg.contains("SUM"),
-        "the suggested alternative is missing: {msg}"
-    );
+    assert!(msg.contains("GROUP_CONCAT"), "{msg}");
+    assert!(msg.contains("order"), "the explanation is missing: {msg}");
 }
 
 #[test]

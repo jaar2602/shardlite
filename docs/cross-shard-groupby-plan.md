@@ -266,8 +266,8 @@ revert-verified.
 | Refusal | Approach | Cost / caveat |
 |---|---|---|
 | ~~**`INTERSECT` / `EXCEPT`**~~ **(done)** | Fan out each branch globally, combine on the coordinator via multi-pass — no pushdown, so cross-shard matches are not missed. | Holds both branch results on the coordinator (same as `Concat`); no separate cap yet. |
-| **Uncorrelated scalar subquery** (`WHERE x > (SELECT AVG(x) FROM t)`) | Two-pass: compute the inner across shards, substitute the literal, re-plan and re-fan-out the outer. | Needs multi-pass planning + value substitution. |
-| **Derived-table / `IN (SELECT …)` subquery** | Materialise the fan-out-safe inner centrally, run the outer over the (small) materialised set. | Same central primitive; cap-gated. |
+| ~~**Uncorrelated scalar subquery**~~ **(done)** (`WHERE x > (SELECT AVG(x) FROM t)`) | Two-pass: `substitute_scalar_subqueries` evaluates each scalar subquery globally, splices its value in as a literal (bottom-up, so nesting works), and the rewritten outer is re-planned and fanned out. A correlated subquery names the outer row and, run on its own, errors — refused naturally. This also completed **bare `AVG` / multiple bare aggregates** (a group over the whole table), which the flagship example needs. | Each subquery is one extra fan-out pass. |
+| **Derived-table / `IN (SELECT …)` subquery** | Materialise the fan-out-safe inner centrally, run the outer over the (small) materialised set. | Same central primitive; cap-gated. Still refused. |
 | **Aggregate + bare column, no `GROUP BY`** | Mostly *subsumed by Increment A* — the fix is "add `GROUP BY`". The `MIN`/`MAX`-with-bare-columns rule is a decomposable **argmin/argmax** (each shard returns its extreme row; coordinator picks the global one) — a small optional feature. | The general bare-column form stays refused: nondeterministic even on one shard. |
 
 ## Tier 3 — the architectural line
@@ -292,5 +292,6 @@ central hash-join of both fully-materialised sides (correct, expensive, cap-gate
 
 **A. `GROUP BY`** ✓ → **`DISTINCT` + `UNION`/`UNION ALL` + `OFFSET`** ✓ → **`INTERSECT`/`EXCEPT` +
 mixed set-ops + aggregate branches** ✓ (multi-pass) → **B. `HAVING`** ✓ → **uncorrelated scalar
-subqueries** (next — the remaining central-materialisation case) → **co-located `JOIN`** as its own
-opt-in feature. Each step keeps parse-prove-refuse and adds a memory cap wherever it materialises.
+subqueries + bare `AVG`/multi-aggregate** ✓ → **co-located `JOIN`** (next — its own opt-in feature)
+and derived-table / `IN` subqueries. Each step keeps parse-prove-refuse and adds a memory cap
+wherever it materialises.

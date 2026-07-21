@@ -10,5 +10,5 @@ pub mod plan;
 pub use merge::{evaluate_set_tree, finalize_rows, merge_results};
 pub use plan::{
     Combine, CompareOp, Grouped, HavingExpr, HavingValue, OutputCol, Plan, PostProcess, SetKind,
-    SetOp, SetTree, SortKey, Unsupported, plan,
+    SetOp, SetTree, SortKey, Unsupported, plan, substitute_scalar_subqueries,
 };

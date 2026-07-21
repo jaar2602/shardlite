@@ -22,14 +22,16 @@
 //! | `DISTINCT` | per-shard dedup, then dedup the union on the coordinator |
 //! | `OFFSET` (± `ORDER BY`) | each shard ships its top `offset+limit`; skip then take |
 //! | `UNION` / `INTERSECT` / `EXCEPT` (any mix) | fan out each branch, then combine on the coordinator |
+//! | scalar subquery `(SELECT …)` | evaluate it globally, substitute its value, re-plan the outer |
 //!
 //! `COUNT`/`SUM`/`MIN`/`MAX` are *associative* — combining per-shard partials reproduces the
 //! global answer. `AVG` is not, but it *decomposes* into two that are, so it is answered by
-//! carrying `SUM` and `COUNT` per shard and dividing once. `GROUP BY` is the same idea per
-//! group (see [`Grouped`]), and `HAVING` filters the complete groups on the coordinator;
-//! `DISTINCT` and `OFFSET` are coordinator-side reshapes of the concatenated rows (see
-//! [`PostProcess`]); a set operation evaluates each branch as its own fan-out and combines the
-//! results (see [`SetOp`]), so a branch may itself be an aggregate.
+//! carrying `SUM` and `COUNT` per shard and dividing once (bare, this is a group over the whole
+//! table). `GROUP BY` is the same idea per group (see [`Grouped`]), and `HAVING` filters the
+//! complete groups on the coordinator; `DISTINCT` and `OFFSET` are coordinator-side reshapes of the
+//! concatenated rows (see [`PostProcess`]); a set operation evaluates each branch as its own
+//! fan-out and combines the results (see [`SetOp`]); a scalar subquery is evaluated on its own and
+//! its value substituted in before the outer query is planned (see [`substitute_scalar_subqueries`]).
 //!
 //! # What is refused, and why each one
 //!
@@ -39,7 +41,9 @@
 //! - **`GROUP_CONCAT`, and any aggregate not listed above** — not associative or order-dependent.
 //! - **A selected column that is neither grouped nor aggregated** — a bare column is a partial,
 //!   arbitrary row per shard.
-//! - **Subqueries** — each would run against one shard alone, not the whole table.
+//! - **`IN` / `EXISTS` / `ANY` / `ALL` subqueries** — these return a set, not a single value to
+//!   substitute; a *correlated* subquery is refused too (it names the outer row and cannot run on
+//!   its own).
 //! - **CTEs** — can hide any of the above.
 //!
 //! # What it cannot fix
@@ -55,7 +59,7 @@ use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, GroupByWithModifier, LimitClause, OrderByKind, Query, Select,
     SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement, UnaryOperator,
-    Value as SqlValue, ValueWithSpan, visit_expressions,
+    Value as SqlValue, ValueWithSpan, visit_expressions, visit_expressions_mut,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -99,6 +103,9 @@ pub enum Plan {
     /// Evaluate each branch of a set operation as its own fan-out, then combine on the coordinator.
     /// Covers `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, in any mix.
     SetOp(Box<SetOp>),
+    /// The query contains scalar subqueries: evaluate each globally, substitute its value, then
+    /// re-plan and fan out the substituted query (see [`substitute_scalar_subqueries`]).
+    ScalarSubqueries,
 }
 
 /// A coordinator-side reshape of concatenated shard rows: optionally dedup them, sort them, skip
@@ -301,15 +308,20 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         });
     }
 
-    // A subquery anywhere would be pushed verbatim to each shard, where it runs against that shard
-    // alone rather than the whole table — a silent wrong answer. Refuse it in every plan (a UNION
-    // branch or a WHERE clause included). Walked completely by sqlparser's visitor.
-    if has_subquery(query) {
-        return Err(Unsupported {
-            what: "a subquery",
-            why: "it would run against each shard alone, not the whole table, so the merged \
-                  result would be wrong; compute the subquery separately and inline its value",
-        });
+    // A scalar subquery is evaluated globally on its own and its value substituted in before the
+    // outer query is planned (two-pass). An IN / EXISTS / ANY / ALL subquery returns a set, not a
+    // value, and is refused. Either way a subquery is never pushed verbatim to a shard, where it
+    // would run against that shard alone and answer wrongly.
+    match classify_subqueries(query) {
+        SubqueryClass::None => {}
+        SubqueryClass::ScalarOnly => return Ok(Plan::ScalarSubqueries),
+        SubqueryClass::SetValued => {
+            return Err(Unsupported {
+                what: "an IN, EXISTS, ANY or ALL subquery",
+                why: "only a scalar subquery — one returning a single value — can be evaluated \
+                      separately and substituted; these return a set",
+            });
+        }
     }
 
     let select = match query.body.as_ref() {
@@ -355,32 +367,9 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
         });
     }
 
-    // An aggregate must be alone in the select list: combining it with plain columns needs
-    // the grouping semantics refused above.
-    let mut aggregates: Vec<Combine> = Vec::new();
-    for item in &select.projection {
-        if let Some(c) = aggregate_of(item)? {
-            aggregates.push(c);
-        }
-    }
-
-    if !aggregates.is_empty() {
-        if select.projection.len() != 1 {
-            return Err(Unsupported {
-                what: "an aggregate alongside other columns",
-                why: "the plain columns would need a GROUP BY to be meaningful, and groups \
-                      are partial per shard",
-            });
-        }
-        if query.order_by.is_some() {
-            return Err(Unsupported {
-                what: "ORDER BY on an aggregate",
-                why: "the aggregate collapses to a single row, so ordering is meaningless",
-            });
-        }
-        return Ok(Plan::Aggregate {
-            combine: aggregates[0],
-        });
+    // A bare aggregate (no GROUP BY) is a group over the whole table.
+    if let Some(plan) = plan_bare_aggregate(query, select)? {
+        return Ok(plan);
     }
 
     let (limit, offset) = limit_and_offset(query)?;
@@ -404,6 +393,44 @@ fn plan_query(query: &Query) -> std::result::Result<Plan, Unsupported> {
     } else {
         Ok(Plan::Merge { keys, limit })
     }
+}
+
+/// Plan a bare aggregate (aggregates in the projection, no `GROUP BY`) as a group over the whole
+/// table. A single associative aggregate takes the fast [`Plan::Aggregate`] path; `AVG`, several
+/// aggregates, or an ordered aggregate go through the grouped machinery with an empty group key.
+/// Returns `Ok(None)` when the projection has no aggregate.
+fn plan_bare_aggregate(
+    query: &Query,
+    select: &Select,
+) -> std::result::Result<Option<Plan>, Unsupported> {
+    let mut has_aggregate = false;
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        // classify_aggregate refuses GROUP_CONCAT and unknown aggregates via `?`.
+        if let Expr::Function(f) = expr
+            && classify_aggregate(f)?.is_some()
+        {
+            has_aggregate = true;
+        }
+    }
+    if !has_aggregate {
+        return Ok(None);
+    }
+
+    // Fast path: one associative aggregate, no ORDER BY / LIMIT.
+    if select.projection.len() == 1
+        && query.order_by.is_none()
+        && query.limit_clause.is_none()
+        && let Some(combine) = aggregate_of(&select.projection[0]).ok().flatten()
+    {
+        return Ok(Some(Plan::Aggregate { combine }));
+    }
+
+    // Everything else — AVG, several aggregates, ordering — is a group over the whole table.
+    Ok(Some(plan_grouped(query, select, &[], &[])?))
 }
 
 /// Plan a `SELECT DISTINCT`: each shard dedups locally (shrinking transfer), and the coordinator
@@ -753,12 +780,18 @@ fn plan_grouped(
         .as_ref()
         .map(|e| format!(" WHERE {e}"))
         .unwrap_or_default();
+    // A bare aggregate (k == 0) has no GROUP BY clause — it groups over the whole table.
+    let group_clause = if k == 0 {
+        String::new()
+    } else {
+        format!(" GROUP BY {}", group_sql.join(", "))
+    };
     let shard_sql = format!(
-        "SELECT {} FROM {}{} GROUP BY {}",
+        "SELECT {} FROM {}{}{}",
         partial.join(", "),
         from,
         where_clause,
-        group_sql.join(", "),
+        group_clause,
     );
 
     Ok(Plan::Grouped(Box::new(Grouped {
@@ -974,22 +1007,103 @@ fn literal_value(expr: &Expr) -> std::result::Result<crate::storage::exec::Value
 
 /// Whether any expression in `query` is (or contains) a subquery — walked completely via
 /// sqlparser's visitor, so nothing nested is missed.
-fn has_subquery(query: &Query) -> bool {
-    visit_expressions(query, |e| {
-        if matches!(
-            e,
-            Expr::Subquery(_)
-                | Expr::Exists { .. }
-                | Expr::InSubquery { .. }
-                | Expr::AnyOp { .. }
-                | Expr::AllOp { .. }
-        ) {
+/// What subqueries a query contains, walked completely by sqlparser's visitor.
+enum SubqueryClass {
+    /// No subqueries.
+    None,
+    /// Only scalar subqueries (`Expr::Subquery`) — evaluable and substitutable.
+    ScalarOnly,
+    /// A set-valued subquery form (`IN` / `EXISTS` / `ANY` / `ALL`) — refused.
+    SetValued,
+}
+
+fn classify_subqueries(query: &Query) -> SubqueryClass {
+    let mut has_scalar = false;
+    let mut set_valued = false;
+    let _ = visit_expressions(query, |e| match e {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
+            set_valued = true;
             ControlFlow::Break(())
-        } else {
+        }
+        Expr::Subquery(_) => {
+            has_scalar = true;
             ControlFlow::Continue(())
         }
-    })
-    .is_break()
+        _ => ControlFlow::Continue(()),
+    });
+    if set_valued {
+        SubqueryClass::SetValued
+    } else if has_scalar {
+        SubqueryClass::ScalarOnly
+    } else {
+        SubqueryClass::None
+    }
+}
+
+/// Two-pass scalar-subquery evaluation: walk `sql` and, for each scalar subquery, call `eval` with
+/// its SQL and splice the returned value in as a literal, then return the rewritten SQL for the
+/// caller to re-plan and fan out. The walk is **post-order**, so a nested subquery is evaluated and
+/// substituted before its parent — the parent is then subquery-free when it is evaluated, and a
+/// correlated subquery surfaces naturally as a "no such column" error from `eval`.
+pub fn substitute_scalar_subqueries<F>(
+    sql: &str,
+    mut eval: F,
+) -> std::result::Result<String, String>
+where
+    F: FnMut(&str) -> std::result::Result<crate::storage::exec::Value, String>,
+{
+    let dialect = SQLiteDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+    let stmt = statements
+        .first_mut()
+        .ok_or_else(|| "empty statement".to_string())?;
+
+    let mut error: Option<String> = None;
+    let _ = visit_expressions_mut(stmt, |expr| {
+        if let Expr::Subquery(inner) = expr {
+            match eval(&inner.to_string()).and_then(|v| literal_to_expr(&v)) {
+                Ok(literal) => *expr = literal,
+                Err(e) => {
+                    error = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if let Some(e) = error {
+        return Err(e);
+    }
+    Ok(stmt.to_string())
+}
+
+/// A [`Value`](crate::storage::exec::Value) as an sqlparser literal expression, for splicing into a
+/// query in place of a scalar subquery.
+fn literal_to_expr(v: &crate::storage::exec::Value) -> std::result::Result<Expr, String> {
+    use crate::storage::exec::Value;
+    let value = match v {
+        Value::Null => SqlValue::Null,
+        Value::Integer(n) => SqlValue::Number(n.to_string(), false),
+        Value::Real(f) if f.is_finite() => SqlValue::Number(real_to_sql(*f), false),
+        // A non-finite float has no SQL literal; treat it as NULL (an aggregate never yields one).
+        Value::Real(_) => SqlValue::Null,
+        Value::Text(s) => SqlValue::SingleQuotedString(s.clone()),
+        Value::Blob(_) => {
+            return Err("a scalar subquery returning a blob cannot be substituted".to_string());
+        }
+    };
+    Ok(Expr::Value(value.with_empty_span()))
+}
+
+/// Render a finite `f64` as a SQL numeric literal that keeps its real type (always has a `.`), so
+/// substituting it back reproduces the single-shard value exactly.
+fn real_to_sql(f: f64) -> String {
+    let s = format!("{f}");
+    if s.contains(['.', 'e', 'E']) {
+        s
+    } else {
+        format!("{s}.0")
+    }
 }
 
 /// A canonical, case-insensitive text form of an expression, for matching a projected column

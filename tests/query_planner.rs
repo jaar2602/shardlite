@@ -252,6 +252,65 @@ fn aggregates_match_a_single_shard() {
 }
 
 #[test]
+fn bare_aggregates_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // AVG and multiple aggregates with no GROUP BY — a group over the whole table. Compared as a
+    // single row against native SQLite (AVG is exact on integer data).
+    for sql in [
+        "SELECT avg(n) FROM t",
+        "SELECT sum(n), count(n), avg(n) FROM t",
+        "SELECT min(n), max(n), count(*) FROM t",
+        "SELECT avg(n) FROM t WHERE n > 300",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn scalar_subqueries_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // The subquery is evaluated globally and its value substituted before the outer fan-out.
+    for sql in [
+        "SELECT count(*) FROM t WHERE n > (SELECT avg(n) FROM t)",
+        "SELECT count(*) FROM t WHERE n >= (SELECT max(n) FROM t)",
+        "SELECT sum(n) FROM t WHERE n < (SELECT avg(n) FROM t)",
+        // A subquery in the projection.
+        "SELECT (SELECT max(n) FROM t) AS mx, (SELECT min(n) FROM t) AS mn FROM t LIMIT 1",
+        // Nested — substituted bottom-up.
+        "SELECT count(*) FROM t WHERE n > \
+         (SELECT avg(n) FROM t WHERE n < (SELECT max(n) FROM t))",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+
+    // Row results with a deterministic order (n is unique, so `= max` and `> avg` are stable).
+    for sql in [
+        "SELECT k FROM t WHERE n > (SELECT avg(n) FROM t) ORDER BY k",
+        "SELECT k FROM t WHERE n = (SELECT max(n) FROM t) ORDER BY k",
+    ] {
+        assert_grouped_ordered(&sharded, &single, sql);
+    }
+}
+
+#[test]
+fn a_correlated_subquery_is_refused() {
+    // A correlated subquery references the outer row; evaluated on its own it names a column that
+    // is not in scope, which surfaces as an error rather than a wrong answer.
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, _single) = twin(&dirs, 8);
+    let err = sharded
+        .query_all_shards(
+            "SELECT a.k FROM t a WHERE a.n > (SELECT avg(b.n) FROM t b WHERE b.k = a.k)",
+        )
+        .expect_err("a correlated subquery must not be answered");
+    assert!(!err.to_string().is_empty(), "{err}");
+}
+
+#[test]
 fn ordered_queries_match_a_single_shard() {
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (sharded, single) = twin(&dirs, 16);
@@ -489,14 +548,22 @@ fn queries_that_cannot_be_combined_are_refused() {
     // Each of these has a plausible-looking wrong answer available, which is exactly why it
     // must error instead.
     for (sql, expect) in [
-        ("SELECT avg(n) FROM t", "AVG"),
         ("SELECT a.k FROM t a JOIN t b ON a.k = b.k", "join"),
         (
             "WITH x AS (SELECT 1) SELECT * FROM x",
             "common table expression",
         ),
-        ("SELECT count(*), sum(n) FROM t", "alongside other columns"),
         ("SELECT group_concat(k) FROM t", "GROUP_CONCAT"),
+        // An aggregate alongside a bare (non-grouped) column is still nondeterministic per shard.
+        (
+            "SELECT count(*), n FROM t",
+            "neither grouped nor aggregated",
+        ),
+        // A set-valued subquery cannot be reduced to a single substituted value.
+        (
+            "SELECT k FROM t WHERE n IN (SELECT n FROM t WHERE n > 20)",
+            "IN, EXISTS",
+        ),
         // --- grouped queries that still cannot be answered correctly across shards ---
         // A bare column that is neither grouped nor aggregated is an arbitrary row per shard.
         (
@@ -517,18 +584,6 @@ fn queries_that_cannot_be_combined_are_refused() {
         (
             "SELECT n % 10, group_concat(s) FROM t GROUP BY n % 10",
             "GROUP_CONCAT",
-        ),
-        // A subquery would run per shard, not over the whole table — a silent wrong answer.
-        // This holds for a plain SELECT, not only a grouped one: the WHERE subquery below would
-        // compare each row against that shard's own avg, never the global one.
-        (
-            "SELECT k FROM t WHERE n > (SELECT avg(n) FROM t)",
-            "subquery",
-        ),
-        ("SELECT (SELECT count(*) FROM t) AS c, k FROM t", "subquery"),
-        (
-            "SELECT n % 10, count(*) FROM t WHERE n > (SELECT avg(n) FROM t) GROUP BY n % 10",
-            "subquery",
         ),
     ] {
         let err = plan(sql).expect_err(&format!("{sql} should have been refused"));
@@ -551,13 +606,13 @@ fn refusals_reach_the_caller_rather_than_a_wrong_answer() {
     let (sharded, _single) = twin(&dirs, 8);
 
     let err = sharded
-        .query_all_shards("SELECT avg(n) FROM t")
-        .expect_err("AVG must not be answered across shards");
-    assert!(err.to_string().contains("AVG"), "{err}");
+        .query_all_shards("SELECT group_concat(k) FROM t")
+        .expect_err("GROUP_CONCAT must not be answered across shards");
+    assert!(err.to_string().contains("GROUP_CONCAT"), "{err}");
 
-    // The suggested replacement does work.
+    // Aggregates that decompose — including AVG — do work.
     sharded.query_all_shards("SELECT sum(n) FROM t").unwrap();
-    sharded.query_all_shards("SELECT count(n) FROM t").unwrap();
+    sharded.query_all_shards("SELECT avg(n) FROM t").unwrap();
 }
 
 #[test]

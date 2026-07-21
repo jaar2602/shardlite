@@ -521,6 +521,15 @@ impl ShardManager {
 
         let plan = plan(sql).map_err(|u| crate::Error::Unsupported(u.to_string()))?;
 
+        // A scalar subquery is evaluated globally on its own, its value substituted in, and the
+        // rewritten (subquery-free) query re-run. Nested subqueries substitute bottom-up.
+        if matches!(&plan, crate::query::Plan::ScalarSubqueries) {
+            let substituted =
+                crate::query::substitute_scalar_subqueries(sql, |subsql| self.eval_scalar(subsql))
+                    .map_err(crate::Error::Unsupported)?;
+            return self.query_all_shards(&substituted);
+        }
+
         // A set operation evaluates each branch as its own full fan-out, then combines the
         // results on the coordinator — so a branch may itself be an aggregate or grouped query.
         if let crate::query::Plan::SetOp(set_op) = &plan {
@@ -596,6 +605,32 @@ impl ShardManager {
         let mut rows = crate::query::evaluate_set_tree(&set_op.tree, &branch_results);
         crate::query::finalize_rows(&mut rows, &set_op.order_by, set_op.offset, set_op.limit);
         Ok(crate::storage::exec::QueryResult { columns, rows })
+    }
+
+    /// Evaluate a scalar subquery globally and return its single value. It must return exactly one
+    /// column and at most one row; no rows is `NULL` (SQLite's scalar-subquery semantics), and more
+    /// than one row is refused rather than picking an unspecified row across shards.
+    fn eval_scalar(
+        &self,
+        subsql: &str,
+    ) -> std::result::Result<crate::storage::exec::Value, String> {
+        let result = self.query_all_shards(subsql).map_err(|e| e.to_string())?;
+        if result.columns.len() != 1 {
+            return Err(format!(
+                "a scalar subquery must return one column, but `{subsql}` returns {}",
+                result.columns.len()
+            ));
+        }
+        match result.rows.len() {
+            0 => Ok(crate::storage::exec::Value::Null),
+            1 => Ok(result.rows[0]
+                .first()
+                .cloned()
+                .unwrap_or(crate::storage::exec::Value::Null)),
+            n => Err(format!(
+                "a scalar subquery must return at most one row, but `{subsql}` returns {n}"
+            )),
+        }
     }
 
     /// Run a statement against **every** shard.
