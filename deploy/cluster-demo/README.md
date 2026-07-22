@@ -35,6 +35,21 @@ Try it yourself against any node — the answer is the same everywhere:
 curl -s localhost:8083/v1/run -d '{"sql":"SELECT count(*) FROM users"}'
 ```
 
+## Web console
+
+`./console.sh` starts the meshdb **console** (the web UI) pointed at this cluster. It brings the
+cluster up if needed, launches the console backend on `localhost:7100`, and pre-registers the
+cluster as a connection, so you just sign in and browse/query it:
+
+```sh
+./console.sh
+# then open http://127.0.0.1:7100  (user: admin, pass: admin-demo-pass)
+```
+
+The console reaches the cluster over the same HTTP `/v1` edge — its connection test reports
+`forwarding: true` and `shard_count: 12`, i.e. it sees the real 3-node cluster. Ctrl-C stops the
+console; the cluster keeps running. (The console is built on first run and needs `npm` + `cargo`.)
+
 Tear down:
 
 ```sh
