@@ -1027,16 +1027,29 @@ impl ShardManager {
             out.push((ShardId(s as u32), outcome?));
         }
 
-        // A CREATE TABLE with a single-column primary key adopts that column as the shard key, so
-        // writes route by it automatically with no separate `shardkey` declaration. An explicit
-        // prior declaration wins (it may shard by a non-PK column), so it is never overwritten.
-        if let Some((table, column)) = crate::query::route::primary_key_of(&statement.sql)
+        self.adopt_shard_key_from_ddl(&statement.sql)?;
+
+        Ok(out)
+    }
+
+    /// If `sql` is a `CREATE TABLE` with a single-column primary key, adopt that column as the
+    /// table's shard key, so writes route by it automatically with no separate `shardkey`
+    /// declaration. An explicit prior declaration wins (it may shard by a non-PK column), so it is
+    /// never overwritten; a non-CREATE or a composite/absent PK is a no-op.
+    ///
+    /// This must run on **every** node that applies the CREATE, not just the coordinator: the shard
+    /// key is per-node metadata (`shard_keys.txt`), and a node that does not learn it mis-routes
+    /// keyed writes (they fall back to shard 0) and point reads for that table. The coordinator calls
+    /// it from [`Self::execute_all_shards`]; a node receiving the DDL as a forwarded `ShardBatch`
+    /// calls it from the server handler. Because the key is derived from the CREATE text itself,
+    /// every node computes the same one.
+    pub fn adopt_shard_key_from_ddl(&self, sql: &str) -> crate::Result<()> {
+        if let Some((table, column)) = crate::query::route::primary_key_of(sql)
             && self.shard_key(&table).is_none()
         {
             self.declare_shard_key(&table, &column)?;
         }
-
-        Ok(out)
+        Ok(())
     }
 
     /// Run one client statement, routing it to the shard(s) that hold its rows — the "just connect

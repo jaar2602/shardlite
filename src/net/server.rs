@@ -926,6 +926,12 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                     outcome_to_batch(outcome)
                 })
                 .collect();
+            // A forwarded CREATE TABLE must make this node adopt the table's shard key too, or it
+            // would mis-route keyed writes and point reads for that table (only the coordinator
+            // adopts it otherwise). A no-op for non-DDL batches.
+            if write {
+                let _ = shards.adopt_shard_key_from_ddl(&statement.sql);
+            }
             Response::Batch { results }
         }
 
@@ -1331,5 +1337,49 @@ fn error_response(e: Error) -> Response {
     Response::Error {
         message: e.to_string(),
         retryable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::ShardConfig;
+    use crate::storage::exec::Statement;
+
+    /// A node that receives a `CREATE TABLE` as a forwarded `ShardBatch` (the DDL fan-out path)
+    /// must adopt its primary key as the shard key locally. Otherwise only the coordinator learns
+    /// it, and this node mis-routes keyed writes (to shard 0) and point reads for the table — the
+    /// cross-node routing bug this asserts against.
+    #[test]
+    fn a_forwarded_create_makes_the_receiving_node_adopt_the_shard_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let shards = Arc::new(
+            ShardManager::open(
+                dir.path(),
+                ShardConfig {
+                    shard_count: 8,
+                    ..ShardConfig::floor()
+                },
+            )
+            .unwrap(),
+        );
+        let services = NodeServices::default();
+
+        assert!(shards.shard_key("t").is_none());
+        let resp = handle(
+            Request::ShardBatch {
+                shards: (0..8).collect(),
+                statement: Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT"),
+                write: true,
+            },
+            &shards,
+            &services,
+        );
+        assert!(matches!(resp, Response::Batch { .. }));
+        assert_eq!(
+            shards.shard_key("t").as_deref(),
+            Some("id"),
+            "the node that ran the forwarded CREATE did not adopt its primary key as the shard key"
+        );
     }
 }
