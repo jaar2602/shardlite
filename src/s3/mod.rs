@@ -17,7 +17,9 @@ use std::time::Duration;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+pub mod pager;
 pub mod sink;
+pub use pager::S3Pager;
 pub use sink::S3Sink;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -85,6 +87,51 @@ impl S3Client {
         let range = format!("bytes={start}-{end}");
         // Range is not an x-amz-* header, so it need not be signed — sent, but not part of SigV4.
         self.send("GET", key, "", "", &[], &[("Range", range)])
+    }
+
+    /// The size of the object at `key`, without downloading it — a `HEAD`, so the pager knows the
+    /// database length for `xFileSize` before faulting any page.
+    pub fn head(&self, key: &str) -> Result<u64> {
+        let (amzdate, datestamp) = amz_timestamp(now_unix());
+        let host = host_of(&self.cfg.endpoint).to_string();
+        let payload_hash = sha256_hex(&[]);
+        let canonical_uri = canonical_path(&self.cfg.bucket, key);
+        let mut signed: BTreeMap<String, String> = BTreeMap::new();
+        signed.insert("host".into(), host);
+        signed.insert("x-amz-content-sha256".into(), payload_hash.clone());
+        signed.insert("x-amz-date".into(), amzdate.clone());
+        let authorization = sign_v4(
+            &self.cfg.access_key,
+            &self.cfg.secret_key,
+            &self.cfg.region,
+            "s3",
+            "HEAD",
+            &canonical_uri,
+            "",
+            &signed,
+            &payload_hash,
+            &amzdate,
+            &datestamp,
+        );
+        let url = format!("{}{canonical_uri}", self.cfg.endpoint.trim_end_matches('/'));
+        let resp = self
+            .agent
+            .request("HEAD", &url)
+            .set("Authorization", &authorization)
+            .set("x-amz-content-sha256", &payload_hash)
+            .set("x-amz-date", &amzdate)
+            .call();
+        match resp {
+            Ok(r) => r
+                .header("Content-Length")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| S3Error::Transport("HEAD response had no Content-Length".into())),
+            Err(ureq::Error::Status(code, r)) => Err(S3Error::Status {
+                code,
+                body: r.into_string().unwrap_or_default(),
+            }),
+            Err(e) => Err(S3Error::Transport(e.to_string())),
+        }
     }
 
     /// Delete the object at `key`.

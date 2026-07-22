@@ -292,3 +292,91 @@ fn a_persistently_failing_sink_reports_unhealthy() {
         "a sink that cannot reach S3 must report unhealthy"
     );
 }
+
+// --- slice 3: the S3 pager (chunked range reads + LRU cache) ---
+
+use meshdb::s3::S3Pager;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A mock serving one fixed object: HEAD returns its size, GET (Range) returns the slice, and
+/// every GET is counted so a test can prove the cache avoids re-fetching.
+fn spawn_object_mock(data: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let gets_ret = Arc::clone(&gets);
+    let data = Arc::new(data);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let (method, _path, headers, _body) = read_request(&mut s);
+            match method.as_str() {
+                "HEAD" => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.flush();
+                }
+                "GET" => {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    match headers.get("range").and_then(|r| parse_range(r)) {
+                        Some((a, b)) => {
+                            let b = b.min(data.len() - 1);
+                            respond(&mut s, "206 Partial Content", &data[a..=b]);
+                        }
+                        None => respond(&mut s, "200 OK", &data),
+                    }
+                }
+                _ => respond(&mut s, "400 Bad Request", &[]),
+            }
+        }
+    });
+    (format!("http://{addr}"), gets_ret)
+}
+
+#[test]
+fn the_pager_reads_ranges_and_caches_chunks() {
+    // A 200 KiB object of predictable bytes.
+    let data: Vec<u8> = (0..200 * 1024)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
+    let (endpoint, gets) = spawn_object_mock(data.clone());
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint,
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    // 64 KiB chunks, cache room for 4.
+    let pager =
+        S3Pager::with_limits(Arc::clone(&client), "snap", 64 * 1024, 4 * 64 * 1024).unwrap();
+    assert_eq!(pager.size(), data.len() as u64);
+
+    // A 4 KiB read spanning the chunk-0/chunk-1 boundary.
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(pager.read_at(65536 - 100, &mut buf).unwrap(), 4096);
+    assert_eq!(&buf[..], &data[65536 - 100..65536 - 100 + 4096]);
+
+    // A re-read fully inside chunk 0 must not hit S3 again.
+    let before = gets.load(Ordering::SeqCst);
+    let mut b2 = vec![0u8; 100];
+    pager.read_at(65436, &mut b2).unwrap();
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        before,
+        "a cached read must not fetch from S3"
+    );
+    assert_eq!(&b2[..], &data[65436..65536]);
+
+    // The tail returns exactly the remaining bytes; past EOF returns nothing.
+    let mut tail = vec![0u8; 4096];
+    assert_eq!(
+        pager.read_at(data.len() as u64 - 10, &mut tail).unwrap(),
+        10
+    );
+    assert_eq!(&tail[..10], &data[data.len() - 10..]);
+    assert_eq!(pager.read_at(data.len() as u64, &mut tail).unwrap(), 0);
+}
