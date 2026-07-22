@@ -679,3 +679,188 @@ fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
         "b-write"
     );
 }
+
+/// The SQLite page size, from the database header (offset 16, big-endian; a stored 1 means 65536).
+fn page_size_of(db: &[u8]) -> usize {
+    let raw = u16::from_be_bytes([db[16], db[17]]) as usize;
+    if raw == 1 { 65536 } else { raw }
+}
+
+/// The page-level diff `base → after`, as the capture VFS would emit it: every page that changed or
+/// was newly added, plus the resulting database size. Overlaying these on `base` reproduces `after`.
+fn change_log_txn(base: &[u8], after: &[u8], lsn: u64) -> meshdb::replication::StreamTxn {
+    let ps = page_size_of(after);
+    let after_pages = after.len() / ps;
+    let base_pages = base.len() / ps;
+    let mut frames = Vec::new();
+    for p in 0..after_pages {
+        let a = &after[p * ps..(p + 1) * ps];
+        let changed = p >= base_pages || a != &base[p * ps..(p + 1) * ps];
+        if changed {
+            frames.push(meshdb::vfs::Frame {
+                page_no: (p + 1) as u32,
+                data: a.to_vec(),
+            });
+        }
+    }
+    meshdb::replication::StreamTxn {
+        lsn,
+        txn: meshdb::vfs::CommittedTxn {
+            db_size_pages: after_pages as u32,
+            page_size: ps as u32,
+            frames,
+            generation: 0,
+        },
+    }
+}
+
+#[test]
+fn a_failover_replays_the_change_log_since_the_snapshot() {
+    // Node A's snapshot of shard 3: rows 0..200. This is the base a failover would otherwise be
+    // pinned to — everything after it is only in the change-log.
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("base.db");
+    let build = |path: &std::path::Path| {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        c
+    };
+    {
+        let c = build(&snap);
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;")
+            .unwrap();
+        for i in 0..200i64 {
+            c.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("a-{i}")],
+            )
+            .unwrap();
+        }
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let base_bytes = std::fs::read(&snap).unwrap();
+
+    // After the snapshot, node A commits two more transactions: ten new rows, then an update. We
+    // materialise each committed state and diff it to reproduce the frames the capture VFS teed.
+    let after1 = dir.path().join("after1.db");
+    std::fs::copy(&snap, &after1).unwrap();
+    {
+        let c = build(&after1);
+        for i in 200..210i64 {
+            c.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("new-{i}")],
+            )
+            .unwrap();
+        }
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let after1_bytes = std::fs::read(&after1).unwrap();
+
+    let after2 = dir.path().join("after2.db");
+    std::fs::copy(&after1, &after2).unwrap();
+    {
+        let c = build(&after2);
+        c.execute("UPDATE t SET v = 'changed' WHERE id = 11", [])
+            .unwrap();
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let after2_bytes = std::fs::read(&after2).unwrap();
+
+    // Snapshot at lsn 200; two change-log transactions at lsn 201 and 202.
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint: spawn_full_s3(),
+        bucket: "meshdb".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    let sink = S3Sink::new(Arc::clone(&client), "arch");
+    sink.put_snapshot(ShardId(3), 7, 200, &base_bytes).unwrap();
+    let t1 = change_log_txn(&base_bytes, &after1_bytes, 201);
+    let t2 = change_log_txn(&after1_bytes, &after2_bytes, 202);
+    // Two separate WAL objects, exactly as the sink would upload two batches.
+    let enc = meshdb::s3::sink::encode_change_log;
+    client
+        .put(
+            "arch/shard_3/wal/00000000000000000007_00000000000000000201",
+            &enc(&[t1]).unwrap(),
+        )
+        .unwrap();
+    client
+        .put(
+            "arch/shard_3/wal/00000000000000000007_00000000000000000202",
+            &enc(&[t2]).unwrap(),
+        )
+        .unwrap();
+
+    // Node B takes over shard 3. Without replay it would see 200 rows as of the snapshot; with
+    // replay it is current — 210 rows, and id 11 carries the post-snapshot update.
+    let scratch = tempfile::tempdir().unwrap();
+    let conn =
+        meshdb::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        210,
+        "the change-log transactions after the snapshot were not replayed"
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 205", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "new-205"
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 11", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "changed"
+    );
+
+    // And it still takes new writes locally over the replayed base.
+    conn.execute("INSERT INTO t VALUES (9999, 'b-write')", [])
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        211
+    );
+}
+
+#[test]
+fn a_failover_refuses_a_change_log_with_a_gap() {
+    // Snapshot at lsn 5, then a WAL object that starts at lsn 8 — lsn 6 and 7 are missing. Serving
+    // this would silently drop two transactions, so the overlay build must refuse.
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint: spawn_full_s3(),
+        bucket: "meshdb".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    let txn = meshdb::replication::StreamTxn {
+        lsn: 8,
+        txn: meshdb::vfs::CommittedTxn {
+            db_size_pages: 1,
+            page_size: 4096,
+            frames: vec![meshdb::vfs::Frame {
+                page_no: 1,
+                data: vec![0u8; 4096],
+            }],
+            generation: 0,
+        },
+    };
+    client
+        .put(
+            "arch/shard_1/wal/00000000000000000004_00000000000000000008",
+            &meshdb::s3::sink::encode_change_log(&[txn]).unwrap(),
+        )
+        .unwrap();
+
+    let err = meshdb::s3::failover::build_overlay(&client, "arch", ShardId(1), 4, 5).unwrap_err();
+    assert!(
+        err.to_string().contains("gap"),
+        "expected a gap refusal, got: {err}"
+    );
+}

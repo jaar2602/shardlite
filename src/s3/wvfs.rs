@@ -61,8 +61,19 @@ pub fn open_readwrite(
     key: &str,
     scratch_dir: &Path,
 ) -> crate::Result<rusqlite::Connection> {
+    open_readwrite_with_overlay(client, key, scratch_dir, None)
+}
+
+/// Like [`open_readwrite`], but replays a change-log [`PageOverlay`] over the S3 base so the shard
+/// is current as of the last committed transaction (see [`super::failover::open_from_s3`]).
+pub fn open_readwrite_with_overlay(
+    client: Arc<S3Client>,
+    key: &str,
+    scratch_dir: &Path,
+    overlay: Option<super::PageOverlay>,
+) -> crate::Result<rusqlite::Connection> {
     register()?;
-    let pager = Arc::new(S3Pager::open(client, key).map_err(to_err)?);
+    let pager = Arc::new(S3Pager::open_with_overlay(client, key, overlay).map_err(to_err)?);
 
     // A real, absolute local path so the base VFS can put the `-wal` next to it. Unique per open.
     let db_path = scratch_dir.join(format!(

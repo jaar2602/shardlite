@@ -16,13 +16,26 @@ pub const DEFAULT_CHUNK: u64 = 64 * 1024;
 /// Default cache ceiling: 16 MiB of chunks per open database.
 pub const DEFAULT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// A read-only, page-cached view of one S3 object.
+/// Pages written after the snapshot the pager is opened on, replayed from the archived change-log so
+/// a failed-over shard is current as of the last committed transaction, not just the last snapshot.
+/// The pages override the S3 base on read; `db_size` is the database size (bytes) after the last
+/// replayed transaction, which may extend past the snapshot (a growing shard) or shrink it.
+#[derive(Clone, Debug)]
+pub struct PageOverlay {
+    /// 1-based page number → the page's bytes.
+    pub pages: HashMap<u32, Vec<u8>>,
+    pub page_size: u32,
+    pub db_size: u64,
+}
+
+/// A read-only, page-cached view of one S3 object, optionally with a change-log [`PageOverlay`].
 pub struct S3Pager {
     client: Arc<S3Client>,
     key: String,
     size: u64,
     chunk: u64,
     cache: Mutex<Cache>,
+    overlay: Option<PageOverlay>,
 }
 
 struct Cache {
@@ -67,6 +80,18 @@ impl S3Pager {
         Self::with_limits(client, key, DEFAULT_CHUNK, DEFAULT_CACHE_BYTES)
     }
 
+    /// Open a pager for `key` with a change-log [`PageOverlay`] laid over the S3 base (see
+    /// [`PageOverlay`]). Pass `None` for a plain read-only view identical to [`Self::open`].
+    pub fn open_with_overlay(
+        client: Arc<S3Client>,
+        key: impl Into<String>,
+        overlay: Option<PageOverlay>,
+    ) -> Result<Self> {
+        let mut p = Self::with_limits(client, key, DEFAULT_CHUNK, DEFAULT_CACHE_BYTES)?;
+        p.overlay = overlay;
+        Ok(p)
+    }
+
     pub fn with_limits(
         client: Arc<S3Client>,
         key: impl Into<String>,
@@ -86,48 +111,80 @@ impl S3Pager {
                 lru: VecDeque::new(),
                 max_chunks,
             }),
+            overlay: None,
         })
     }
 
+    /// The database size SQLite sees: the overlay's post-replay size when present, else the S3 base.
     pub fn size(&self) -> u64 {
-        self.size
+        match &self.overlay {
+            Some(o) => o.db_size,
+            None => self.size,
+        }
     }
 
     /// Fill `buf` from the object starting at `offset`. Returns the number of bytes read, which is
     /// short only at end-of-object (SQLite treats a short read past EOF as zero-fill).
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        if offset >= self.size || buf.is_empty() {
+        let eff = self.size();
+        if offset >= eff || buf.is_empty() {
             return Ok(0);
         }
-        let end = (offset + buf.len() as u64).min(self.size);
+        let end = (offset + buf.len() as u64).min(eff);
         let want = (end - offset) as usize;
-        let mut done = 0usize;
-        let mut pos = offset;
 
-        while (pos as usize) < offset as usize + want {
-            let c = pos / self.chunk;
-            let chunk_start = c * self.chunk;
-            let chunk_end = (chunk_start + self.chunk).min(self.size);
-            let in_chunk = (pos - chunk_start) as usize;
-            let copy_len = ((chunk_end - pos) as usize).min(want - done);
+        // Base: bytes that still live in the S3 object. Anything past its size (a shard that grew
+        // after the snapshot) starts as zero and is filled entirely from the overlay below.
+        buf[..want].fill(0);
+        if offset < self.size {
+            let base_end = end.min(self.size);
+            let mut pos = offset;
+            while pos < base_end {
+                let c = pos / self.chunk;
+                let chunk_start = c * self.chunk;
+                let chunk_end = (chunk_start + self.chunk).min(self.size);
+                let in_chunk = (pos - chunk_start) as usize;
+                let copy_len = ((chunk_end - pos) as usize).min((base_end - pos) as usize);
+                let done = (pos - offset) as usize;
 
-            // Cache hit → copy straight out.
-            let cached = self.cache.lock().unwrap().get(c);
-            let bytes = match cached {
-                Some(b) => b,
-                None => {
-                    // Miss → fetch the whole chunk (outside the lock), then cache it.
-                    let fetched =
-                        self.client
-                            .get_range(&self.key, chunk_start, chunk_end - chunk_start)?;
-                    self.cache.lock().unwrap().put(c, fetched.clone());
-                    fetched
-                }
-            };
-            buf[done..done + copy_len].copy_from_slice(&bytes[in_chunk..in_chunk + copy_len]);
-            done += copy_len;
-            pos += copy_len as u64;
+                // Cache hit → copy straight out.
+                let cached = self.cache.lock().unwrap().get(c);
+                let bytes = match cached {
+                    Some(b) => b,
+                    None => {
+                        // Miss → fetch the whole chunk (outside the lock), then cache it.
+                        let fetched = self.client.get_range(
+                            &self.key,
+                            chunk_start,
+                            chunk_end - chunk_start,
+                        )?;
+                        self.cache.lock().unwrap().put(c, fetched.clone());
+                        fetched
+                    }
+                };
+                buf[done..done + copy_len].copy_from_slice(&bytes[in_chunk..in_chunk + copy_len]);
+                pos += copy_len as u64;
+            }
         }
-        Ok(done)
+
+        // Overlay: replayed pages win over the base for any page they intersect this read.
+        if let Some(o) = &self.overlay {
+            let ps = o.page_size as u64;
+            let first = offset / ps;
+            let last = (end - 1) / ps;
+            for pg in first..=last {
+                let Some(page) = o.pages.get(&((pg as u32) + 1)) else {
+                    continue;
+                };
+                let pstart = pg * ps;
+                let cs = offset.max(pstart);
+                let ce = end.min(pstart + ps);
+                let dst = (cs - offset) as usize;
+                let src = (cs - pstart) as usize;
+                buf[dst..dst + (ce - cs) as usize]
+                    .copy_from_slice(&page[src..src + (ce - cs) as usize]);
+            }
+        }
+        Ok(want)
     }
 }

@@ -23,7 +23,7 @@ pub mod sink;
 pub mod vfs;
 pub mod wvfs;
 pub use failover::open_from_s3;
-pub use pager::S3Pager;
+pub use pager::{PageOverlay, S3Pager};
 pub use sink::S3Sink;
 pub use vfs::open_readonly;
 pub use wvfs::open_readwrite;
