@@ -21,6 +21,8 @@ export interface WorkbenchDriver<ReadResult, ChangeResult, SchemaResult> {
   queryAll: (sql: string) => Promise<ReadResult>;
   query: (sql: string, shard: number, params: unknown[]) => Promise<ReadResult>;
   execute: (sql: string, shard: number, params: unknown[]) => Promise<ChangeResult>;
+  /** Auto-routed write: the server picks the shard from the SQL, so no data key is needed. */
+  run: (sql: string) => Promise<ChangeResult>;
   transaction: (statements: { sql: string; params: unknown[] }[], shard: number) => Promise<ChangeResult>;
   preflight: (sql: string) => Promise<SchemaResult>;
 }
@@ -204,6 +206,12 @@ export async function dispatchExecutionPlan<ReadResult, ChangeResult, SchemaResu
     return { kind: "reads", values };
   }
   if (plan.kind === "write") {
+    // With no bound parameters, let the server auto-route from the SQL text (POST /v1/run) — the
+    // user need not supply a data key. With parameters (which the router cannot read), fall back
+    // to an explicit route + execute against a resolved shard.
+    if (params[0].length === 0) {
+      return { kind: "write", value: await driver.run(plan.statements[0].sql) };
+    }
     const shard = await driver.route();
     return { kind: "write", value: await driver.execute(plan.statements[0].sql, shard, params[0]) };
   }

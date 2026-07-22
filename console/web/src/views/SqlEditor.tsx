@@ -195,6 +195,7 @@ export default function SqlEditor({ name }: { name: string }) {
             signal: controller.signal,
           }),
           execute: (statement, selected, values) => c.execute(statement, selected, values),
+          run: (statement) => c.run(statement),
           transaction: (items, selected) => c.tx(items, selected),
           preflight: (statement) => api.operations.preflight(name, statement),
         },

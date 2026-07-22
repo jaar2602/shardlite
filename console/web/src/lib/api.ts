@@ -449,6 +449,9 @@ export function conn(name: string) {
     ) =>
       streamQuery(b, sql, opts),
     queryAll: (sql: string, signal?: AbortSignal) => req<MaterializedQueryResult>("POST", `${b}/query_all`, { sql }, signal),
+    // Auto-routed: the server picks the shard(s) from the SQL, so no data key is needed. Used for
+    // param-less writes; a write returns the affected count.
+    run: (sql: string) => req<{ rows_affected: number; last_insert_rowid: number }>("POST", `${b}/run`, { sql }),
   };
 }
 

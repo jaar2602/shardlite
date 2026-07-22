@@ -50,6 +50,7 @@ test("dispatches plans through the matching client endpoints", async () => {
     queryAll: async (sql: string) => { calls.push(`query_all:${sql}`); return sql; },
     query: async (sql: string, shard: number) => { calls.push(`query:${shard}:${sql}`); return sql; },
     execute: async (sql: string, shard: number) => { calls.push(`execute:${shard}:${sql}`); return { rows: 1 }; },
+    run: async (sql: string) => { calls.push(`run:${sql}`); return { rows: 1 }; },
     transaction: async (statements: { sql: string }[], shard: number) => { calls.push(`tx:${shard}:${statements.length}`); return { rows: statements.length }; },
     preflight: async (sql: string) => { calls.push(`preflight:${sql}`); return { checked: true }; },
   };
@@ -61,8 +62,14 @@ test("dispatches plans through the matching client endpoints", async () => {
   await dispatchExecutionPlan(plan, [[], []], true, driver);
   assert.deepEqual(calls.splice(0), ["route", "query:7:SELECT 1;", "query:7:SELECT 2;"]);
 
+  // A param-less write auto-routes through the server (POST /v1/run) — no data key needed.
   plan = buildExecutionPlan(splitStatements("UPDATE t SET v = 1;"));
   await dispatchExecutionPlan(plan, [[]], false, driver);
+  assert.deepEqual(calls.splice(0), ["run:UPDATE t SET v = 1;"]);
+
+  // A write WITH bound parameters cannot be auto-routed (the router reads only SQL text), so it
+  // falls back to an explicit route + execute.
+  await dispatchExecutionPlan(plan, [[42]], false, driver);
   assert.deepEqual(calls.splice(0), ["route", "execute:7:UPDATE t SET v = 1;"]);
 
   plan = buildExecutionPlan(splitStatements("INSERT INTO t VALUES (1); UPDATE t SET v = 2;"));
