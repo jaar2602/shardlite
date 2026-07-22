@@ -438,10 +438,14 @@ dependencies = [
  "chacha20poly1305",
  "include_dir",
  "rand",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tiny_http",
  "ureq",
+ "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -39,19 +39,31 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
 /// Authenticated encryption for stored secrets, keyed by the console master passphrase.
 pub struct Sealer {
     cipher: ChaCha20Poly1305,
+    legacy_cipher: ChaCha20Poly1305,
 }
 
 impl Sealer {
-    /// Derive the encryption key from the operator's master passphrase. `derive_key` is a
-    /// keyed BLAKE3 with a fixed context string, so the same passphrase always yields the same
-    /// key and a different context could never collide with another use of the passphrase.
+    /// Derive the encryption key from the operator's master passphrase with Argon2id. The legacy
+    /// BLAKE3-derived key remains available only to read v1 ciphertext; every new seal is v2.
     pub fn from_passphrase(passphrase: &str) -> Self {
-        let key_bytes = blake3::derive_key(
+        let mut key_bytes = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(
+                passphrase.as_bytes(),
+                b"meshdb-console-v2-registry",
+                &mut key_bytes,
+            )
+            .expect("fixed Argon2id key derivation parameters are valid");
+        let legacy_bytes = blake3::derive_key(
             "meshdb-console 2026 registry secret encryption key",
             passphrase.as_bytes(),
         );
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        Self { cipher }
+        let legacy_cipher = ChaCha20Poly1305::new(Key::from_slice(&legacy_bytes));
+        Self {
+            cipher,
+            legacy_cipher,
+        }
     }
 
     /// Encrypt `plaintext`, returning base64 of `nonce (12 bytes) || ciphertext+tag`. A fresh
@@ -65,21 +77,23 @@ impl Sealer {
             .expect("ChaCha20-Poly1305 encryption cannot fail");
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ciphertext);
-        B64.encode(blob)
+        format!("v2:{}", B64.encode(blob))
     }
 
     /// Reverse [`seal`]. Returns `None` on a bad key, tampering, or a malformed blob — the
     /// authentication tag makes "wrong passphrase" and "corrupted file" indistinguishable from
     /// "not a valid secret", which is exactly right: all three must fail closed.
     pub fn open(&self, sealed: &str) -> Option<Vec<u8>> {
-        let blob = B64.decode(sealed).ok()?;
+        let (cipher, encoded) = match sealed.strip_prefix("v2:") {
+            Some(encoded) => (&self.cipher, encoded),
+            None => (&self.legacy_cipher, sealed),
+        };
+        let blob = B64.decode(encoded).ok()?;
         if blob.len() < 12 {
             return None;
         }
         let (nonce, ciphertext) = blob.split_at(12);
-        self.cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .ok()
+        cipher.decrypt(Nonce::from_slice(nonce), ciphertext).ok()
     }
 }
 
@@ -115,5 +129,27 @@ mod tests {
     fn the_same_secret_seals_to_different_blobs() {
         let sealer = Sealer::from_passphrase("k");
         assert_ne!(sealer.seal(b"x"), sealer.seal(b"x"));
+    }
+
+    #[test]
+    fn v1_ciphertext_remains_readable_during_migration() {
+        let passphrase = "master-key";
+        let key = blake3::derive_key(
+            "meshdb-console 2026 registry secret encryption key",
+            passphrase.as_bytes(),
+        );
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = [7u8; 12];
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), b"old-secret".as_ref())
+            .unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend(ciphertext);
+        let legacy = B64.encode(blob);
+
+        assert_eq!(
+            Sealer::from_passphrase(passphrase).open(&legacy).as_deref(),
+            Some(&b"old-secret"[..])
+        );
     }
 }

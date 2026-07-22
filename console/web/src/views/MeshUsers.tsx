@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../lib/api";
-import { Banner, Button, Card, DataTable, Select, Spinner, Tag, TextInput } from "../components/ui";
+import { Banner, Button, Card, DataTable, Page, PageHeader, Select, Spinner, Tag, TextInput } from "../components/ui";
 
 // meshdb's own users on the cluster (Read/Write/Admin/Cluster), managed through the connection's
 // stored credential — which must itself be an Admin for these calls to succeed. A 403 here means
@@ -53,11 +53,12 @@ export default function MeshUsers({ name }: { name: string }) {
     role === "admin" ? "red" : role === "write" ? "blue" : role === "cluster" ? "yellow" : "gray";
 
   return (
-    <div className="p-6 space-y-6 max-w-3xl">
+    <Page>
+      <PageHeader eyebrow="Database / access control" title="MeshDB users" description="Manage identities stored by this database. The connection credential must have MeshDB admin access." />
       {error && <Banner tone="error">{error}</Banner>}
 
       <Card title="Create meshdb user">
-        <form onSubmit={add} className="grid grid-cols-3 gap-4 items-end">
+        <form onSubmit={add} className="grid grid-cols-1 items-end gap-4 md:grid-cols-3">
           <TextInput label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
           <TextInput
             label="Secret"
@@ -71,7 +72,7 @@ export default function MeshUsers({ name }: { name: string }) {
             <option value="write">write</option>
             <option value="admin">admin</option>
           </Select>
-          <div className="col-span-3">
+          <div className="md:col-span-3">
             <Button type="submit">Create user</Button>
           </div>
         </form>
@@ -92,6 +93,6 @@ export default function MeshUsers({ name }: { name: string }) {
           ])}
         />
       )}
-    </div>
+    </Page>
   );
 }

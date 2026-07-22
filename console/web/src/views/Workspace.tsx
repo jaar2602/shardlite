@@ -1,52 +1,38 @@
-import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
-import SqlEditor from "./SqlEditor";
-import Schema from "./Schema";
+import { Navigate, Route, Routes } from "react-router-dom";
+import { lazy, Suspense } from "react";
+import { useAuth } from "../auth";
+import { Spinner } from "../components/ui";
+import * as api from "../lib/api";
 import Cluster from "./Cluster";
-import Shards from "./Shards";
 import Stats from "./Stats";
 import MeshUsers from "./MeshUsers";
+import Overview from "./Overview";
+import ShardInventory from "./ShardInventory";
 
-const TABS = [
-  ["query", "SQL editor"],
-  ["schema", "Schema"],
-  ["cluster", "Cluster"],
-  ["shards", "Shards & frames"],
-  ["stats", "Stats"],
-  ["users", "meshdb users"],
-] as const;
+const SqlEditor = lazy(() => import("./SqlEditor"));
+const Schema = lazy(() => import("./Schema"));
+const Operations = lazy(() => import("./Operations"));
 
 export default function Workspace({ name }: { name: string }) {
-  const nav = useNavigate();
-  const tab = "px-4 py-3 text-sm text-carbon-text-2 hover:text-carbon-text border-b-2 border-transparent";
-  const active = "text-carbon-text border-carbon-blue";
-
+  const { me } = useAuth();
   return (
-    <div className="h-full flex flex-col">
-      <div className="border-b border-carbon-border bg-carbon-layer">
-        <div className="px-6 pt-4 flex items-center gap-2">
-          <button className="text-carbon-text-3 hover:text-carbon-text text-sm" onClick={() => nav("/")}>
-            ← Connections
-          </button>
-          <span className="text-carbon-text font-semibold">{name}</span>
-        </div>
-        <div className="px-4 flex">
-          {TABS.map(([path, label]) => (
-            <NavLink key={path} to={path} className={({ isActive }) => `${tab} ${isActive ? active : ""}`}>
-              {label}
-            </NavLink>
-          ))}
-        </div>
-      </div>
-      <div className="flex-1 overflow-auto">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1 overflow-auto">
+        <Suspense fallback={<div className="p-6"><Spinner label="Loading workspace…" /></div>}>
         <Routes>
+          <Route path="overview" element={<Overview name={name} />} />
+          <Route path="shard-inventory" element={<Navigate replace to={`/c/${encodeURIComponent(name)}/${api.permits(me?.role, "operate") ? "storage-internals" : "overview"}`} />} />
           <Route path="query" element={<SqlEditor name={name} />} />
           <Route path="schema" element={<Schema name={name} />} />
+          {api.permits(me?.role, "write") && <Route path="operations" element={<Operations name={name} />} />}
           <Route path="cluster" element={<Cluster name={name} />} />
-          <Route path="shards" element={<Shards name={name} />} />
+          {api.permits(me?.role, "operate") && <Route path="storage-internals" element={<ShardInventory name={name} />} />}
+          <Route path="frames" element={<Navigate replace to={`/c/${encodeURIComponent(name)}/${api.permits(me?.role, "operate") ? "storage-internals" : "overview"}`} />} />
           <Route path="stats" element={<Stats name={name} />} />
-          <Route path="users" element={<MeshUsers name={name} />} />
-          <Route path="*" element={<SqlEditor name={name} />} />
+          {api.permits(me?.role, "admin") && <Route path="users" element={<MeshUsers name={name} />} />}
+          <Route path="*" element={<Overview name={name} />} />
         </Routes>
+        </Suspense>
       </div>
     </div>
   );

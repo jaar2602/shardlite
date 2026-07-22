@@ -1,10 +1,9 @@
 //! The console's own user store — its identity layer, entirely separate from the meshdb
 //! credentials it stores per connection (this is scoping decision 1: multi-user from the start).
 //!
-//! Two roles. `Admin` manages console users and connection profiles; `User` may use connections
-//! and read observability but cannot change the console's configuration. Do not confuse this
-//! ladder with meshdb's `Read/Write/Admin`, which still governs what each *stored* meshdb
-//! credential can do on a cluster.
+//! Four roles. Console policy is checked before any request reaches a stored meshdb credential;
+//! meshdb then applies its own role as a second, independent boundary. Old persisted `user`
+//! records deserialize as `Developer` for compatibility with the v1 console.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,8 +16,37 @@ use crate::crypto::{hash_password, verify_password};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    Viewer,
+    #[serde(alias = "user")]
+    Developer,
+    Operator,
     Admin,
-    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Observe,
+    Query,
+    Write,
+    Operate,
+    ManageConnections,
+    ManageConsoleUsers,
+    ManageMeshUsers,
+    ReadAudit,
+}
+
+impl Role {
+    pub fn permits(self, permission: Permission) -> bool {
+        use Permission as P;
+        use Role as R;
+        matches!(
+            (self, permission),
+            (R::Admin, _)
+                | (R::Viewer, P::Observe | P::Query)
+                | (R::Developer, P::Observe | P::Query | P::Write)
+                | (R::Operator, P::Observe | P::Query | P::Operate)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +118,7 @@ impl Users {
     fn persist(&self, map: &HashMap<String, Record>) -> Result<(), UserError> {
         let mut records: Vec<&Record> = map.values().collect();
         records.sort_by(|a, b| a.name.cmp(&b.name));
-        let json =
-            serde_json::to_vec_pretty(&records).map_err(|e| UserError::Io(e.to_string()))?;
+        let json = serde_json::to_vec_pretty(&records).map_err(|e| UserError::Io(e.to_string()))?;
         crate::store::write_atomic(&self.path, &json).map_err(UserError::Io)
     }
 
@@ -175,10 +202,10 @@ mod tests {
         let path = tmp();
         {
             let users = Users::open(&path, Some(("admin", "pw"))).unwrap();
-            users.create("bob", "s3cret", Role::User).unwrap();
+            users.create("bob", "s3cret", Role::Developer).unwrap();
         }
         let reopened = Users::open(&path, None).unwrap();
-        assert_eq!(reopened.verify("bob", "s3cret"), Some(Role::User));
+        assert_eq!(reopened.verify("bob", "s3cret"), Some(Role::Developer));
         std::fs::remove_file(&path).ok();
     }
 
@@ -190,5 +217,23 @@ mod tests {
         users.create("admin2", "pw", Role::Admin).unwrap();
         assert!(users.delete("admin").is_ok()); // now safe, another admin remains
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn roles_enforce_the_console_permission_ladder() {
+        assert!(Role::Viewer.permits(Permission::Observe));
+        assert!(Role::Viewer.permits(Permission::Query));
+        assert!(!Role::Viewer.permits(Permission::Write));
+        assert!(Role::Developer.permits(Permission::Write));
+        assert!(!Role::Developer.permits(Permission::Operate));
+        assert!(Role::Operator.permits(Permission::Operate));
+        assert!(!Role::Operator.permits(Permission::ManageConnections));
+        assert!(Role::Admin.permits(Permission::ManageMeshUsers));
+    }
+
+    #[test]
+    fn the_legacy_user_role_loads_as_developer() {
+        let role: Role = serde_json::from_str("\"user\"").unwrap();
+        assert_eq!(role, Role::Developer);
     }
 }

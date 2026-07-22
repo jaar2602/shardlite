@@ -6,9 +6,12 @@
 
 mod api;
 mod assets;
+mod audit;
 mod auth;
 mod crypto;
+mod database;
 mod metrics;
+mod operations;
 mod proxy;
 mod registry;
 mod respond;
@@ -17,10 +20,12 @@ mod users;
 
 use std::sync::Arc;
 
-use api::AppState;
-use auth::Sessions;
+use api::{AppState, StreamSlots};
+use audit::Audit;
+use auth::{LoginLimiter, Sessions};
 use crypto::Sealer;
 use metrics::Metrics;
+use operations::Operations;
 use registry::Registry;
 use users::Users;
 
@@ -37,7 +42,12 @@ fn run() -> Result<(), String> {
     let data = flag(&args, "--data").unwrap_or_else(|| "console-data".into());
     let workers: usize = flag(&args, "--workers")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or(8)
+        .max(2);
+    let query_streams: usize = flag(&args, "--query-streams")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(workers / 2)
+        .clamp(1, workers - 1);
 
     // The master passphrase is required, and required at startup — a console that could not
     // decrypt its stored secrets must fail loudly now, not when someone first opens a connection.
@@ -51,8 +61,11 @@ fn run() -> Result<(), String> {
     }
 
     let data_dir = std::path::PathBuf::from(&data);
+    secure_data_dir(&data_dir)?;
     let users_path = data_dir.join("users.json");
     let conns_path = data_dir.join("connections.json");
+    let audit_path = data_dir.join("audit.jsonl");
+    let operations_path = data_dir.join("operations.json");
 
     // Bootstrap a first admin from the environment when the store has none — otherwise there
     // would be no way to log in and create one.
@@ -66,19 +79,46 @@ fn run() -> Result<(), String> {
     let bootstrap_ref = bootstrap.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
 
     let users = Users::open(&users_path, bootstrap_ref).map_err(|e| e.to_string())?;
-    let registry = Arc::new(
-        Registry::open(&conns_path, Sealer::from_passphrase(&key)).map_err(|e| e.to_string())?,
+    let mut registry =
+        Registry::open(&conns_path, Sealer::from_passphrase(&key)).map_err(|e| e.to_string())?;
+    if args.iter().any(|arg| arg == "--rotate-key") {
+        let new_key = std::env::var("MESHDB_CONSOLE_NEW_KEY")
+            .map_err(|_| "MESHDB_CONSOLE_NEW_KEY is required with --rotate-key".to_string())?;
+        if new_key.is_empty() || new_key == key {
+            return Err("MESHDB_CONSOLE_NEW_KEY must be non-empty and different".into());
+        }
+        registry
+            .rotate_key(Sealer::from_passphrase(&new_key))
+            .map_err(|e| format!("rotating connection secrets: {e}"))?;
+        eprintln!("meshdb-console rotated all saved connection secrets; restart with the new key");
+        return Ok(());
+    }
+    let registry = Arc::new(registry);
+    let metrics = Arc::new(Metrics::open(&data_dir.join("observability.json"))?);
+    let sessions = Sessions::with_ttl(
+        std::time::Duration::from_secs(env_u64("MESHDB_CONSOLE_SESSION_IDLE_SECS", 30 * 60)),
+        std::time::Duration::from_secs(env_u64(
+            "MESHDB_CONSOLE_SESSION_ABSOLUTE_SECS",
+            12 * 60 * 60,
+        )),
     );
-    let metrics = Arc::new(Metrics::new());
-    let sessions = Sessions::new();
+    let audit = Audit::open(&audit_path)?;
+    let operations = Operations::open(&operations_path)?;
+    let secure_cookie = env_bool("MESHDB_CONSOLE_SECURE_COOKIE", false);
 
     metrics::spawn(Arc::clone(&registry), Arc::clone(&metrics));
+    operations.spawn(Arc::clone(&registry), audit.clone());
 
     let state = Arc::new(AppState {
         users,
         registry,
         sessions,
         metrics,
+        operations,
+        audit,
+        login_limiter: LoginLimiter::new(),
+        secure_cookie,
+        streams: StreamSlots::new(query_streams),
     });
 
     let server = Arc::new(
@@ -110,6 +150,31 @@ fn run() -> Result<(), String> {
     }
     for h in handles {
         let _ = h.join();
+    }
+    Ok(())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn secure_data_dir(path: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", path.display()))?;
     }
     Ok(())
 }

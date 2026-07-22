@@ -37,5 +37,26 @@ pub fn serve(request: Request, url_path: &str) -> std::io::Result<()> {
     };
 
     let header = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).expect("ctype header");
-    request.respond(Response::from_data(bytes.to_vec()).with_header(header))
+    let csp = Header::from_bytes(
+        &b"Content-Security-Policy"[..],
+        &b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"[..],
+    )
+    .expect("csp header");
+    let mut response = Response::from_data(bytes.to_vec())
+        .with_header(header)
+        .with_header(csp);
+    for (name, value) in [
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "no-referrer"),
+        (
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        ),
+    ] {
+        response.add_header(
+            Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("security header"),
+        );
+    }
+    request.respond(response)
 }

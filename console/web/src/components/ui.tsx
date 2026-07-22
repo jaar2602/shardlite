@@ -4,6 +4,41 @@
 
 import { ReactNode, ButtonHTMLAttributes, InputHTMLAttributes, SelectHTMLAttributes } from "react";
 
+export function Page({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <div className={`w-full space-y-4 p-3 sm:p-4 lg:p-5 ${className}`}>{children}</div>;
+}
+
+export function PageHeader({
+  eyebrow,
+  title,
+  description,
+  status,
+  actions,
+}: {
+  eyebrow?: string;
+  title: ReactNode;
+  description?: ReactNode;
+  status?: ReactNode;
+  actions?: ReactNode;
+}) {
+  return <header className="flex flex-wrap items-end justify-between gap-3 border-b border-carbon-border pb-3">
+    <div className="min-w-0 max-w-3xl">
+      {eyebrow && <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.18em] text-carbon-blue">{eyebrow}</div>}
+      <div className="flex flex-wrap items-center gap-3"><h1 className="text-xl font-semibold leading-tight text-carbon-text sm:text-2xl">{title}</h1>{status}</div>
+      {description && <p className="mt-1.5 max-w-3xl text-sm leading-5 text-carbon-text-3">{description}</p>}
+    </div>
+    {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
+  </header>;
+}
+
+export function EmptyState({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
+  return <div className="border border-dashed border-carbon-border bg-carbon-layer/40 px-5 py-8 text-center">
+    <div className="font-medium text-carbon-text">{title}</div>
+    {description && <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-carbon-text-3">{description}</p>}
+    {action && <div className="mt-5">{action}</div>}
+  </div>;
+}
+
 export function Button({
   variant = "primary",
   className = "",
@@ -20,7 +55,7 @@ export function Button({
   };
   return (
     <button
-      className={`px-4 py-2 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${styles[variant]} ${className}`}
+      className={`min-h-9 px-4 py-2 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-carbon-blue disabled:cursor-not-allowed disabled:opacity-40 ${styles[variant]} ${className}`}
       {...rest}
     >
       {children}
@@ -37,7 +72,7 @@ export function TextInput({
     <label className="block">
       {label && <span className="block text-xs text-carbon-text-3 mb-1">{label}</span>}
       <input
-        className={`w-full bg-carbon-field border-b border-carbon-text-3 focus:border-carbon-blue outline-none px-3 py-2 text-sm text-carbon-text placeholder:text-carbon-text-3 ${className}`}
+        className={`w-full border-b border-carbon-text-3 bg-carbon-field px-3 py-2 text-sm text-carbon-text outline-none placeholder:text-carbon-text-3 focus:border-carbon-blue focus-visible:ring-1 focus-visible:ring-carbon-blue ${className}`}
         {...rest}
       />
     </label>
@@ -54,7 +89,7 @@ export function Select({
     <label className="block">
       {label && <span className="block text-xs text-carbon-text-3 mb-1">{label}</span>}
       <select
-        className={`w-full bg-carbon-field border-b border-carbon-text-3 focus:border-carbon-blue outline-none px-3 py-2 text-sm text-carbon-text ${className}`}
+        className={`w-full border-b border-carbon-text-3 bg-carbon-field px-3 py-2 text-sm text-carbon-text outline-none focus:border-carbon-blue focus-visible:ring-1 focus-visible:ring-carbon-blue ${className}`}
         {...rest}
       >
         {children}
@@ -75,14 +110,14 @@ export function Card({
   className?: string;
 }) {
   return (
-    <div className={`bg-carbon-layer border border-carbon-border ${className}`}>
+    <div className={`border border-carbon-border bg-carbon-layer ${className}`}>
       {(title || actions) && (
-        <div className="flex items-center justify-between px-4 py-3 border-b border-carbon-border">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-carbon-border px-3 py-2.5">
           <h3 className="text-sm font-semibold text-carbon-text">{title}</h3>
           <div className="flex gap-2">{actions}</div>
         </div>
       )}
-      <div className="p-4">{children}</div>
+      <div className="p-3">{children}</div>
     </div>
   );
 }
@@ -126,12 +161,12 @@ export function DataTable({
   empty?: string;
 }) {
   return (
-    <div className="overflow-x-auto border border-carbon-border">
-      <table className="w-full text-sm border-collapse">
+    <div className="overflow-x-auto border border-carbon-border bg-carbon-layer/30">
+      <table className="w-full border-collapse text-sm">
         <thead>
           <tr className="bg-carbon-layer2 text-left">
             {columns.map((c) => (
-              <th key={c} className="px-4 py-2 font-semibold text-carbon-text-2 whitespace-nowrap">
+              <th key={c} className="whitespace-nowrap px-3 py-2 font-mono text-[10px] font-normal uppercase tracking-wider text-carbon-text-2">
                 {c}
               </th>
             ))}
@@ -140,15 +175,15 @@ export function DataTable({
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={columns.length} className="px-4 py-6 text-center text-carbon-text-3">
+              <td colSpan={columns.length} className="px-4 py-10 text-center text-carbon-text-3">
                 {empty}
               </td>
             </tr>
           ) : (
             rows.map((r, i) => (
-              <tr key={i} className="border-t border-carbon-border hover:bg-carbon-layer2/50">
+              <tr key={i} className="border-t border-carbon-border transition-colors hover:bg-carbon-layer2/50">
                 {r.map((cell, j) => (
-                  <td key={j} className="px-4 py-2 font-mono text-xs text-carbon-text whitespace-nowrap">
+                  <td key={j} className="whitespace-nowrap px-3 py-2 font-mono text-xs text-carbon-text">
                     {cell}
                   </td>
                 ))}
@@ -161,12 +196,14 @@ export function DataTable({
   );
 }
 
-export function StatCard({ label, value, tone }: { label: string; value: ReactNode; tone?: "blue" | "green" | "red" }) {
-  const color = tone === "green" ? "text-carbon-green" : tone === "red" ? "text-carbon-red" : "text-carbon-text";
+export function StatCard({ label, value, tone, detail }: { label: string; value: ReactNode; tone?: "blue" | "green" | "red" | "yellow"; detail?: ReactNode }) {
+  const color = tone === "green" ? "text-carbon-green" : tone === "red" ? "text-carbon-red" : tone === "yellow" ? "text-carbon-yellow" : tone === "blue" ? "text-carbon-blue" : "text-carbon-text";
+  const rail = tone === "green" ? "border-l-carbon-green" : tone === "red" ? "border-l-carbon-red" : tone === "yellow" ? "border-l-carbon-yellow" : tone === "blue" ? "border-l-carbon-blue" : "border-l-carbon-text-3";
   return (
-    <div className="bg-carbon-layer border border-carbon-border p-4">
-      <div className="text-carbon-text-3 text-xs mb-1">{label}</div>
-      <div className={`text-2xl font-mono ${color}`}>{value}</div>
+    <div className={`border border-carbon-border border-l-2 bg-carbon-layer p-3 ${rail}`}>
+      <div className="mb-1.5 font-mono text-[10px] uppercase tracking-wider text-carbon-text-3">{label}</div>
+      <div className={`font-mono text-xl leading-none ${color}`}>{value}</div>
+      {detail && <div className="mt-1.5 text-xs text-carbon-text-3">{detail}</div>}
     </div>
   );
 }
@@ -193,7 +230,7 @@ export function Sparkline({ values, width = 180, height = 40 }: { values: number
     })
     .join(" ");
   return (
-    <svg width={width} height={height} className="overflow-visible">
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Metric trend" className="h-10 w-full overflow-visible" preserveAspectRatio="none">
       <polyline points={pts} fill="none" stroke="#0f62fe" strokeWidth="1.5" />
     </svg>
   );

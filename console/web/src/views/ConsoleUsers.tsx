@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../lib/api";
-import { Banner, Button, Card, DataTable, Select, Spinner, Tag, TextInput } from "../components/ui";
+import { Banner, Button, Card, DataTable, Page, PageHeader, Select, Spinner, Tag, TextInput } from "../components/ui";
 
 export default function ConsoleUsers() {
   const [list, setList] = useState<{ name: string; role: api.Role }[] | null>(null);
@@ -8,12 +8,13 @@ export default function ConsoleUsers() {
   const [form, setForm] = useState<{ username: string; password: string; role: api.Role }>({
     username: "",
     password: "",
-    role: "user",
+    role: "viewer",
   });
 
   const load = async () => {
     try {
       setList(await api.consoleUsers.list());
+      setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     }
@@ -27,7 +28,7 @@ export default function ConsoleUsers() {
     setError(null);
     try {
       await api.consoleUsers.create(form.username, form.password, form.role);
-      setForm({ username: "", password: "", role: "user" });
+      setForm({ username: "", password: "", role: "viewer" });
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to add");
@@ -45,18 +46,13 @@ export default function ConsoleUsers() {
   };
 
   return (
-    <div className="p-8 max-w-3xl">
-      <h1 className="text-2xl text-carbon-text mb-2">Console users</h1>
-      <p className="text-carbon-text-3 text-sm mb-6">
-        These are the console's own accounts, separate from the meshdb credentials stored per
-        connection. Admins manage users and connections; users may use connections and read
-        observability.
-      </p>
+    <Page>
+      <PageHeader eyebrow="Console / access control" title="Console users" description="Accounts for this console, separate from credentials stored for each MeshDB connection. Roles limit which observations and actions are available." />
 
       {error && <div className="mb-4"><Banner tone="error">{error}</Banner></div>}
 
       <Card title="Add user" className="mb-6">
-        <form onSubmit={add} className="grid grid-cols-3 gap-4 items-end">
+        <form onSubmit={add} className="grid grid-cols-1 items-end gap-4 md:grid-cols-3">
           <TextInput
             label="Username"
             value={form.username}
@@ -75,10 +71,12 @@ export default function ConsoleUsers() {
             value={form.role}
             onChange={(e) => setForm({ ...form, role: e.target.value as api.Role })}
           >
-            <option value="user">user</option>
+            <option value="viewer">viewer</option>
+            <option value="developer">developer</option>
+            <option value="operator">operator</option>
             <option value="admin">admin</option>
           </Select>
-          <div className="col-span-3">
+          <div className="md:col-span-3">
             <Button type="submit">Create user</Button>
           </div>
         </form>
@@ -91,13 +89,15 @@ export default function ConsoleUsers() {
           columns={["Name", "Role", ""]}
           rows={list.map((u) => [
             u.name,
-            <Tag tone={u.role === "admin" ? "blue" : "gray"}>{u.role}</Tag>,
+            <Tag tone={u.role === "admin" ? "red" : u.role === "developer" ? "blue" : u.role === "operator" ? "yellow" : "gray"}>
+              {u.role}
+            </Tag>,
             <button className="text-carbon-red hover:underline" onClick={() => void remove(u.name)}>
               Remove
             </button>,
           ])}
         />
       )}
-    </div>
+    </Page>
   );
 }
