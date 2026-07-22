@@ -17,6 +17,9 @@ use std::time::Duration;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+pub mod sink;
+pub use sink::S3Sink;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Where and how to reach an S3(-compatible) bucket. `endpoint` is the scheme + host (+ optional

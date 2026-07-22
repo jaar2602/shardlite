@@ -216,3 +216,79 @@ fn respond(s: &mut TcpStream, status: &str, body: &[u8]) {
     let _ = s.write_all(body);
     let _ = s.flush();
 }
+
+// --- slice 2: the S3 sink (change-log + snapshots) ---
+
+use meshdb::replication::{FrameSink, StreamTxn};
+use meshdb::s3::S3Sink;
+use meshdb::s3::sink::decode_change_log;
+use meshdb::shard::ShardId;
+use meshdb::vfs::{CommittedTxn, Frame};
+
+fn sample_txn(lsn: u64, page: u32) -> StreamTxn {
+    StreamTxn {
+        lsn,
+        txn: CommittedTxn {
+            db_size_pages: page,
+            page_size: 4096,
+            frames: vec![Frame {
+                page_no: page,
+                data: vec![lsn as u8; 16],
+            }],
+            generation: 0,
+        },
+    }
+}
+
+#[test]
+fn the_sink_uploads_the_change_log_and_snapshots() {
+    let (endpoint, _seen) = spawn_mock_s3();
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint,
+        bucket: "meshdb".into(),
+        region: "us-east-1".into(),
+        access_key: "AKIDEXAMPLE".into(),
+        secret_key: "s".into(),
+    }));
+    let sink = S3Sink::new(Arc::clone(&client), "arch");
+
+    let txns = vec![sample_txn(1, 1), sample_txn(2, 2)];
+    sink.accept(ShardId(3), 1, txns.clone()).unwrap();
+    // flush waits for the async upload to finish and reports the sink healthy.
+    sink.flush().unwrap();
+
+    // The change-log landed where the sink keys it (padded epoch_firstlsn), and decodes back to
+    // exactly the transactions handed in.
+    let key = "arch/shard_3/wal/00000000000000000001_00000000000000000001";
+    let got = decode_change_log(&client.get(key).unwrap()).unwrap();
+    assert_eq!(got, txns);
+
+    // A snapshot uploads under its own (epoch, lsn) key.
+    sink.put_snapshot(ShardId(3), 2, 9, b"SNAPSHOT-BYTES")
+        .unwrap();
+    assert_eq!(
+        client
+            .get("arch/shard_3/snapshot/00000000000000000002_00000000000000000009")
+            .unwrap(),
+        b"SNAPSHOT-BYTES"
+    );
+}
+
+#[test]
+fn a_persistently_failing_sink_reports_unhealthy() {
+    // Nothing is listening on this port, so uploads fail. The failure must surface through flush,
+    // so the writer stops rather than committing data that never reached S3.
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint: "http://127.0.0.1:1".into(),
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    let sink = S3Sink::new(client, "arch");
+    sink.accept(ShardId(0), 1, vec![sample_txn(1, 1)]).unwrap();
+    assert!(
+        sink.flush().is_err(),
+        "a sink that cannot reach S3 must report unhealthy"
+    );
+}
