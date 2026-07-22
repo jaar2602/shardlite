@@ -12,7 +12,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::Sealer;
 
-/// What the API returns about a connection — never the secret.
+/// S3 replication settings for a connection — the non-secret half. The bucket a cluster archives
+/// its shards to for HA. The secret key is sealed separately (see [`Record::s3_sealed_secret_key`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct S3Settings {
+    pub bucket: String,
+    pub region: String,
+    /// e.g. `https://s3.us-east-1.amazonaws.com` or a MinIO endpoint. Empty = derive from region.
+    pub endpoint: String,
+    pub access_key: String,
+    /// Key prefix under which shard snapshots and change-logs are stored.
+    pub prefix: String,
+    /// Whether replication to S3 is turned on for this cluster.
+    pub enabled: bool,
+}
+
+/// What the API returns about a connection — never a secret.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionInfo {
     pub name: String,
@@ -23,6 +38,8 @@ pub struct ConnectionInfo {
     pub timeout_ms: u64,
     pub allow_insecure_http: bool,
     pub custom_ca_pem: Option<String>,
+    /// S3 replication config (non-secret); `None` if never configured.
+    pub s3: Option<S3Settings>,
 }
 
 /// What the proxy needs to actually reach a cluster.
@@ -33,6 +50,12 @@ pub struct Resolved {
     pub meshdb_secret: Option<String>,
     pub timeout_ms: u64,
     pub custom_ca_pem: Option<String>,
+    // Resolved but not yet consumed by the proxy: pushing this to the nodes (so meshdb archives to
+    // S3) is the remaining integration step. Stored and decrypted here so it is ready for it.
+    #[allow(dead_code)]
+    pub s3: Option<S3Settings>,
+    #[allow(dead_code)]
+    pub s3_secret_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +81,12 @@ struct Record {
     /// as PEM rather than sealed like the cluster credential.
     #[serde(default)]
     custom_ca_pem: Option<String>,
+    /// S3 replication settings (non-secret). Absent in records created before S3 support.
+    #[serde(default)]
+    s3: Option<S3Settings>,
+    /// The S3 secret key, sealed like the cluster credential. `None` when S3 is unconfigured.
+    #[serde(default)]
+    s3_sealed_secret_key: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -184,6 +213,8 @@ impl Registry {
             timeout_ms,
             allow_insecure_http,
             custom_ca_pem,
+            None,
+            None,
         )
     }
 
@@ -199,6 +230,8 @@ impl Registry {
         timeout_ms: u64,
         allow_insecure_http: bool,
         custom_ca_pem: Option<String>,
+        s3: Option<S3Settings>,
+        s3_secret: Option<String>,
     ) -> Result<(), RegistryError> {
         validate_name(name)?;
         if seeds.is_empty() || seeds.len() > 32 {
@@ -230,6 +263,15 @@ impl Registry {
                 .and_then(|record| record.sealed_secret.clone()),
             None => None,
         };
+        // Same preserve-on-omit pattern as the cluster credential: a blank S3 secret on edit keeps
+        // the stored one rather than clearing it.
+        let s3_sealed_secret_key = match s3_secret {
+            Some(secret) => Some(self.sealer.seal(secret.as_bytes())),
+            None if replace => map
+                .get(name)
+                .and_then(|record| record.s3_sealed_secret_key.clone()),
+            None => None,
+        };
         map.insert(
             name.to_string(),
             Record {
@@ -242,6 +284,8 @@ impl Registry {
                 timeout_ms,
                 allow_insecure_http,
                 custom_ca_pem,
+                s3,
+                s3_sealed_secret_key,
             },
         );
         self.persist(&map)?;
@@ -275,6 +319,7 @@ impl Registry {
                 timeout_ms: r.timeout_ms,
                 allow_insecure_http: r.allow_insecure_http,
                 custom_ca_pem: r.custom_ca_pem.clone(),
+                s3: r.s3.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -379,6 +424,10 @@ impl Registry {
                 let plaintext = self.sealer.open(sealed).ok_or(RegistryError::Unsealable)?;
                 record.sealed_secret = Some(new_sealer.seal(&plaintext));
             }
+            if let Some(sealed) = &record.s3_sealed_secret_key {
+                let plaintext = self.sealer.open(sealed).ok_or(RegistryError::Unsealable)?;
+                record.s3_sealed_secret_key = Some(new_sealer.seal(&plaintext));
+            }
         }
         self.persist(&updated)?;
         *self.map.write().unwrap() = updated;
@@ -399,12 +448,21 @@ fn resolve_record(
             Some(String::from_utf8(bytes).map_err(|_| RegistryError::Unsealable)?)
         }
     };
+    let s3_secret_key = match &record.s3_sealed_secret_key {
+        None => None,
+        Some(sealed) => {
+            let bytes = sealer.open(sealed).ok_or(RegistryError::Unsealable)?;
+            Some(String::from_utf8(bytes).map_err(|_| RegistryError::Unsealable)?)
+        }
+    };
     Ok(Resolved {
         url,
         meshdb_user: record.meshdb_user.clone(),
         meshdb_secret,
         timeout_ms: record.timeout_ms,
         custom_ca_pem: record.custom_ca_pem.clone(),
+        s3: record.s3.clone(),
+        s3_secret_key,
     })
 }
 
@@ -526,6 +584,97 @@ mod tests {
         // and the on-disk file must not contain the plaintext.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("s3cret"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn s3_config_round_trips_and_seals_its_key() {
+        let path = tmp();
+        let reg = Registry::open(&path, Sealer::from_passphrase("master")).unwrap();
+        reg.put_config_seeds(
+            "prod",
+            vec!["http://10.0.0.5:4680".into()],
+            None,
+            None,
+            false,
+            true,
+            60_000,
+            true,
+            None,
+            Some(S3Settings {
+                bucket: "meshdb-backup".into(),
+                region: "us-east-1".into(),
+                endpoint: String::new(),
+                access_key: "AKIAEXAMPLE".into(),
+                prefix: "cluster-a".into(),
+                enabled: true,
+            }),
+            Some("s3-secret-key-material".into()),
+        )
+        .unwrap();
+
+        // list surfaces the non-secret S3 settings, never the key.
+        let listed = reg.list();
+        let s3 = listed[0].s3.as_ref().unwrap();
+        assert_eq!(s3.bucket, "meshdb-backup");
+        assert_eq!(s3.access_key, "AKIAEXAMPLE");
+        assert!(s3.enabled);
+
+        // resolve decrypts the secret key for the proxy.
+        let r = reg.resolve("prod").unwrap();
+        assert_eq!(r.s3_secret_key.as_deref(), Some("s3-secret-key-material"));
+        assert_eq!(r.s3.as_ref().unwrap().bucket, "meshdb-backup");
+
+        // the sealed key is never written to disk in plaintext.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("s3-secret-key-material"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn editing_a_connection_preserves_the_s3_key_when_omitted() {
+        let path = tmp();
+        let reg = Registry::open(&path, Sealer::from_passphrase("master")).unwrap();
+        let s3 = S3Settings {
+            bucket: "b".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        reg.put_config_seeds(
+            "c",
+            vec!["http://h:1".into()],
+            None,
+            None,
+            false,
+            true,
+            60_000,
+            true,
+            None,
+            Some(s3.clone()),
+            Some("key1".into()),
+        )
+        .unwrap();
+        // Edit (replace) without re-supplying the secret → the stored key survives.
+        reg.put_config_seeds(
+            "c",
+            vec!["http://h:1".into()],
+            None,
+            None,
+            true,
+            true,
+            60_000,
+            true,
+            None,
+            Some(s3),
+            None,
+        )
+        .unwrap();
+        let r = reg.resolve("c").unwrap();
+        assert_eq!(
+            r.s3_secret_key.as_deref(),
+            Some("key1"),
+            "the S3 key must survive an edit that omits it"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -699,6 +848,8 @@ mod tests {
             true,
             5_000,
             false,
+            None,
+            None,
             None,
         )
         .unwrap();

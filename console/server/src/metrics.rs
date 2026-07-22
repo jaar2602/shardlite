@@ -897,6 +897,8 @@ mod tests {
                 5_000,
                 true,
                 None,
+                None,
+                None,
             )
             .unwrap();
         let metrics = Metrics::open(&metrics_path).unwrap();

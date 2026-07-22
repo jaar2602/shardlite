@@ -19,6 +19,16 @@ export interface Me {
   csrf_token: string;
 }
 
+/** S3 replication settings for a cluster (non-secret; the secret key is never returned). */
+export interface S3Settings {
+  bucket: string;
+  region: string;
+  endpoint: string;
+  access_key: string;
+  prefix: string;
+  enabled: boolean;
+}
+
 export interface Connection {
   name: string;
   url: string;
@@ -28,6 +38,7 @@ export interface Connection {
   timeout_ms: number;
   allow_insecure_http: boolean;
   custom_ca_pem?: string | null;
+  s3?: S3Settings | null;
 }
 
 export class ApiError extends Error {
@@ -168,6 +179,13 @@ export const connections = {
     timeout_ms?: number;
     allow_insecure_http?: boolean;
     custom_ca_pem?: string;
+    s3_bucket?: string;
+    s3_region?: string;
+    s3_endpoint?: string;
+    s3_access_key?: string;
+    s3_secret_key?: string;
+    s3_prefix?: string;
+    s3_enabled?: boolean;
   }) => req("POST", "/api/connections", c),
   remove: (name: string) => req("DELETE", `/api/connections/${encodeURIComponent(name)}`),
   test: (name: string) =>

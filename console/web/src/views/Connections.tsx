@@ -28,6 +28,13 @@ export default function Connections() {
     timeout_ms: 60000,
     allow_insecure_http: false,
     custom_ca_pem: "",
+    s3_bucket: "",
+    s3_region: "",
+    s3_endpoint: "",
+    s3_access_key: "",
+    s3_secret_key: "",
+    s3_prefix: "",
+    s3_enabled: false,
   };
   const [form, setForm] = useState(emptyForm);
 
@@ -58,6 +65,13 @@ export default function Connections() {
         timeout_ms: form.timeout_ms,
         allow_insecure_http: form.allow_insecure_http,
         custom_ca_pem: form.custom_ca_pem,
+        s3_bucket: form.s3_bucket || undefined,
+        s3_region: form.s3_region || undefined,
+        s3_endpoint: form.s3_endpoint || undefined,
+        s3_access_key: form.s3_access_key || undefined,
+        s3_secret_key: form.s3_secret_key || undefined,
+        s3_prefix: form.s3_prefix || undefined,
+        s3_enabled: form.s3_enabled,
       });
       setForm(emptyForm);
       setAdding(false);
@@ -85,6 +99,13 @@ export default function Connections() {
       timeout_ms: connection.timeout_ms,
       allow_insecure_http: connection.allow_insecure_http,
       custom_ca_pem: connection.custom_ca_pem ?? "",
+      s3_bucket: connection.s3?.bucket ?? "",
+      s3_region: connection.s3?.region ?? "",
+      s3_endpoint: connection.s3?.endpoint ?? "",
+      s3_access_key: connection.s3?.access_key ?? "",
+      s3_secret_key: "",
+      s3_prefix: connection.s3?.prefix ?? "",
+      s3_enabled: connection.s3?.enabled ?? false,
     });
     setEditing(connection.name);
     setAdding(true);
@@ -244,6 +265,58 @@ export default function Connections() {
                 Adds private roots without disabling normal HTTPS certificate or hostname verification.
               </span>
             </label>
+            <div className="sm:col-span-2 border-t border-carbon-border pt-4">
+              <div className="mb-2 text-xs uppercase tracking-wide text-carbon-text-2">
+                S3 replication (high availability)
+              </div>
+              <label className="flex items-start gap-2 text-sm text-carbon-text">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={form.s3_enabled}
+                  onChange={(e) => setForm({ ...form, s3_enabled: e.target.checked })}
+                />
+                <span>
+                  Replicate this cluster's shards to S3. A survivor can then serve a failed node's
+                  shards from the bucket without a full restore. The secret key is stored encrypted.
+                </span>
+              </label>
+            </div>
+            <TextInput
+              label="S3 bucket"
+              value={form.s3_bucket}
+              onChange={(e) => setForm({ ...form, s3_bucket: e.target.value })}
+              placeholder="meshdb-backups"
+            />
+            <TextInput
+              label="S3 region"
+              value={form.s3_region}
+              onChange={(e) => setForm({ ...form, s3_region: e.target.value })}
+              placeholder="us-east-1"
+            />
+            <TextInput
+              label="S3 endpoint (optional)"
+              value={form.s3_endpoint}
+              onChange={(e) => setForm({ ...form, s3_endpoint: e.target.value })}
+              placeholder="https://s3.us-east-1.amazonaws.com"
+            />
+            <TextInput
+              label="Key prefix (optional)"
+              value={form.s3_prefix}
+              onChange={(e) => setForm({ ...form, s3_prefix: e.target.value })}
+              placeholder="cluster-a"
+            />
+            <TextInput
+              label="S3 access key"
+              value={form.s3_access_key}
+              onChange={(e) => setForm({ ...form, s3_access_key: e.target.value })}
+            />
+            <TextInput
+              label={editing ? "New S3 secret key (blank keeps current)" : "S3 secret key (stored encrypted)"}
+              type="password"
+              value={form.s3_secret_key}
+              onChange={(e) => setForm({ ...form, s3_secret_key: e.target.value })}
+            />
             <div className="sm:col-span-2">
               <Button type="submit">{editing ? "Update connection" : "Save database"}</Button>
             </div>

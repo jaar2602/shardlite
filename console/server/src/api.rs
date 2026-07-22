@@ -718,6 +718,27 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 .get("custom_ca_pem")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // S3 replication settings. Present only when a bucket is given; the secret key is
+            // sealed (blank on edit preserves the stored one), everything else is plain config.
+            let s3_field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let s3_bucket = s3_field("s3_bucket");
+            let s3 = if s3_bucket.is_empty() {
+                None
+            } else {
+                Some(crate::registry::S3Settings {
+                    bucket: s3_bucket,
+                    region: s3_field("s3_region"),
+                    endpoint: s3_field("s3_endpoint"),
+                    access_key: s3_field("s3_access_key"),
+                    prefix: s3_field("s3_prefix"),
+                    enabled: v.get("s3_enabled").and_then(Value::as_bool).unwrap_or(false),
+                })
+            };
+            let s3_secret = v
+                .get("s3_secret_key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let result = state.registry.put_config_seeds(
                 name,
                 seeds,
@@ -728,6 +749,8 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 timeout_ms,
                 allow_insecure_http,
                 custom_ca_pem,
+                s3,
+                s3_secret,
             );
             state.audit.record(
                 Some(&session.user),
