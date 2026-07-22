@@ -20,9 +20,11 @@ use sha2::{Digest, Sha256};
 pub mod pager;
 pub mod sink;
 pub mod vfs;
+pub mod wvfs;
 pub use pager::S3Pager;
 pub use sink::S3Sink;
 pub use vfs::open_readonly;
+pub use wvfs::open_readwrite;
 
 type HmacSha256 = Hmac<Sha256>;
 

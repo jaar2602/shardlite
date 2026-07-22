@@ -432,3 +432,80 @@ fn a_snapshot_in_s3_is_queryable_over_the_read_vfs() {
         "a read-only S3 snapshot must reject writes"
     );
 }
+
+// --- slice 3c: the read-write overlay (S3 base + local WAL) ---
+
+#[test]
+fn a_failed_over_shard_takes_writes_over_a_local_wal() {
+    // A WAL-mode snapshot with 300 "old" rows, checkpointed so the .db is complete.
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("base.db");
+    {
+        let c = rusqlite::Connection::open(&snap).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;")
+            .unwrap();
+        for i in 0..300i64 {
+            c.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("old-{i}")],
+            )
+            .unwrap();
+        }
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let bytes = std::fs::read(&snap).unwrap();
+
+    // Serve the base from S3; open it read-WRITE with the overlay VFS (base on S3, -wal local).
+    let (endpoint, _gets) = spawn_object_mock(bytes);
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint,
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = meshdb::s3::open_readwrite(client, "base.db", scratch.path()).unwrap();
+
+    // Old rows are readable straight from the S3 base.
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        300
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 42", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "old-42"
+    );
+
+    // New writes land in the local WAL — instantly, no download.
+    for i in 1000..1010i64 {
+        conn.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i, format!("new-{i}")],
+        )
+        .unwrap();
+    }
+
+    // Reads now merge the local WAL over the S3 base: both old and new rows are visible.
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        310
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 1005", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "new-1005"
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 7", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "old-7"
+    );
+}
