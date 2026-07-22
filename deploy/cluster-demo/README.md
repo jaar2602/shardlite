@@ -35,6 +35,32 @@ Try it yourself against any node — the answer is the same everywhere:
 curl -s localhost:8083/v1/run -d '{"sql":"SELECT count(*) FROM users"}'
 ```
 
+## TPC-H dataset
+
+`./tpch.sh` bootstraps the **same cluster** with a small TPC-H-shaped dataset (region, nation,
+customer, orders, lineitem) and runs a walkthrough of the classic TPC-H query shapes against it —
+a more realistic star schema than the single `users` table.
+
+```sh
+cd deploy/cluster-demo
+./tpch.sh
+```
+
+It brings the cluster up (reusing `docker-compose.yml`), generates the data with `tpch_data.py`
+(deterministic, no `dbgen`), loads it **rotating writes across all three nodes**, then shows:
+
+- **Q1** (Pricing Summary Report) — a `GROUP BY` over the whole `lineitem` table, two-phase-merged
+  across every shard on all three nodes.
+- **Q6** (Forecasting Revenue Change) — a filtered `sum` fanned out across shards.
+- a grouped aggregate on `orders`, a point lookup routed to one shard, and a 3-way
+  `customer⋈nation⋈region` **join** — which shards by different keys, so it is not co-located and
+  meshdb answers it by materialising centrally.
+
+Money is modelled as **integer cents** and discount as an integer percent (with the discounted
+price precomputed), so the cross-shard merged answers are *exactly* equal to a single-node one —
+no floating-point drift. `tpch_data.py` documents the schema and the scaled-down sizing; it is not
+official TPC-H (no scale factor), just the same table and query shapes at demo size.
+
 ## Web console
 
 `./console.sh` starts the meshdb **console** (the web UI) pointed at this cluster. It brings the
