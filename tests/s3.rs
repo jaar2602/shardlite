@@ -509,3 +509,173 @@ fn a_failed_over_shard_takes_writes_over_a_local_wal() {
         "old-7"
     );
 }
+
+// --- slice 4: serving a shard from S3 on failover ---
+
+/// A fuller mock S3: a real key→bytes store supporting PUT / HEAD / GET(+Range) / DELETE / LIST.
+/// Keys are stored without the leading bucket segment, matching the client's addressing.
+fn spawn_full_s3() -> String {
+    use std::collections::BTreeMap;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let store: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let (method, path, headers, body) = read_request(&mut s);
+            let (full, query) = match path.split_once('?') {
+                Some((p, q)) => (p, q),
+                None => (path.as_str(), ""),
+            };
+            // Drop the leading "/bucket" to get the object key.
+            let key = full
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            let mut st = store.lock().unwrap();
+            match method.as_str() {
+                "PUT" => {
+                    st.insert(key, body);
+                    respond(&mut s, "200 OK", &[]);
+                }
+                "HEAD" => match st.get(&key) {
+                    Some(b) => {
+                        let h = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            b.len()
+                        );
+                        let _ = s.write_all(h.as_bytes());
+                    }
+                    None => {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                },
+                "GET" if query.contains("list-type=2") => {
+                    let prefix = query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("prefix="))
+                        .map(urldecode)
+                        .unwrap_or_default();
+                    let mut xml = String::from("<ListBucketResult>");
+                    for k in st.keys().filter(|k| k.starts_with(&prefix)) {
+                        xml.push_str(&format!("<Key>{k}</Key>"));
+                    }
+                    xml.push_str("</ListBucketResult>");
+                    respond(&mut s, "200 OK", xml.as_bytes());
+                }
+                "GET" => match st.get(&key).cloned() {
+                    Some(b) => match headers.get("range").and_then(|r| parse_range(r)) {
+                        Some((a, e)) => {
+                            let e = e.min(b.len() - 1);
+                            respond(&mut s, "206 Partial Content", &b[a..=e]);
+                        }
+                        None => respond(&mut s, "200 OK", &b),
+                    },
+                    None => respond(&mut s, "404 Not Found", b"NoSuchKey"),
+                },
+                "DELETE" => {
+                    st.remove(&key);
+                    respond(&mut s, "204 No Content", &[]);
+                }
+                _ => respond(&mut s, "400 Bad Request", &[]),
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
+    // Node A archives a WAL-mode snapshot of shard 3 to S3.
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("s.db");
+    {
+        let c = rusqlite::Connection::open(&snap).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;")
+            .unwrap();
+        for i in 0..200i64 {
+            c.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("a-{i}")],
+            )
+            .unwrap();
+        }
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let bytes = std::fs::read(&snap).unwrap();
+
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint: spawn_full_s3(),
+        bucket: "meshdb".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+    let sink = S3Sink::new(Arc::clone(&client), "arch");
+    // An older, stale snapshot plus the real latest one — the survivor must pick the latest.
+    sink.put_snapshot(ShardId(3), 3, 100, b"OLD-STALE-SNAPSHOT")
+        .unwrap();
+    sink.put_snapshot(ShardId(3), 5, 200, &bytes).unwrap();
+
+    // The latest snapshot is the epoch-5 one.
+    assert_eq!(
+        meshdb::s3::failover::latest_snapshot(&client, "arch", ShardId(3))
+            .unwrap()
+            .unwrap(),
+        "arch/shard_3/snapshot/00000000000000000005_00000000000000000200"
+    );
+
+    // Node B takes over shard 3: opens it from S3, no download, and serves it.
+    let scratch = tempfile::tempdir().unwrap();
+    let conn =
+        meshdb::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        200
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 11", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "a-11"
+    );
+
+    // And it takes new writes locally, merged over the S3 base.
+    conn.execute("INSERT INTO t VALUES (9999, 'b-write')", [])
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        201
+    );
+    assert_eq!(
+        conn.query_row("SELECT v FROM t WHERE id = 9999", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "b-write"
+    );
+}
