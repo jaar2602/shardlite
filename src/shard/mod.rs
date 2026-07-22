@@ -364,6 +364,16 @@ pub trait PeerRouter: Send + Sync {
         shard: ShardId,
         statement: crate::storage::exec::Statement,
     ) -> crate::Result<crate::storage::exec::Outcome>;
+
+    /// Run `statement` on each of `shards` (none owned locally), **batched one request per owner
+    /// node** rather than one per shard, and return the results aligned with `shards`. This is what
+    /// keeps a wide fan-out to one round trip per node instead of one per shard.
+    fn fan_out(
+        &self,
+        shards: &[ShardId],
+        statement: &crate::storage::exec::Statement,
+        write: bool,
+    ) -> Vec<crate::Result<crate::storage::exec::Outcome>>;
 }
 
 pub struct ShardManager {
@@ -726,10 +736,13 @@ impl ShardManager {
             _ => sql,
         };
 
+        // Fan out the (identical) shard SQL to every shard — remote shards batched one request per
+        // owner node — then apply the same per-shard handling to the results in shard order.
+        let stmt = crate::storage::exec::Statement::new(shard_sql);
         let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
         let mut grouped_rows = 0usize;
-        for s in 0..self.cfg.shard_count {
-            match self.query(ShardId(s), shard_sql)? {
+        for (s, outcome) in self.fan_out_shards(&stmt, false).into_iter().enumerate() {
+            match outcome? {
                 Outcome::Ok(Executed::Rows(r)) => {
                     // Bound coordinator memory: refuse a runaway grouping before its partial rows
                     // are collected, rather than merging them and risking an OOM.
@@ -764,6 +777,54 @@ impl ShardManager {
         }
 
         Ok(merge_results(&plan, parts))
+    }
+
+    /// Run `statement` on every shard, returning the outcomes in shard order. Shards this node owns
+    /// run locally; shards it does not are gathered from their owners in **one batched request per
+    /// owner node** (via the peer router). Without a peer router — standalone — every shard is
+    /// local. This is the single place the per-shard-forward cost of a fan-out is collapsed.
+    fn fan_out_shards(
+        &self,
+        statement: &crate::storage::exec::Statement,
+        write: bool,
+    ) -> Vec<crate::Result<crate::storage::exec::Outcome>> {
+        let n = self.cfg.shard_count;
+        let run_local = |id: ShardId| {
+            if write {
+                self.writers.execute_one(id, statement.clone())
+            } else {
+                self.readers.query(id, statement.clone())
+            }
+        };
+        let Some(peer) = self.peer.get() else {
+            return (0..n).map(|s| run_local(ShardId(s))).collect();
+        };
+        let remote: Vec<ShardId> = (0..n)
+            .map(ShardId)
+            .filter(|&id| !peer.is_local(id))
+            .collect();
+        let mut remote_results: std::collections::HashMap<
+            u32,
+            crate::Result<crate::storage::exec::Outcome>,
+        > = remote
+            .iter()
+            .map(|s| s.0)
+            .zip(peer.fan_out(&remote, statement, write))
+            .collect();
+        (0..n)
+            .map(|s| {
+                let id = ShardId(s);
+                if peer.is_local(id) {
+                    run_local(id)
+                } else {
+                    remote_results.remove(&s).unwrap_or_else(|| {
+                        Err(crate::Error::Unsupported(format!(
+                            "no result for shard {s}"
+                        )))
+                    })
+                }
+            })
+            .collect()
     }
 
     /// Evaluate a set operation: fan out each branch independently (so an aggregate or grouped
@@ -955,12 +1016,15 @@ impl ShardManager {
         sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<(ShardId, crate::storage::exec::Outcome)>> {
         let statement = sql.into();
+        // Batched fan-out (one request per owner node) so DDL reaches every shard across hosts
+        // without one forward per shard.
         let mut out = Vec::with_capacity(self.cfg.shard_count as usize);
-        for s in 0..self.cfg.shard_count {
-            let id = ShardId(s);
-            // Through execute_one so a shard owned by another node is applied there — DDL reaches
-            // every shard across hosts, not just this node's.
-            out.push((id, self.execute_one(id, statement.clone())?));
+        for (s, outcome) in self
+            .fan_out_shards(&statement, true)
+            .into_iter()
+            .enumerate()
+        {
+            out.push((ShardId(s as u32), outcome?));
         }
 
         // A CREATE TABLE with a single-column primary key adopts that column as the shard key, so

@@ -906,6 +906,29 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             }
         }
 
+        // A batched fan-out from a coordinator: run `statement` on each named shard (this node owns
+        // them) and return the per-shard results in order. One request stands in for what would
+        // otherwise be one forward per shard.
+        Request::ShardBatch {
+            shards: batch_shards,
+            statement,
+            write,
+        } => {
+            let results = batch_shards
+                .iter()
+                .map(|&s| {
+                    let id = ShardId(s);
+                    let outcome = if write {
+                        shards.execute_one(id, statement.clone())
+                    } else {
+                        shards.query(id, statement.clone())
+                    };
+                    outcome_to_batch(outcome)
+                })
+                .collect();
+            Response::Batch { results }
+        }
+
         // The COMMIT of a client transaction: all-or-nothing, and durable before it returns.
         Request::Transaction { shard, statements } => {
             match shards.execute_txn(ShardId(shard), statements) {
@@ -1273,6 +1296,26 @@ fn outcome_to_response(o: Outcome) -> Response {
             last_insert_rowid: w.last_insert_rowid,
         },
         Outcome::Rejected(m) => Response::Rejected { message: m },
+    }
+}
+
+/// One shard's outcome as a [`BatchResult`] for [`Response::Batch`]. An error becomes a rejection so
+/// the coordinator sees it per shard rather than failing the whole batch.
+fn outcome_to_batch(o: crate::Result<Outcome>) -> super::protocol::BatchResult {
+    use super::protocol::BatchResult;
+    match o {
+        Ok(Outcome::Ok(Executed::Rows(r))) => BatchResult::Rows {
+            columns: r.columns,
+            rows: r.rows,
+        },
+        Ok(Outcome::Ok(Executed::Changed(w))) => BatchResult::Changed {
+            rows_affected: w.rows_affected,
+            last_insert_rowid: w.last_insert_rowid,
+        },
+        Ok(Outcome::Rejected(m)) => BatchResult::Rejected { message: m },
+        Err(e) => BatchResult::Rejected {
+            message: e.to_string(),
+        },
     }
 }
 

@@ -213,6 +213,105 @@ impl crate::shard::PeerRouter for Router {
         )?;
         response_to_outcome(resp)
     }
+
+    fn fan_out(
+        &self,
+        shards: &[ShardId],
+        statement: &crate::storage::exec::Statement,
+        write: bool,
+    ) -> Vec<Result<crate::storage::exec::Outcome>> {
+        use std::collections::BTreeMap;
+
+        // Group by owner node, so each node's shards travel in one ShardBatch.
+        let mut by_owner: BTreeMap<u64, Vec<ShardId>> = BTreeMap::new();
+        let mut results: std::collections::HashMap<u32, Result<crate::storage::exec::Outcome>> =
+            std::collections::HashMap::new();
+        for &s in shards {
+            match self.owner(s) {
+                Some(node) => by_owner.entry(node).or_default().push(s),
+                None => {
+                    results.insert(
+                        s.0,
+                        Err(Error::NoOwner {
+                            shard: s.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+
+        for group in by_owner.into_values() {
+            let ids: Vec<u32> = group.iter().map(|s| s.0).collect();
+            let req = Request::ShardBatch {
+                shards: ids,
+                statement: statement.clone(),
+                write,
+            };
+            // All shards in a group share an owner, so forwarding by the first reaches the node.
+            match self.forward(group[0], req) {
+                Ok(Response::Batch { results: batch }) if batch.len() == group.len() => {
+                    for (s, r) in group.iter().zip(batch) {
+                        results.insert(s.0, Ok(batch_to_outcome(r)));
+                    }
+                }
+                Ok(Response::Batch { results: batch }) => {
+                    let msg = format!(
+                        "shard batch returned {} results for {} shards",
+                        batch.len(),
+                        group.len()
+                    );
+                    for s in &group {
+                        results.insert(s.0, Err(Error::Protocol(msg.clone())));
+                    }
+                }
+                Ok(Response::Error { message, .. }) => {
+                    for s in &group {
+                        results.insert(s.0, Err(Error::Protocol(message.clone())));
+                    }
+                }
+                Ok(other) => {
+                    let msg = format!("unexpected response to a shard batch: {other:?}");
+                    for s in &group {
+                        results.insert(s.0, Err(Error::Protocol(msg.clone())));
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    for s in &group {
+                        results.insert(s.0, Err(Error::Protocol(msg.clone())));
+                    }
+                }
+            }
+        }
+
+        // Reassemble in the caller's shard order.
+        shards
+            .iter()
+            .map(|s| {
+                results
+                    .remove(&s.0)
+                    .unwrap_or_else(|| Err(Error::Protocol(format!("no result for {s}"))))
+            })
+            .collect()
+    }
+}
+
+fn batch_to_outcome(r: super::protocol::BatchResult) -> crate::storage::exec::Outcome {
+    use super::protocol::BatchResult;
+    use crate::storage::exec::{Executed, Outcome, QueryResult, WriteOutcome};
+    match r {
+        BatchResult::Rows { columns, rows } => {
+            Outcome::Ok(Executed::Rows(QueryResult { columns, rows }))
+        }
+        BatchResult::Changed {
+            rows_affected,
+            last_insert_rowid,
+        } => Outcome::Ok(Executed::Changed(WriteOutcome {
+            rows_affected,
+            last_insert_rowid,
+        })),
+        BatchResult::Rejected { message } => Outcome::Rejected(message),
+    }
 }
 
 fn response_to_outcome(resp: Response) -> Result<crate::storage::exec::Outcome> {

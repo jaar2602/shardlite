@@ -16,7 +16,7 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Largest single message. Snapshot chunks are the biggest legitimate payload, so this sits
 /// comfortably above the chunk size while still refusing anything absurd.
@@ -61,6 +61,15 @@ pub enum Request {
     /// client runs SQL without knowing the cluster is sharded: a keyed write lands on its shard, a
     /// point read hits one shard, any other read fans out, and DDL reaches every shard.
     Run { statement: Statement },
+    /// Run one statement on each of several shards **this node owns**, in a single round trip.
+    /// A coordinator groups the shards of a fan-out by owner and sends one of these per owner, so
+    /// a cross-shard query costs one request per node rather than one per shard. Cluster-internal.
+    ShardBatch {
+        shards: Vec<u32>,
+        statement: Statement,
+        /// Reads go to the reader pool; writes to the writer.
+        write: bool,
+    },
     /// Run a write against one shard.
     Execute {
         shard: u32,
@@ -158,6 +167,10 @@ pub enum Response {
     AllShards {
         outcomes: Vec<(u32, ShardOutcome)>,
     },
+    /// Per-shard results for a `ShardBatch`, in the same order as the requested shards.
+    Batch {
+        results: Vec<BatchResult>,
+    },
     Routed {
         shard: u32,
     },
@@ -232,6 +245,23 @@ pub enum Response {
 pub enum ShardOutcome {
     Ok,
     Rejected(String),
+}
+
+/// One shard's result inside a [`Response::Batch`] — rich enough for both reads (rows) and writes
+/// (a count), unlike [`ShardOutcome`], which only records DDL success/failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BatchResult {
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    Changed {
+        rows_affected: u64,
+        last_insert_rowid: i64,
+    },
+    Rejected {
+        message: String,
+    },
 }
 
 fn config() -> impl bincode::config::Config {

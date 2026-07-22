@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meshdb::shard::{PeerRouter, ShardConfig, ShardId, ShardManager};
 use meshdb::storage::Value;
@@ -22,10 +23,14 @@ fn cfg() -> ShardConfig {
     }
 }
 
-/// Owns the shards in `mine`; forwards every other shard to `other`.
+/// Owns the shards in `mine`; forwards every other shard to `other`. Counters record how the
+/// fan-out reached the peer: `fan_out_calls` is the number of batched round trips, `remote_seen`
+/// the total shards those calls carried — so a batch shows as few calls covering many shards.
 struct Split {
     mine: HashSet<u32>,
     other: Arc<ShardManager>,
+    fan_out_calls: Arc<AtomicUsize>,
+    remote_seen: Arc<AtomicUsize>,
 }
 
 impl PeerRouter for Split {
@@ -38,25 +43,67 @@ impl PeerRouter for Split {
     fn execute_remote(&self, shard: ShardId, stmt: Statement) -> meshdb::Result<Outcome> {
         self.other.execute_one(shard, stmt)
     }
+    fn fan_out(
+        &self,
+        shards: &[ShardId],
+        statement: &Statement,
+        write: bool,
+    ) -> Vec<meshdb::Result<Outcome>> {
+        // One call, all remote shards — the whole point of batching. (There is only one peer here,
+        // so every remote shard is in this single call; a real Router splits by owner node.)
+        self.fan_out_calls.fetch_add(1, Ordering::SeqCst);
+        self.remote_seen.fetch_add(shards.len(), Ordering::SeqCst);
+        shards
+            .iter()
+            .map(|&id| {
+                if write {
+                    self.other.execute_one(id, statement.clone())
+                } else {
+                    self.other.query(id, statement.clone())
+                }
+            })
+            .collect()
+    }
 }
 
-/// Node A owns even shards, node B owns odd. Each forwards the other half to its peer.
-fn two_nodes() -> (Arc<ShardManager>, Arc<ShardManager>, TempDir, TempDir) {
+/// Node A owns even shards, node B owns odd. Each forwards the other half to its peer. Returns
+/// node A's fan-out counters (`calls`, `remote_shards_seen`) so a test can assert batching.
+struct TwoNodes {
+    a: Arc<ShardManager>,
+    b: Arc<ShardManager>,
+    a_calls: Arc<AtomicUsize>,
+    a_remote: Arc<AtomicUsize>,
+    _dirs: (TempDir, TempDir),
+}
+
+fn two_nodes() -> TwoNodes {
     let da = TempDir::new().unwrap();
     let db = TempDir::new().unwrap();
     let a = Arc::new(ShardManager::open(da.path(), cfg()).unwrap());
     let b = Arc::new(ShardManager::open(db.path(), cfg()).unwrap());
     let even: HashSet<u32> = (0..N).filter(|s| s % 2 == 0).collect();
     let odd: HashSet<u32> = (0..N).filter(|s| s % 2 == 1).collect();
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let a_remote = Arc::new(AtomicUsize::new(0));
     a.set_peer_router(Arc::new(Split {
         mine: even,
         other: Arc::clone(&b),
+        fan_out_calls: Arc::clone(&a_calls),
+        remote_seen: Arc::clone(&a_remote),
     }));
     b.set_peer_router(Arc::new(Split {
         mine: odd,
         other: Arc::clone(&a),
+        fan_out_calls: Arc::new(AtomicUsize::new(0)),
+        remote_seen: Arc::new(AtomicUsize::new(0)),
     }));
-    (a, b, da, db)
+    TwoNodes {
+        a,
+        b,
+        a_calls,
+        a_remote,
+        _dirs: (da, db),
+    }
 }
 
 fn rows(o: Outcome) -> Vec<Vec<Value>> {
@@ -87,7 +134,8 @@ fn local_count(m: &ShardManager, owned: &[u32]) -> i64 {
 
 #[test]
 fn writes_and_reads_span_two_nodes() {
-    let (a, b, _da, _db) = two_nodes();
+    // Keep `_dirs` bound: it owns the TempDirs, and dropping it would delete the databases.
+    let TwoNodes { a, b, _dirs, .. } = two_nodes();
 
     // DDL issued on A reaches every shard — the odd ones are created on B by forwarding.
     a.execute_all_shards("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT) STRICT")
@@ -179,5 +227,44 @@ fn writes_and_reads_span_two_nodes() {
             .unwrap()
             .rows,
         vec![vec![Value::Integer(0)]]
+    );
+}
+
+#[test]
+fn a_fan_out_batches_remote_shards_into_one_call_per_owner() {
+    // With 8 shards split evenly, node A owns 4 and node B owns 4. A cross-shard read from A must
+    // reach B's 4 shards in ONE batched call, not four separate forwards.
+    let TwoNodes {
+        a,
+        a_calls,
+        a_remote,
+        _dirs,
+        ..
+    } = two_nodes();
+    a.execute_all_shards("CREATE TABLE t (id TEXT PRIMARY KEY, v INTEGER) STRICT")
+        .unwrap();
+    for i in 0..80 {
+        a.run_routed(Statement::new(format!(
+            "INSERT INTO t (id, v) VALUES ('k{i}', {i})"
+        )))
+        .unwrap();
+    }
+
+    // Reset the counters, then run exactly one fan-out read.
+    a_calls.store(0, Ordering::SeqCst);
+    a_remote.store(0, Ordering::SeqCst);
+    let total = a.query_all_shards("SELECT count(*) FROM t").unwrap();
+    assert_eq!(total.rows, vec![vec![Value::Integer(80)]]);
+
+    // One batched call to the one peer, carrying all 4 of its shards — not 4 calls.
+    assert_eq!(
+        a_calls.load(Ordering::SeqCst),
+        1,
+        "a fan-out should make one batched call per owner node"
+    );
+    assert_eq!(
+        a_remote.load(Ordering::SeqCst),
+        (N / 2) as usize,
+        "the single batch should carry all of the peer's shards"
     );
 }

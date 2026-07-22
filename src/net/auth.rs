@@ -101,6 +101,8 @@ pub fn required(req: &Request) -> Requirement {
         | Request::SnapshotEnd { .. }
         | Request::Vote(_)
         | Request::Beat(_)
+        // A batched fan-out is coordinator-to-owner, on the cluster's own authority.
+        | Request::ShardBatch { .. }
         | Request::Direct(_) => Requirement::Cluster,
     }
 }
