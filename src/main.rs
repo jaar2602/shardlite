@@ -735,6 +735,20 @@ Clustering (deploy across hosts):
     meshdb serve /data --shards 12 --listen B:4600 --node-id 2 --peers 1=A:4600,3=C:4600
     meshdb serve /data --shards 12 --listen C:4600 --node-id 3 --peers 1=A:4600,2=B:4600
 
+S3 replication for HA (requires the `s3` build feature):
+  --s3-bucket NAME       enable archival to this bucket (turns on S3 replication)
+  --s3-endpoint URL      S3 endpoint; set for S3-compatible stores (MinIO, R2).
+                         Defaults to the AWS regional endpoint.
+  --s3-region NAME       region (default us-east-1)
+  --s3-access-key KEY    access key (or the AWS_ACCESS_KEY_ID env var)
+  --s3-secret-key KEY    secret key (or the AWS_SECRET_ACCESS_KEY env var)
+  --s3-prefix PREFIX     key prefix for this cluster's objects (default meshdb)
+  --s3-snapshot-secs N   seconds between shard snapshots to S3 (default 60)
+
+  Committed frames stream to S3 as a change-log; each shard is periodically
+  snapshotted as a checkpointed base. A failover node opens the S3 replica when
+  the owner is down. Path-style addressing is used, so any S3-compatible store works.
+
 Without --users the server accepts any connection and warns that it is open.
 Without --tls-cert connections are plaintext.";
 
@@ -850,6 +864,21 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // S3 archival for HA (opt-in via --s3-bucket). Requires an `s3`-featured build.
+    #[cfg(not(feature = "s3"))]
+    if flag(args, "--s3-bucket").is_some() {
+        eprintln!("error: S3 replication requires a build with `--features s3`");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "s3")]
+    let s3_sink = match s3_archival(args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let (manager, services, cluster) = match node_id {
         Some(id) => match build_cluster(&dir, shards, id, peers, auth) {
             Ok((m, svc, c)) => (m, svc, Some(c)),
@@ -859,13 +888,28 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             }
         },
         None => {
-            let m = match meshdb::shard::ShardManager::open(
-                &dir,
-                meshdb::shard::ShardConfig {
-                    shard_count: shards,
-                    ..meshdb::shard::ShardConfig::floor()
-                },
-            ) {
+            #[allow(unused_mut)]
+            let mut cfg = meshdb::shard::ShardConfig {
+                shard_count: shards,
+                ..meshdb::shard::ShardConfig::floor()
+            };
+            // With an S3 sink, capture must be on so committed frames reach it.
+            #[cfg(feature = "s3")]
+            let opened = if let Some(sink) = &s3_sink {
+                cfg.capture = true;
+                meshdb::shard::ShardManager::open_with_sink(
+                    &dir,
+                    cfg,
+                    Some(std::sync::Arc::clone(sink)
+                        as std::sync::Arc<dyn meshdb::replication::FrameSink>),
+                )
+            } else {
+                meshdb::shard::ShardManager::open(&dir, cfg)
+            };
+            #[cfg(not(feature = "s3"))]
+            let opened = meshdb::shard::ShardManager::open(&dir, cfg);
+
+            let m = match opened {
                 Ok(m) => std::sync::Arc::new(m),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -879,6 +923,10 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             (m, services, None)
         }
     };
+
+    // Keep a handle for the S3 snapshot task before the manager moves into the server.
+    #[cfg(feature = "s3")]
+    let snap_manager = std::sync::Arc::clone(&manager);
 
     let mut cfg = meshdb::net::ServerConfig {
         addr: listen.clone(),
@@ -941,6 +989,20 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         std::thread::spawn(move || c.run(std::time::Duration::from_millis(300)));
     }
 
+    // Periodically archive each shard to S3 so a failover node has a fresh base to open.
+    #[cfg(feature = "s3")]
+    if let Some(sink) = &s3_sink {
+        let secs = flag(args, "--s3-snapshot-secs")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        spawn_s3_snapshots(
+            snap_manager,
+            std::sync::Arc::clone(sink),
+            std::time::Duration::from_secs(secs),
+        );
+        eprintln!("meshdb archiving to S3 every {secs}s");
+    }
+
     match node_id {
         Some(id) => eprintln!("meshdb serving {shards} shards on {listen} as cluster node {id}"),
         None => eprintln!("meshdb serving {shards} shards on {listen}"),
@@ -979,6 +1041,77 @@ fn parse_peers(s: &str) -> std::result::Result<std::collections::BTreeMap<u64, S
 /// replicas, no quorum wait). It delivers multi-write scale-out across hosts; data-level HA
 /// (replicas + quorum ack) is a further step, not wired here.
 #[allow(clippy::type_complexity)]
+/// Build the S3 archival sink from `--s3-*` flags (or AWS_* env for the keys), or `None` when
+/// `--s3-bucket` is absent. `--s3-endpoint` makes it work against any S3-compatible store (MinIO,
+/// Cloudflare R2, …), not just AWS; without it the AWS regional endpoint is derived.
+#[cfg(feature = "s3")]
+fn s3_archival(
+    args: &[String],
+) -> std::result::Result<Option<std::sync::Arc<meshdb::s3::S3Sink>>, String> {
+    use std::sync::Arc;
+    let Some(bucket) = flag(args, "--s3-bucket") else {
+        return Ok(None);
+    };
+    let region = flag(args, "--s3-region").unwrap_or("us-east-1").to_string();
+    let endpoint = flag(args, "--s3-endpoint")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+    let access_key = flag(args, "--s3-access-key")
+        .map(str::to_string)
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+        .ok_or("S3 needs --s3-access-key or AWS_ACCESS_KEY_ID")?;
+    let secret_key = flag(args, "--s3-secret-key")
+        .map(str::to_string)
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+        .ok_or("S3 needs --s3-secret-key or AWS_SECRET_ACCESS_KEY")?;
+    let prefix = flag(args, "--s3-prefix").unwrap_or("meshdb").to_string();
+    let client = Arc::new(meshdb::s3::S3Client::new(meshdb::s3::S3Config {
+        endpoint,
+        bucket: bucket.to_string(),
+        region,
+        access_key,
+        secret_key,
+    }));
+    Ok(Some(Arc::new(meshdb::s3::S3Sink::new(client, prefix))))
+}
+
+/// Periodically snapshot every shard to S3, so a failover node always has a recent base to open
+/// (the change-log covers the frames since). The snapshot is a checkpointed .db, taken by the
+/// writer thread; `interval` trades RPO/failover-freshness against the cost of a checkpoint.
+#[cfg(feature = "s3")]
+fn spawn_s3_snapshots(
+    manager: std::sync::Arc<meshdb::shard::ShardManager>,
+    sink: std::sync::Arc<meshdb::s3::S3Sink>,
+    interval: std::time::Duration,
+) {
+    use meshdb::shard::ShardId;
+    let _ = std::thread::Builder::new()
+        .name("meshdb-s3-snap".into())
+        .spawn(move || {
+            loop {
+                for s in 0..manager.shard_count() {
+                    let shard = ShardId(s);
+                    let tmp = std::env::temp_dir().join(format!("meshdb-s3-snap-{s}.db"));
+                    match manager.snapshot(shard, &tmp) {
+                        Ok((epoch, lsn)) => {
+                            if let Ok(bytes) = std::fs::read(&tmp) {
+                                // Flush the change-log up to the snapshot point first, so S3 is
+                                // consistent, then upload the base.
+                                let _ = sink.flush();
+                                if let Err(e) = sink.put_snapshot(shard, epoch, lsn, &bytes) {
+                                    tracing::warn!(shard = s, error = %e, "s3 snapshot upload failed");
+                                }
+                            }
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                        Err(e) => tracing::debug!(shard = s, error = %e, "snapshot skipped"),
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        });
+}
+
 fn build_cluster(
     dir: &std::path::Path,
     shards: u32,
