@@ -12,6 +12,8 @@ pub mod error;
 pub mod net;
 pub mod query;
 pub mod replication;
+#[cfg(feature = "s3")]
+pub mod s3;
 pub mod shard;
 pub mod storage;
 pub(crate) mod sync;

@@ -52,6 +52,13 @@ rustls-pemfile = { version = "2", optional = true }
 # core tokio-free; the gateway calls the same handle() the TCP server does.
 tiny_http = { version = "0.12", optional = true }
 serde_json = { version = "1", optional = true }
+# S3 archival for HA (opt-in `s3` feature). A *blocking* client so the core stays tokio-free:
+# ureq for HTTP/1.1 + TLS (rustls, the same provider the `tls` feature uses), and sha2/hmac for
+# AWS Signature V4 signing (blake3 elsewhere is not SHA-256, which SigV4 requires). A deployment
+# that does not use S3 compiles none of this.
+ureq = { version = "2", features = ["tls"], optional = true }
+sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [[bench]]
 name = "write_throughput"
@@ -85,3 +92,6 @@ cli = ["dep:tracing-subscriber"]
 tls = ["dep:rustls", "dep:rustls-pemfile"]
 http = ["dep:tiny_http", "dep:serde_json"]
 json-tcp = ["dep:serde_json"]
+# Replicate shards to S3 object storage for HA (snapshot + change-log), and read them back on
+# failover. Blocking client; no async runtime.
+s3 = ["dep:ureq", "dep:sha2", "dep:hmac"]
