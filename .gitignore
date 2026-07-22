@@ -12,3 +12,6 @@
 /console/web/vite.config.d.ts
 /console-data
 /.stack
+
+# runtime artifact from deploy/cluster-demo/console.sh
+/deploy/cluster-demo/console-data/
