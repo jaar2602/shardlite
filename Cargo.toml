@@ -66,6 +66,9 @@ harness = false
 
 [dev-dependencies]
 tempfile = "3"
+# Used by the s3 read-VFS test to build a real snapshot .db and query it back over S3. Same crate
+# (and pinned version) as the main dependency, so cargo unifies rather than double-linking SQLite.
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
 # Self-signed certs for the TLS tests, generated in-process so nothing is checked in to
 # expire. Only compiled when the tls tests run.
 rcgen = "0.13"

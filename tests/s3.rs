@@ -380,3 +380,55 @@ fn the_pager_reads_ranges_and_caches_chunks() {
     assert_eq!(&tail[..10], &data[data.len() - 10..]);
     assert_eq!(pager.read_at(data.len() as u64, &mut tail).unwrap(), 0);
 }
+
+// --- slice 3 part 2: the read-only S3-backed VFS ---
+
+#[test]
+fn a_snapshot_in_s3_is_queryable_over_the_read_vfs() {
+    // Build a real SQLite database on disk...
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snap.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        // DELETE journal so the .db is self-contained (no -wal); immutable=1 then reads it directly.
+        c.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;")
+            .unwrap();
+        for i in 0..500i64 {
+            c.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("row-{i}")],
+            )
+            .unwrap();
+        }
+    }
+
+    // ...serve its bytes from a mock S3, and query it over the read-only VFS — no download.
+    let bytes = std::fs::read(&path).unwrap();
+    let (endpoint, gets) = spawn_object_mock(bytes);
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint,
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+
+    let conn = meshdb::s3::open_readonly(client, "snap.db").unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 500);
+    let v: String = conn
+        .query_row("SELECT v FROM t WHERE id = 42", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "row-42");
+
+    // Pages were faulted from S3 (the read path actually ran), and writes are refused.
+    assert!(gets.load(Ordering::SeqCst) > 0, "no page reads hit S3");
+    assert!(
+        conn.execute("INSERT INTO t VALUES (99999, 'x')", [])
+            .is_err(),
+        "a read-only S3 snapshot must reject writes"
+    );
+}
