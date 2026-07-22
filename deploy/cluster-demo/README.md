@@ -61,6 +61,11 @@ price precomputed), so the cross-shard merged answers are *exactly* equal to a s
 no floating-point drift. `tpch_data.py` documents the schema and the scaled-down sizing; it is not
 official TPC-H (no scale factor), just the same table and query shapes at demo size.
 
+After the walkthrough it **starts the web console** (see below) pointed at the cluster, so you can
+open `http://127.0.0.1:7100` and browse/query the TPC-H tables in the UI. The load is idempotent —
+re-running `./tpch.sh` skips it and goes straight to the console. Set `TPCH_NO_CONSOLE=1` to stop
+after the walkthrough instead (e.g. a non-interactive run).
+
 ## Web console
 
 `./console.sh` starts the meshdb **console** (the web UI) pointed at this cluster. It brings the

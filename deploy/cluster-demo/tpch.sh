@@ -54,22 +54,35 @@ done
 echo "==> waiting for the cluster to elect a leader and place shards"
 sleep 6
 
-echo "==> generating a small TPC-H dataset"
-mapfile -t STMTS < <(python3 tpch_data.py)
-echo "    ${#STMTS[@]} statements (region, nation, customer, orders, lineitem)"
+# Idempotent: if the dataset is already loaded (e.g. a re-run to reach the console), skip the load
+# and go straight to the walkthrough. `count(*)` on a missing table comes back as a null row.
+loaded=$(run "${PORTS[0]}" "SELECT count(*) AS n FROM lineitem" \
+  | python3 -c 'import json,sys
+try:
+    v=json.load(sys.stdin).get("rows",[[None]])[0][0]
+    print(v if isinstance(v,int) else 0)
+except Exception:
+    print(0)')
+if [ "${loaded:-0}" -gt 0 ]; then
+  echo "==> dataset already loaded ($loaded lineitem rows); skipping the load"
+else
+  echo "==> generating a small TPC-H dataset"
+  mapfile -t STMTS < <(python3 tpch_data.py)
+  echo "    ${#STMTS[@]} statements (region, nation, customer, orders, lineitem)"
 
-echo "==> loading it, rotating which node we write to (node 1, 2, 3, 1, …)"
-echo "    every INSERT is auto-routed to whichever node owns the row's shard, wherever we send it"
-i=0
-for stmt in "${STMTS[@]}"; do
-  resp=$(run "${PORTS[$(( i % 3 ))]}" "$stmt")
-  case "$resp" in
-    *'"error"'*) echo "    load failed on: $stmt"; echo "    $resp"; exit 1;;
-  esac
-  i=$(( i + 1 ))
-  (( i % 40 == 0 )) && printf '    …%d/%d\n' "$i" "${#STMTS[@]}"
-done
-echo "    done: $i statements loaded"
+  echo "==> loading it, rotating which node we write to (node 1, 2, 3, 1, …)"
+  echo "    every INSERT is auto-routed to whichever node owns the row's shard, wherever we send it"
+  i=0
+  for stmt in "${STMTS[@]}"; do
+    resp=$(run "${PORTS[$(( i % 3 ))]}" "$stmt")
+    case "$resp" in
+      *'"error"'*) echo "    load failed on: $stmt"; echo "    $resp"; exit 1;;
+    esac
+    i=$(( i + 1 ))
+    (( i % 40 == 0 )) && printf '    …%d/%d\n' "$i" "${#STMTS[@]}"
+  done
+  echo "    done: $i statements loaded"
+fi
 
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
@@ -129,4 +142,15 @@ show "${PORTS[2]}" "SELECT o_orderkey, o_custkey, o_orderstatus, o_totalprice_ce
 echo
 echo "cluster is live with the TPC-H dataset. Poke it directly against any node, e.g.:"
 echo "  curl -s localhost:8082/v1/run -d '{\"sql\":\"SELECT count(*) FROM lineitem\"}'"
-echo "Tear it down with:  docker compose -f \"$(pwd)/docker-compose.yml\" down"
+
+# Hand off to the web console so the dataset is immediately browsable in the UI. console.sh sees
+# the cluster is already up, launches the console, pre-registers the 3 nodes as a connection, and
+# blocks until Ctrl-C (which stops the console; the cluster keeps running). Set TPCH_NO_CONSOLE=1
+# to finish here instead — e.g. for a non-interactive run.
+if [ "${TPCH_NO_CONSOLE:-0}" = "1" ]; then
+  echo "Tear it down with:  docker compose -f \"$(pwd)/docker-compose.yml\" down"
+  exit 0
+fi
+echo
+echo "==> starting the web console (set TPCH_NO_CONSOLE=1 to skip)"
+exec ./console.sh
