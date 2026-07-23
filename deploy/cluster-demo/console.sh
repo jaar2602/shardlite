@@ -14,7 +14,7 @@ CONSOLE_ADDR=127.0.0.1:7100
 CONSOLE_KEY="demo-master-key"          # encrypts stored secrets (demo value)
 ADMIN_USER=admin
 ADMIN_PASS=admin-demo-pass
-DATA_DIR="$PWD/console-data"           # fresh each run for a predictable demo
+DATA_DIR="$PWD/console-data"           # persisted across runs; pass --fresh to wipe it
 NODE_URLS='["http://127.0.0.1:8081","http://127.0.0.1:8082","http://127.0.0.1:8083"]'
 
 # --- 1. cluster up ---------------------------------------------------------------------------
@@ -42,7 +42,13 @@ if [ ! -x "$BIN" ]; then
 fi
 
 # --- 3. start the console backend ------------------------------------------------------------
-rm -rf "$DATA_DIR"; mkdir -p "$DATA_DIR"
+# Keep the data dir across restarts so users, connections, and AI settings survive — restarting
+# to pick up a new UI build must not wipe your configuration. Pass --fresh for a clean demo.
+if [ "${1:-}" = "--fresh" ]; then
+  echo "==> --fresh: wiping $DATA_DIR"
+  rm -rf "$DATA_DIR"
+fi
+mkdir -p "$DATA_DIR"
 echo "==> starting console at http://$CONSOLE_ADDR"
 MESHDB_CONSOLE_KEY="$CONSOLE_KEY" \
 MESHDB_CONSOLE_ADMIN="$ADMIN_USER" \
