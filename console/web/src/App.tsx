@@ -6,6 +6,7 @@ import * as api from "./lib/api";
 import Login from "./views/Login";
 import Connections from "./views/Connections";
 import ConsoleUsers from "./views/ConsoleUsers";
+import AiSettings from "./views/AiSettings";
 import Activity from "./views/Activity";
 import Fleet from "./views/Fleet";
 import Workspace from "./views/Workspace";
@@ -18,6 +19,7 @@ const WORKSPACE_LINKS: { path: string; label: string; short: string; permission:
   { path: "replication", label: "Replication", short: "⇄", permission: "observe" },
   { path: "operations", label: "Operations", short: "↻", permission: "write" },
   { path: "storage-internals", label: "Storage internals", short: "≋", permission: "operate" },
+  { path: "assistant", label: "Assistant", short: "🤖", permission: "observe" },
   { path: "stats", label: "Stats", short: "⌁", permission: "observe" },
   { path: "settings", label: "Settings", short: "⚙", permission: "observe" },
   { path: "users", label: "meshdb users", short: "◎", permission: "admin" },
@@ -59,6 +61,9 @@ function SideNav({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => 
             </NavLink>
             <NavLink to="/console-users" title="Console users" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
               {label("●", "Console users")}
+            </NavLink>
+            <NavLink to="/ai-settings" title="AI settings" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
+              {label("⚙", "AI settings")}
             </NavLink>
           </>
         )}
@@ -121,6 +126,7 @@ export default function App() {
           {me.role === "admin" && (
             <>
               <Route path="/console-users" element={<ConsoleUsers />} />
+              <Route path="/ai-settings" element={<AiSettings />} />
               <Route path="/activity" element={<Activity />} />
             </>
           )}

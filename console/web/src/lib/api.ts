@@ -82,6 +82,43 @@ export async function login(username: string, password: string): Promise<Me> {
   csrfToken = value.csrf_token;
   return value;
 }
+export interface AiSettings {
+  base_url: string;
+  model: string;
+  enabled: boolean;
+  has_key: boolean;
+  max_tool_calls: number;
+}
+export interface AiConfigUpdate {
+  base_url: string;
+  model: string;
+  enabled: boolean;
+  max_tool_calls: number;
+  // Omit to preserve the stored key; "" clears it; a value seals a new one.
+  api_key?: string;
+}
+export async function getAiConfig(): Promise<AiSettings> {
+  return req<AiSettings>("GET", "/api/ai/config");
+}
+export async function putAiConfig(body: AiConfigUpdate): Promise<AiSettings> {
+  return req<AiSettings>("PUT", "/api/ai/config", body);
+}
+
+export interface AssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+export interface AssistantToolTrace {
+  name: string;
+  arguments: unknown;
+  ok: boolean;
+  summary: string;
+}
+export interface AssistantReply {
+  answer: string;
+  trace: AssistantToolTrace[];
+}
+
 export async function logout(): Promise<{ ok: boolean }> {
   const value = await req<{ ok: boolean }>("POST", "/api/logout");
   csrfToken = null;
@@ -486,6 +523,10 @@ export function conn(name: string) {
       req<{ applied: string[]; failures: string[] }>("POST", `${b}/shardkey`, { table, column }),
     // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
     drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
+    // One turn of the AI assistant over this connection: send the conversation, get an answer + the
+    // tool calls it made. Read-only in this build.
+    assistant: (messages: AssistantMessage[]) =>
+      req<AssistantReply>("POST", `${b}/assistant`, { messages }),
   };
 }
 

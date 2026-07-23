@@ -3,6 +3,7 @@ import { lazy, Suspense } from "react";
 import { useAuth } from "../auth";
 import { Spinner } from "../components/ui";
 import * as api from "../lib/api";
+import Assistant from "./Assistant";
 import Cluster from "./Cluster";
 import Stats from "./Stats";
 import MeshUsers from "./MeshUsers";
@@ -32,6 +33,7 @@ export default function Workspace({ name }: { name: string }) {
           <Route path="cluster" element={<Cluster name={name} />} />
           {api.permits(me?.role, "operate") && <Route path="storage-internals" element={<ShardInventory name={name} />} />}
           <Route path="frames" element={<Navigate replace to={`/c/${encodeURIComponent(name)}/${api.permits(me?.role, "operate") ? "storage-internals" : "overview"}`} />} />
+          <Route path="assistant" element={<Assistant name={name} />} />
           <Route path="stats" element={<Stats name={name} />} />
           {api.permits(me?.role, "admin") && <Route path="users" element={<MeshUsers name={name} />} />}
           <Route path="*" element={<Overview name={name} />} />
