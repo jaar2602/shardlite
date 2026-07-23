@@ -179,6 +179,9 @@ impl HttpGateway {
             (Method::Get, "/v1/replication") => {
                 self.route(&req, role, Requirement::Read, || self.replication_json())
             }
+            (Method::Get, "/v1/config") => {
+                self.route(&req, role, Requirement::Read, || self.config_json())
+            }
             (Method::Post, "/v1/query") => {
                 // Streaming: handled specially, it takes ownership of the request to stream.
                 return self.handle_query(req, role);
@@ -1093,6 +1096,52 @@ impl HttpGateway {
         let bytes = std::fs::read(&wal).unwrap_or_default();
         let report = crate::vfs::inspect_wal(&bytes);
         Ok(frames_json(&report))
+    }
+
+    /// The effective configuration, each setting annotated with whether it can change at runtime and
+    /// how. For a sharded HA database most settings are immutable by design — shard count re-routes
+    /// every key, peers/TLS are wiring — so this surfaces them honestly as read-only-with-a-reason
+    /// rather than pretending they are editable. The genuinely runtime-mutable ones (S3 archival,
+    /// users) name the endpoint that changes them.
+    fn config_json(&self) -> serde_json::Value {
+        let cluster = self.services.cluster.as_ref();
+        let peers: Vec<String> = cluster
+            .map(|c| {
+                c.peers()
+                    .into_iter()
+                    .map(|(id, addr)| format!("{id}={addr}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let auth_on = self.services.auth.as_ref().is_some_and(|a| !a.is_empty());
+        #[cfg(feature = "s3")]
+        let s3_configured = self.services.s3.configured();
+        #[cfg(not(feature = "s3"))]
+        let s3_configured = false;
+
+        let setting = |key: &str, value: serde_json::Value, mutable: bool, note: &str| serde_json::json!({ "key": key, "value": value, "mutable": mutable, "note": note });
+        serde_json::json!({
+            "api_version": 1,
+            "node": cluster.map(|c| c.id()),
+            "settings": [
+                setting("shard_count", serde_json::json!(self.shards.shard_count()), false,
+                    "fixed at creation; changing it would re-route every key"),
+                setting("clustered", serde_json::json!(cluster.is_some()), false,
+                    "set at startup via --node-id"),
+                setting("peers", serde_json::json!(peers), false,
+                    "set at startup via --peers"),
+                setting("capture", serde_json::json!(self.shards.capture_enabled()), false,
+                    "set at startup via --s3-ready or --s3-bucket"),
+                setting("s3_archival", serde_json::json!(s3_configured), true,
+                    "change with POST /v1/s3/config"),
+                setting("auth", serde_json::json!(auth_on), true,
+                    "manage with GET/POST/DELETE /v1/users"),
+                setting("http_workers", serde_json::json!(self.cfg.workers), false,
+                    "set at startup via the gateway config"),
+                setting("http_insecure", serde_json::json!(self.cfg.insecure), false,
+                    "set at startup via --http-insecure"),
+            ],
+        })
     }
 
     /// Replication position and durability: per shard, how far the primary has written vs. how far

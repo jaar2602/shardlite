@@ -1112,7 +1112,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
 fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
     match (method, rest) {
         ("GET", ["info" | "meta" | "health" | "cluster" | "topology" | "shards" | "stats"])
-        | ("GET", ["replication"])
+        | ("GET", ["replication" | "config"])
         | ("GET", ["s3", "status"])
         | ("GET", ["schema", _]) => Some(Permission::Observe),
         ("POST", ["query" | "query_all" | "route"]) => Some(Permission::Query),

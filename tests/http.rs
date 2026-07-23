@@ -576,6 +576,30 @@ fn phase_c_shard_operations() {
 }
 
 #[test]
+fn phase_e_config_reports_settings_and_mutability() {
+    let g = gateway(None, false);
+    let cfg: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/config", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    let settings = cfg["settings"].as_array().unwrap();
+    let find = |key: &str| settings.iter().find(|s| s["key"] == key).unwrap();
+    // shard_count is present and honestly marked immutable-with-a-reason.
+    let sc = find("shard_count");
+    assert_eq!(sc["value"], 1);
+    assert_eq!(sc["mutable"], false);
+    assert!(sc["note"].as_str().unwrap().contains("re-route"));
+    // s3_archival is marked runtime-mutable and names the endpoint.
+    let s3 = find("s3_archival");
+    assert_eq!(s3["mutable"], true);
+    assert!(s3["note"].as_str().unwrap().contains("/v1/s3/config"));
+}
+
+#[test]
 fn phase_d_drain_refused_on_a_standalone_node() {
     // A standalone node is not a cluster member, so there is nothing to drain: 409, not a silent
     // no-op. (The clustered drain path exercises ClusterNode::stop, covered by the cluster tests.)
