@@ -28,6 +28,8 @@ pub struct AppState {
     pub operations: Operations,
     pub audit: Audit,
     pub ai: Arc<crate::ai::AiConfig>,
+    pub reports: Arc<crate::reports::Reports>,
+    pub dashboards: Arc<crate::reports::Dashboards>,
     pub login_limiter: LoginLimiter,
     pub secure_cookie: bool,
     pub streams: StreamSlots,
@@ -438,6 +440,157 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                     respond::respond_json(request, 200, &json!(state.ai.settings()))
                 }
                 Err(e) => respond::error(request, 500, &e),
+            }
+        }
+
+        // --- Reports: named, shareable saved queries (read = Observe, author = Write) ---
+        ("GET", ["reports"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "report.list", "reports");
+            }
+            respond::respond_json(request, 200, &json!(state.reports.list()))
+        }
+        ("GET", ["reports", id]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "report.get", id);
+            }
+            match state.reports.get(id) {
+                Some(r) => respond::respond_json(request, 200, &json!(r)),
+                None => respond::error(request, 404, "no such report"),
+            }
+        }
+        ("POST", ["reports"]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "report.create", "reports");
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(m) => return respond::error(request, 400, m),
+            };
+            let result = state.reports.create(
+                v["name"].as_str().unwrap_or(""),
+                v["description"].as_str().unwrap_or(""),
+                v.get("connection").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+                v["sql"].as_str().unwrap_or(""),
+                v["viz"].as_str().unwrap_or("table"),
+                &session.user,
+            );
+            match result {
+                Ok(r) => {
+                    state.audit.record(Some(&session.user), "report.create", &r.id, "ok");
+                    respond::respond_json(request, 200, &json!(r))
+                }
+                Err(e) => respond::error(request, 400, &e),
+            }
+        }
+        ("PUT", ["reports", id]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "report.update", id);
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(m) => return respond::error(request, 400, m),
+            };
+            let result = state.reports.update(
+                id,
+                v["name"].as_str().unwrap_or(""),
+                v["description"].as_str().unwrap_or(""),
+                v.get("connection").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+                v["sql"].as_str().unwrap_or(""),
+                v["viz"].as_str().unwrap_or("table"),
+            );
+            match result {
+                Ok(r) => {
+                    state.audit.record(Some(&session.user), "report.update", id, "ok");
+                    respond::respond_json(request, 200, &json!(r))
+                }
+                Err(e) => respond::error(request, 400, &e),
+            }
+        }
+        ("DELETE", ["reports", id]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "report.delete", id);
+            }
+            match state.reports.delete(id) {
+                Ok(()) => {
+                    state.audit.record(Some(&session.user), "report.delete", id, "ok");
+                    respond::respond_json(request, 200, &json!({ "ok": true }))
+                }
+                Err(e) => respond::error(request, 404, &e),
+            }
+        }
+
+        // --- Dashboards: arrangements of report tiles (read = Observe, author = Write) ---
+        ("GET", ["dashboards"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "dashboard.list", "dashboards");
+            }
+            respond::respond_json(request, 200, &json!(state.dashboards.list()))
+        }
+        ("GET", ["dashboards", id]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "dashboard.get", id);
+            }
+            match state.dashboards.get(id) {
+                Some(d) => respond::respond_json(request, 200, &json!(d)),
+                None => respond::error(request, 404, "no such dashboard"),
+            }
+        }
+        ("POST", ["dashboards"]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "dashboard.create", "dashboards");
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(m) => return respond::error(request, 400, m),
+            };
+            let tiles = parse_tiles(&v);
+            let result = state.dashboards.create(
+                v["name"].as_str().unwrap_or(""),
+                v["description"].as_str().unwrap_or(""),
+                tiles,
+                &session.user,
+            );
+            match result {
+                Ok(d) => {
+                    state.audit.record(Some(&session.user), "dashboard.create", &d.id, "ok");
+                    respond::respond_json(request, 200, &json!(d))
+                }
+                Err(e) => respond::error(request, 400, &e),
+            }
+        }
+        ("PUT", ["dashboards", id]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "dashboard.update", id);
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(m) => return respond::error(request, 400, m),
+            };
+            let tiles = parse_tiles(&v);
+            match state.dashboards.update(
+                id,
+                v["name"].as_str().unwrap_or(""),
+                v["description"].as_str().unwrap_or(""),
+                tiles,
+            ) {
+                Ok(d) => {
+                    state.audit.record(Some(&session.user), "dashboard.update", id, "ok");
+                    respond::respond_json(request, 200, &json!(d))
+                }
+                Err(e) => respond::error(request, 400, &e),
+            }
+        }
+        ("DELETE", ["dashboards", id]) => {
+            if !session.role.permits(Permission::Write) {
+                return require(request, state, &session, Permission::Write, "dashboard.delete", id);
+            }
+            match state.dashboards.delete(id) {
+                Ok(()) => {
+                    state.audit.record(Some(&session.user), "dashboard.delete", id, "ok");
+                    respond::respond_json(request, 200, &json!({ "ok": true }))
+                }
+                Err(e) => respond::error(request, 404, &e),
             }
         }
 
@@ -1310,6 +1463,19 @@ fn operation_error(request: Request, error: OperationError) -> std::io::Result<(
         OperationError::Invalid(_) => respond::error(request, 400, &error.to_string()),
         OperationError::Io(_) => respond::error(request, 500, &error.to_string()),
     }
+}
+
+/// Parse a dashboard's `tiles` array from a request body, dropping any malformed tile rather than
+/// failing the whole request.
+fn parse_tiles(v: &Value) -> Vec<crate::reports::Tile> {
+    v.get("tiles")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| serde_json::from_value::<crate::reports::Tile>(t.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Executes the assistant's read tools against a resolved connection, through the same proxy the UI

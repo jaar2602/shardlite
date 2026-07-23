@@ -16,6 +16,7 @@ mod metrics;
 mod operations;
 mod proxy;
 mod registry;
+mod reports;
 mod respond;
 mod store;
 mod users;
@@ -110,6 +111,8 @@ fn run() -> Result<(), String> {
         &data_dir.join("ai.json"),
         Sealer::from_passphrase(&key),
     )?);
+    let reports = Arc::new(reports::Reports::open(&data_dir.join("reports.json"))?);
+    let dashboards = Arc::new(reports::Dashboards::open(&data_dir.join("dashboards.json"))?);
     let secure_cookie = env_bool("MESHDB_CONSOLE_SECURE_COOKIE", false);
 
     metrics::spawn(Arc::clone(&registry), Arc::clone(&metrics));
@@ -123,6 +126,8 @@ fn run() -> Result<(), String> {
         operations,
         audit,
         ai,
+        reports,
+        dashboards,
         login_limiter: LoginLimiter::new(),
         secure_cookie,
         streams: StreamSlots::new(query_streams),

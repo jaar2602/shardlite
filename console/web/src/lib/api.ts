@@ -119,6 +119,62 @@ export interface AssistantReply {
   trace: AssistantToolTrace[];
 }
 
+export interface Report {
+  id: string;
+  name: string;
+  description: string;
+  connection: string | null;
+  sql: string;
+  viz: string;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+export interface ReportInput {
+  name: string;
+  description?: string;
+  connection?: string | null;
+  sql: string;
+  viz?: string;
+}
+export interface Tile {
+  report_id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  viz?: string | null;
+}
+export interface Dashboard {
+  id: string;
+  name: string;
+  description: string;
+  tiles: Tile[];
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+export interface DashboardInput {
+  name: string;
+  description?: string;
+  tiles: Tile[];
+}
+
+export const reports = {
+  list: () => req<Report[]>("GET", "/api/reports"),
+  get: (id: string) => req<Report>("GET", `/api/reports/${encodeURIComponent(id)}`),
+  create: (body: ReportInput) => req<Report>("POST", "/api/reports", body),
+  update: (id: string, body: ReportInput) => req<Report>("PUT", `/api/reports/${encodeURIComponent(id)}`, body),
+  remove: (id: string) => req<{ ok: boolean }>("DELETE", `/api/reports/${encodeURIComponent(id)}`),
+};
+export const dashboards = {
+  list: () => req<Dashboard[]>("GET", "/api/dashboards"),
+  get: (id: string) => req<Dashboard>("GET", `/api/dashboards/${encodeURIComponent(id)}`),
+  create: (body: DashboardInput) => req<Dashboard>("POST", "/api/dashboards", body),
+  update: (id: string, body: DashboardInput) => req<Dashboard>("PUT", `/api/dashboards/${encodeURIComponent(id)}`, body),
+  remove: (id: string) => req<{ ok: boolean }>("DELETE", `/api/dashboards/${encodeURIComponent(id)}`),
+};
+
 export async function logout(): Promise<{ ok: boolean }> {
   const value = await req<{ ok: boolean }>("POST", "/api/logout");
   csrfToken = null;
