@@ -9,6 +9,10 @@ export default function Schema({ name }: { name: string }) {
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState<"structure" | "data">("structure");
+  const [data, setData] = useState<api.MaterializedQueryResult | null>(null);
+  const [dataBusy, setDataBusy] = useState(false);
+  const [dataError, setDataError] = useState<string | null>(null);
 
   const load = async () => {
     setBusy(true);
@@ -38,6 +42,28 @@ export default function Schema({ name }: { name: string }) {
   }, [catalog, filter]);
   const table = catalog?.tables.find((item) => item.name === selected);
   const tableObject = catalog?.objects.find((item) => item.type === "table" && item.name === selected);
+
+  // Switching tables resets to the Structure tab; the Data tab lazy-loads its own rows.
+  useEffect(() => {
+    setTab("structure");
+    setData(null);
+    setDataError(null);
+  }, [selected]);
+
+  const openData = async () => {
+    setTab("data");
+    if (!table || data || dataBusy) return;
+    setDataBusy(true);
+    setDataError(null);
+    try {
+      const result = await api.conn(name).queryAll(`SELECT * FROM "${table.name.replace(/"/g, '""')}" LIMIT 100`);
+      setData(result);
+    } catch (caught) {
+      setDataError(caught instanceof Error ? caught.message : "The table data could not be loaded.");
+    } finally {
+      setDataBusy(false);
+    }
+  };
 
   return <Page>
     <PageHeader
@@ -77,11 +103,24 @@ export default function Schema({ name }: { name: string }) {
 
       <div className="space-y-3">
         {table ? <>
-          <Card title={<span>{table.name} <Tag tone="green">table</Tag></span>}><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-2">{table.sql ?? tableObject?.sql ?? "No CREATE statement reported"}</pre></Card>
-          <Card title="Columns"><DataTable columns={["CID", "Name", "Type", "Not null", "Default", "PK", "Hidden"]} empty="No columns" rows={table.columns.map((row) => row.map(cell))} /></Card>
-          <Card title="Indexes"><DataTable columns={["Seq", "Name", "Unique", "Origin", "Partial"]} empty="No indexes" rows={table.indexes.map((row) => row.map(cell))} /></Card>
-          <Card title="Foreign keys"><DataTable columns={["ID", "Seq", "Target table", "From", "To", "On update", "On delete", "Match"]} empty="No foreign keys" rows={table.foreign_keys.map((row) => row.map(cell))} /></Card>
-          <Card title="Related definitions"><div className="space-y-3">{(catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).length === 0 ? <p className="text-sm text-carbon-text-3">No indexes or triggers with stored definitions.</p> : (catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).map((object) => <div key={`${object.type}:${object.name}`} className="border-t border-carbon-border pt-3"><div className="mb-2 flex items-center gap-2"><Tag tone={objectTone(object.type)}>{object.type}</Tag><span className="text-sm">{object.name}</span></div><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-3">{object.sql ?? "Implicit definition"}</pre></div>)}</div></Card>
+          <div className="flex gap-1 border-b border-carbon-border">
+            <SchemaTab active={tab === "structure"} onClick={() => setTab("structure")}>Structure</SchemaTab>
+            <SchemaTab active={tab === "data"} onClick={() => void openData()}>Data</SchemaTab>
+          </div>
+          {tab === "structure" ? <>
+            <Card title={<span>{table.name} <Tag tone="green">table</Tag></span>}><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-2">{table.sql ?? tableObject?.sql ?? "No CREATE statement reported"}</pre></Card>
+            <Card title="Columns"><DataTable columns={["CID", "Name", "Type", "Not null", "Default", "PK", "Hidden"]} empty="No columns" rows={table.columns.map((row) => row.map(cell))} /></Card>
+            <Card title="Indexes"><DataTable columns={["Seq", "Name", "Unique", "Origin", "Partial"]} empty="No indexes" rows={table.indexes.map((row) => row.map(cell))} /></Card>
+            <Card title="Foreign keys"><DataTable columns={["ID", "Seq", "Target table", "From", "To", "On update", "On delete", "Match"]} empty="No foreign keys" rows={table.foreign_keys.map((row) => row.map(cell))} /></Card>
+            <Card title="Related definitions"><div className="space-y-3">{(catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).length === 0 ? <p className="text-sm text-carbon-text-3">No indexes or triggers with stored definitions.</p> : (catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).map((object) => <div key={`${object.type}:${object.name}`} className="border-t border-carbon-border pt-3"><div className="mb-2 flex items-center gap-2"><Tag tone={objectTone(object.type)}>{object.type}</Tag><span className="text-sm">{object.name}</span></div><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-3">{object.sql ?? "Implicit definition"}</pre></div>)}</div></Card>
+          </> : <Card title={<span>{table.name} <Tag tone="blue">data</Tag></span>}>
+            {dataBusy && <Spinner label="Reading table data…" />}
+            {dataError && <Banner tone="error">{dataError}</Banner>}
+            {data && !dataBusy && !dataError && <div className="space-y-2">
+              <p className="text-xs text-carbon-text-3">first 100 rows</p>
+              <DataTable columns={data.columns} empty="No rows" rows={data.rows.map((row) => row.map(dataCell))} />
+            </div>}
+          </Card>}
         </> : <Card><p className="py-12 text-center text-sm text-carbon-text-3">Select a table to inspect its columns, indexes, foreign keys, triggers, and SQL definition.</p></Card>}
       </div>
     </div>
@@ -90,3 +129,10 @@ export default function Schema({ name }: { name: string }) {
 
 function objectTone(type: string): "green" | "blue" | "yellow" | "gray" { return type === "table" ? "green" : type === "index" ? "blue" : type === "trigger" ? "yellow" : "gray"; }
 function cell(value: unknown) { return value === null ? <span className="italic text-carbon-text-3">NULL</span> : typeof value === "object" ? JSON.stringify(value) : String(value); }
+function SchemaTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) { return <button className={`border-b-2 px-3 py-2 text-sm ${active ? "border-carbon-blue text-carbon-text" : "border-transparent text-carbon-text-3"}`} onClick={onClick}>{children}</button>; }
+function isBlob(value: unknown): value is number[] { return Array.isArray(value) && value.every((item) => Number.isInteger(item) && item >= 0 && item <= 255); }
+function dataCell(value: unknown) {
+  if (value === null) return <span className="italic text-carbon-text-3">NULL</span>;
+  if (isBlob(value)) { const hex = value.slice(0, 12).map((item) => item.toString(16).padStart(2, "0")).join(""); return <span className="text-carbon-yellow">BLOB · {value.length} bytes · {hex}{value.length > 12 ? "…" : ""}</span>; }
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Spinner, Tag } from "../components/ui";
+import { Markdown } from "../lib/markdown";
 
 type ChatMessage = api.AssistantMessage & { trace?: api.AssistantToolTrace[] };
 
@@ -188,8 +189,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   const user = message.role === "user";
   return (
     <div className={`flex ${user ? "justify-end" : "justify-start"}`}>
-      <div className={`max-w-[85%] whitespace-pre-wrap px-3 py-2 text-sm ${user ? "bg-carbon-blue text-white" : "border border-carbon-border bg-carbon-layer text-carbon-text"}`}>
-        {message.content}
+      <div className={`max-w-[85%] px-3 py-2 text-sm ${user ? "whitespace-pre-wrap bg-carbon-blue text-white" : "border border-carbon-border bg-carbon-layer text-carbon-text"}`}>
+        {user ? message.content : <Markdown text={message.content} />}
         {message.trace && message.trace.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-1.5 border-t border-carbon-border pt-2">
             {message.trace.map((call, index) => <ToolChip key={index} call={call} />)}
