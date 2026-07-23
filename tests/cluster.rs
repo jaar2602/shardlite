@@ -32,6 +32,10 @@ struct Node {
     /// Kept so a test can talk to this node directly over the wire.
     #[allow(dead_code)]
     addr: String,
+    #[cfg(feature = "http")]
+    http: Arc<meshdb::net::HttpGateway>,
+    #[cfg(feature = "http")]
+    http_base: String,
     _dir: TempDir,
 }
 
@@ -39,6 +43,10 @@ impl Node {
     fn stop(&self) {
         self.cluster.stop();
         self.server
+            .shutdown_handle()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "http")]
+        self.http
             .shutdown_handle()
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -150,16 +158,17 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         );
 
         let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
+        let services = meshdb::net::NodeServices {
+            frames: Some(frames),
+            cluster: Some(Arc::clone(&cluster)),
+            router: Some(router),
+            ..Default::default()
+        };
         let server = Arc::new(
             Server::from_listener(
                 listener,
                 Arc::clone(&manager),
-                meshdb::net::NodeServices {
-                    frames: Some(frames),
-                    cluster: Some(Arc::clone(&cluster)),
-                    router: Some(router),
-                    ..Default::default()
-                },
+                services.clone(),
                 ServerConfig {
                     addr: addr.clone(),
                     ..ServerConfig::default()
@@ -172,12 +181,36 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         std::thread::spawn(move || {
             let _ = s.serve();
         });
+
+        #[cfg(feature = "http")]
+        let (http, http_base) = {
+            let gateway = Arc::new(
+                meshdb::net::HttpGateway::bind(
+                    Arc::clone(&manager),
+                    services,
+                    meshdb::net::HttpConfig {
+                        addr: "127.0.0.1:0".into(),
+                        workers: 2,
+                        insecure: false,
+                    },
+                )
+                .unwrap(),
+            );
+            let base = format!("http://{}", gateway.local_addr().unwrap());
+            let serving = Arc::clone(&gateway);
+            std::thread::spawn(move || serving.serve());
+            (gateway, base)
+        };
         nodes.push(Arc::new(Node {
             id,
             cluster,
             server,
             manager,
             addr,
+            #[cfg(feature = "http")]
+            http,
+            #[cfg(feature = "http")]
+            http_base,
             _dir: dir,
         }));
     }
@@ -189,6 +222,83 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         std::thread::spawn(move || c.run(Duration::from_millis(40)));
     }
     nodes
+}
+
+#[cfg(feature = "http")]
+#[test]
+fn observability_endpoints_show_node_loss_and_the_new_leader() {
+    let nodes = cluster(3);
+    let first = await_leader(&nodes, Duration::from_secs(5)).expect("no initial leader");
+    let first_term = first.cluster.term();
+
+    let initial: serde_json::Value = ureq::get(&format!("{}/v1/topology", first.http_base))
+        .call()
+        .unwrap()
+        .into_string()
+        .map_err(|error| error.to_string())
+        .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()))
+        .unwrap();
+    assert_eq!(initial["leader"], first.id);
+    assert_eq!(initial["members"].as_array().unwrap().len(), 3);
+
+    first.stop();
+    let survivors: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.id != first.id)
+        .cloned()
+        .collect();
+    let second = await_leader(&survivors, Duration::from_secs(5)).expect("no replacement leader");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observed = loop {
+        let value: serde_json::Value = ureq::get(&format!("{}/v1/topology", second.http_base))
+            .call()
+            .unwrap()
+            .into_string()
+            .map_err(|error| error.to_string())
+            .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()))
+            .unwrap();
+        let old = value["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["node"] == first.id)
+            .unwrap();
+        if value["leader"] == second.id && old["status"] == "suspected" {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new topology was not observable within two seconds: {value}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(observed["term"].as_u64().unwrap() > first_term);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let health = loop {
+        let health: serde_json::Value = ureq::get(&format!("{}/v1/health", second.http_base))
+            .call()
+            .unwrap()
+            .into_string()
+            .map_err(|error| error.to_string())
+            .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()))
+            .unwrap();
+        if health["status"] == "healthy" {
+            break health;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the surviving quorum never became healthy: {health}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        health["status"], "healthy",
+        "a two-of-three quorum remains healthy: {health}"
+    );
+
+    for node in &nodes {
+        node.stop();
+    }
 }
 
 /// Wait until exactly one node among `live` claims leadership, or time out.

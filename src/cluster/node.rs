@@ -182,6 +182,32 @@ impl ClusterNode {
         self.peers.get(&node).map(|s| s.as_str())
     }
 
+    /// Configured voting peers and their native meshdb addresses, sorted by node ID.
+    ///
+    /// This is a snapshot for operator-facing diagnostics. It deliberately says only who is
+    /// configured; callers that need liveness must combine it with [`Self::live_members`] and
+    /// must remember that only the current leader has a meaningful heartbeat view.
+    pub fn peers(&self) -> Vec<(NodeId, String)> {
+        self.peers
+            .iter()
+            .map(|(&node, addr)| (node, addr.clone()))
+            .collect()
+    }
+
+    /// Peers that answered the leader's latest heartbeat round.
+    ///
+    /// Followers do not heartbeat their peers, so an empty set on a follower means "not
+    /// observed", not "every peer is down". The HTTP topology response preserves that
+    /// distinction rather than manufacturing liveness.
+    pub fn live_members(&self) -> Vec<NodeId> {
+        self.live
+            .lock()
+            .expect("live mutex")
+            .iter()
+            .copied()
+            .collect()
+    }
+
     pub fn fence(&self) -> &Arc<Fence> {
         &self.fence
     }

@@ -19,8 +19,8 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-/// JSON parameters → SQL values. Null, integers, floats, strings — the ordinary bound-parameter
-/// kinds. Arrays and objects are refused with a message rather than guessed at.
+/// JSON parameters → SQL values. Blob parameters use an explicit `{ "blob_hex": "00ff" }`
+/// object so arrays and arbitrary objects are never guessed to be binary data.
 pub fn json_params(vals: &[serde_json::Value]) -> std::result::Result<Vec<Value>, String> {
     vals.iter()
         .map(|v| match v {
@@ -29,7 +29,26 @@ pub fn json_params(vals: &[serde_json::Value]) -> std::result::Result<Vec<Value>
             serde_json::Value::Number(n) if n.is_i64() => Ok(Value::Integer(n.as_i64().unwrap())),
             serde_json::Value::Number(n) => Ok(Value::Real(n.as_f64().unwrap())),
             serde_json::Value::String(s) => Ok(Value::Text(s.clone())),
+            serde_json::Value::Object(object) if object.len() == 1 => object
+                .get("blob_hex")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("unsupported parameter type: {v}"))
+                .and_then(parse_hex_blob)
+                .map(Value::Blob),
             other => Err(format!("unsupported parameter type: {other}")),
+        })
+        .collect()
+}
+
+fn parse_hex_blob(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("blob_hex must contain an even number of hexadecimal digits".into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|_| "blob_hex contains a non-hexadecimal digit".to_string())
         })
         .collect()
 }
@@ -52,6 +71,28 @@ pub fn consistency_from(v: Option<&serde_json::Value>) -> ReadConsistency {
             .map(ReadConsistency::AtLeastLsn)
             .unwrap_or_default(),
         _ => ReadConsistency::Linearizable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_explicit_hex_blob_parameters() {
+        let values = vec![serde_json::json!({ "blob_hex": "00aF10" })];
+        assert_eq!(
+            json_params(&values).unwrap(),
+            vec![Value::Blob(vec![0, 175, 16])]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_blob_parameters() {
+        assert!(json_params(&[serde_json::json!({ "blob_hex": "abc" })]).is_err());
+        assert!(json_params(&[serde_json::json!({ "blob_hex": "zz" })]).is_err());
+        assert!(json_params(&[serde_json::json!([0, 1])]).is_err());
+        assert!(json_params(&[serde_json::json!({ "blob_hex": "00", "other": true })]).is_err());
     }
 }
 

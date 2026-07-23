@@ -85,6 +85,43 @@ fn info_reports_the_shard_count() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["shard_count"], 1);
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["forwarding"], false);
+}
+
+#[test]
+fn observability_contracts_are_versioned_and_truthful_for_standalone() {
+    let g = gateway(None, false);
+    for endpoint in ["meta", "health", "topology", "shards"] {
+        let response = ureq::get(&format!("{}/v1/{endpoint}", g.base))
+            .call()
+            .unwrap();
+        assert_eq!(response.status(), 200, "{endpoint}");
+        let value: serde_json::Value =
+            serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        match endpoint {
+            "meta" => {
+                assert_eq!(value["api_version"], 1);
+                assert_eq!(value["clustered"], false);
+                assert_eq!(value["capabilities"]["topology"], true);
+            }
+            "health" => {
+                assert_eq!(value["status"], "healthy");
+                assert_eq!(value["checks"]["consensus"]["status"], "not_applicable");
+            }
+            "topology" => {
+                assert_eq!(value["api_version"], 1);
+                assert_eq!(value["clustered"], false);
+                assert!(value["observed_at_ms"].as_u64().unwrap() > 0);
+            }
+            "shards" => {
+                assert_eq!(value["api_version"], 1);
+                assert_eq!(value["shards"].as_array().unwrap().len(), 1);
+                assert_eq!(value["shards"][0]["local_role"], "primary");
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]

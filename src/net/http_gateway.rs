@@ -164,6 +164,18 @@ impl HttpGateway {
             (Method::Get, "/v1/info") => {
                 self.route(&req, role, Requirement::Read, || self.info_json())
             }
+            (Method::Get, "/v1/meta") => {
+                self.route(&req, role, Requirement::Read, || self.meta_json())
+            }
+            (Method::Get, "/v1/health") => {
+                self.route(&req, role, Requirement::Read, || self.health_json())
+            }
+            (Method::Get, "/v1/topology") => {
+                self.route(&req, role, Requirement::Read, || self.topology_json())
+            }
+            (Method::Get, "/v1/shards") => {
+                self.route(&req, role, Requirement::Read, || self.shards_json())
+            }
             (Method::Post, "/v1/query") => {
                 // Streaming: handled specially, it takes ownership of the request to stream.
                 return self.handle_query(req, role);
@@ -286,6 +298,141 @@ impl HttpGateway {
         serde_json::json!({
             "shard_count": self.shards.shard_count(),
             "epoch": self.shards.epoch(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "forwarding": self.services.router.is_some(),
+        })
+    }
+
+    /// Stable capability and identity contract. Unlike `/v1/info`, fields are additive behind an
+    /// explicit API version so collectors can negotiate mixed-version clusters without guessing.
+    fn meta_json(&self) -> serde_json::Value {
+        let cluster = self.services.cluster.as_ref();
+        serde_json::json!({
+            "api_version": 1,
+            "version": env!("CARGO_PKG_VERSION"),
+            "node": cluster.map(|c| c.id()),
+            "clustered": cluster.is_some(),
+            "shard_count": self.shards.shard_count(),
+            "epoch": self.shards.epoch(),
+            "forwarding": self.services.router.is_some(),
+            "capabilities": {
+                "health": true,
+                "topology": true,
+                "shards": true,
+                "metrics": true,
+            },
+        })
+    }
+
+    /// Node-local health, with the observation boundary stated explicitly. A follower cannot
+    /// claim peer liveness because only the leader sends heartbeats; it reports consensus from
+    /// its current election view and leaves reachability unknown in the topology contract.
+    fn health_json(&self) -> serde_json::Value {
+        let observed_at_ms = unix_millis();
+        let Some(cluster) = self.services.cluster.as_ref() else {
+            return serde_json::json!({
+                "status": "healthy",
+                "observed_at_ms": observed_at_ms,
+                "node": null,
+                "checks": {
+                    "storage": { "status": "ok" },
+                    "consensus": { "status": "not_applicable", "reason": "standalone" },
+                    "placement": { "status": "ok", "assigned": self.shards.shard_count(), "expected": self.shards.shard_count() },
+                }
+            });
+        };
+
+        let placement = cluster.placement();
+        let assigned = placement.assignments.len() as u32;
+        let expected = self.shards.shard_count();
+        let leader = cluster.leader();
+        let is_leader = cluster.is_leader();
+        let voters = cluster.peers().len() + 1;
+        let quorum = voters / 2 + 1;
+        let reachable = if is_leader {
+            Some(cluster.live_members().len() + 1)
+        } else {
+            None
+        };
+        let consensus_ok = leader.is_some() && reachable.is_none_or(|count| count >= quorum);
+        let placement_ok = assigned == expected && cluster.stats().handover_failed == 0;
+        let status = if consensus_ok && placement_ok {
+            "healthy"
+        } else if leader.is_none() {
+            "unavailable"
+        } else {
+            "degraded"
+        };
+        serde_json::json!({
+            "status": status,
+            "observed_at_ms": observed_at_ms,
+            "node": cluster.id(),
+            "term": cluster.term(),
+            "role": format!("{:?}", cluster.role()).to_lowercase(),
+            "leader": leader,
+            "checks": {
+                "storage": { "status": "ok" },
+                "consensus": {
+                    "status": if consensus_ok { "ok" } else { "degraded" },
+                    "voters": voters,
+                    "quorum": quorum,
+                    "reachable": reachable,
+                },
+                "placement": {
+                    "status": if placement_ok { "ok" } else { "degraded" },
+                    "assigned": assigned,
+                    "expected": expected,
+                    "handover_failures": cluster.stats().handover_failed,
+                },
+            }
+        })
+    }
+
+    fn topology_json(&self) -> serde_json::Value {
+        let mut topology = self.cluster_json();
+        if let Some(object) = topology.as_object_mut() {
+            object.insert("api_version".into(), serde_json::json!(1));
+            object.insert("observed_at_ms".into(), serde_json::json!(unix_millis()));
+            object.insert(
+                "observer".into(),
+                self.services
+                    .cluster
+                    .as_ref()
+                    .map(|cluster| serde_json::json!(cluster.id()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        topology
+    }
+
+    /// Node-local shard inventory. `primary_lsn` and `replica_lsn` are separate rulers; the
+    /// console compares observations from multiple nodes only when their epochs match.
+    fn shards_json(&self) -> serde_json::Value {
+        let cluster = self.services.cluster.as_ref();
+        let placement = cluster.map(|c| c.placement());
+        let node = cluster.map(|c| c.id());
+        let follower = self.services.follower.as_ref();
+        let mut shards = Vec::with_capacity(self.shards.shard_count() as usize);
+        for id in 0..self.shards.shard_count() {
+            let shard = crate::shard::ShardId(id);
+            let owner = placement
+                .as_ref()
+                .and_then(|placement| placement.assignments.get(&shard).copied());
+            let primary = cluster.is_none() || owner == node;
+            let replica = follower.map(|f| f.position(shard));
+            shards.push(serde_json::json!({
+                "id": id,
+                "owner": owner,
+                "local_role": if primary { "primary" } else if follower.is_some() { "replica" } else { "unassigned" },
+                "epoch": if primary { self.shards.epoch().unwrap_or(0) } else { replica.map(|p| p.epoch).unwrap_or(0) },
+                "lsn": if primary { self.shards.last_lsn(shard) } else { replica.map(|p| p.applied_lsn).unwrap_or(0) },
+            }));
+        }
+        serde_json::json!({
+            "api_version": 1,
+            "observed_at_ms": unix_millis(),
+            "node": node,
+            "shards": shards,
         })
     }
 
@@ -556,6 +703,7 @@ impl HttpGateway {
     fn stats_json(&self) -> serde_json::Value {
         let w = self.shards.writer_stats();
         let r = self.shards.reader_stats();
+        let checkpoint = self.shards.checkpoint_stats();
         serde_json::json!({
             "writer": {
                 "batches": w.batches, "requests": w.requests, "max_batch": w.max_batch,
@@ -570,6 +718,13 @@ impl HttpGateway {
                 "errors": self.counters.errors.load(Ordering::Relaxed),
                 "auth_failures": self.counters.auth_failures.load(Ordering::Relaxed),
                 "authz_refused": self.counters.authz_refused.load(Ordering::Relaxed),
+            },
+            "checkpoint": {
+                "passive": checkpoint.passive,
+                "truncated": checkpoint.truncated,
+                "stalls": checkpoint.stalls,
+                "failures": checkpoint.failures,
+                "wal_bytes": checkpoint.wal_bytes,
             },
         })
     }
@@ -587,23 +742,60 @@ impl HttpGateway {
                     .map(|(s, n)| (s.0.to_string(), serde_json::json!(n)))
                     .collect();
                 let s = c.stats();
+                let leader_view = c.is_leader();
+                let live: std::collections::BTreeSet<_> = c.live_members().into_iter().collect();
+                let peers = c.peers();
+                let mut members = Vec::with_capacity(peers.len() + 1);
+                members.push(serde_json::json!({
+                    "node": c.id(),
+                    "address": null,
+                    "this_node": true,
+                    "status": "up",
+                }));
+                members.extend(peers.iter().map(|(node, address)| {
+                    let status = if leader_view {
+                        if live.contains(node) {
+                            "up"
+                        } else {
+                            "suspected"
+                        }
+                    } else {
+                        "unknown"
+                    };
+                    serde_json::json!({
+                        "node": node,
+                        "address": address,
+                        "this_node": false,
+                        "status": status,
+                    })
+                }));
                 serde_json::json!({
                     "clustered": true,
                     "node": c.id(),
                     "term": c.term(),
                     "role": format!("{:?}", c.role()).to_lowercase(),
                     "leader": c.leader(),
+                    "voters": peers.len() + 1,
+                    "members": members,
                     "led_shards": c.led_shards().iter().map(|s| s.0).collect::<Vec<_>>(),
                     "placement": { "term": p.term, "assignments": assignments },
                     "stats": {
                         "elections_started": s.elections_started, "became_leader": s.became_leader,
                         "stepped_down": s.stepped_down, "heartbeats_sent": s.heartbeats_sent,
-                        "peer_unreachable": s.peer_unreachable, "handover_failed": s.handover_failed,
+                        "peer_unreachable": s.peer_unreachable, "votes_granted": s.votes_granted,
+                        "votes_refused": s.votes_refused, "handover_failed": s.handover_failed,
                     },
                 })
             }
         }
     }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---- request bodies ----
