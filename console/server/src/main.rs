@@ -4,8 +4,10 @@
 //! The browser talks only to this backend (same origin, so no CORS), and this backend talks to
 //! clusters over their stable HTTP `/v1` edge. See `docs/console-plan.md`.
 
+mod ai;
 mod api;
 mod assets;
+mod assistant;
 mod audit;
 mod auth;
 mod crypto;
@@ -104,6 +106,10 @@ fn run() -> Result<(), String> {
     );
     let audit = Audit::open(&audit_path)?;
     let operations = Operations::open(&operations_path)?;
+    let ai = Arc::new(ai::AiConfig::open(
+        &data_dir.join("ai.json"),
+        Sealer::from_passphrase(&key),
+    )?);
     let secure_cookie = env_bool("MESHDB_CONSOLE_SECURE_COOKIE", false);
 
     metrics::spawn(Arc::clone(&registry), Arc::clone(&metrics));
@@ -116,6 +122,7 @@ fn run() -> Result<(), String> {
         metrics,
         operations,
         audit,
+        ai,
         login_limiter: LoginLimiter::new(),
         secure_cookie,
         streams: StreamSlots::new(query_streams),

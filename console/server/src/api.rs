@@ -27,6 +27,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub operations: Operations,
     pub audit: Audit,
+    pub ai: Arc<crate::ai::AiConfig>,
     pub login_limiter: LoginLimiter,
     pub secure_cookie: bool,
     pub streams: StreamSlots,
@@ -387,6 +388,55 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             }
             match state.audit.recent(500) {
                 Ok(events) => respond::respond_json(request, 200, &json!(events)),
+                Err(e) => respond::error(request, 500, &e),
+            }
+        }
+
+        // AI assistant provider settings (admin). The key is sealed and never returned.
+        ("GET", ["ai", "config"]) => {
+            if !session.role.permits(Permission::ManageConsoleUsers) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::ManageConsoleUsers,
+                    "ai.config.read",
+                    "ai",
+                );
+            }
+            respond::respond_json(request, 200, &json!(state.ai.settings()))
+        }
+        ("PUT", ["ai", "config"]) => {
+            if !session.role.permits(Permission::ManageConsoleUsers) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::ManageConsoleUsers,
+                    "ai.config.update",
+                    "ai",
+                );
+            }
+            let value = match json_body(&mut request) {
+                Ok(value) => value,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let base_url = value["base_url"].as_str().unwrap_or("").trim().to_string();
+            let model = value["model"].as_str().unwrap_or("").trim().to_string();
+            let enabled = value["enabled"].as_bool().unwrap_or(false);
+            let max_tool_calls = value["max_tool_calls"].as_u64().unwrap_or(0) as u32;
+            // preserve-on-omit: absent api_key keeps the stored one; "" clears it.
+            let api_key = value
+                .get("api_key")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match state.ai.update(base_url, model, enabled, max_tool_calls, api_key) {
+                Ok(()) => {
+                    state
+                        .audit
+                        .record(Some(&session.user), "ai.config.update", "ai", "ok");
+                    respond::respond_json(request, 200, &json!(state.ai.settings()))
+                }
                 Err(e) => respond::error(request, 500, &e),
             }
         }
@@ -928,6 +978,93 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             }
         }
 
+        // The AI assistant: run one turn of the harness against this connection. Read-only tools
+        // execute automatically (through the same proxy + policy as the UI); the answer + tool trace
+        // come back. Any signed-in user may chat; the harness only offers tools their role permits.
+        ("POST", ["connections", name, "assistant"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::Observe,
+                    "assistant.chat",
+                    name,
+                );
+            }
+            let Some(provider_cfg) = state.ai.resolved() else {
+                return respond::error(
+                    request,
+                    409,
+                    "the AI assistant is not configured; an admin must set the provider in AI settings",
+                );
+            };
+            let resolved = match state.registry.resolve(name) {
+                Ok(resolved) => resolved,
+                Err(RegistryError::NotFound) => {
+                    return respond::error(request, 404, "no such connection")
+                }
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
+                }
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let body = match json_body(&mut request) {
+                Ok(value) => value,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let Some(turns) = body.get("messages").and_then(Value::as_array) else {
+                return respond::error(request, 400, "expected { messages: [{role, content}, …] }");
+            };
+            // Only user/assistant text turns from the client; the system prompt is added server-side,
+            // and tool messages are never accepted from the client.
+            let mut messages = vec![crate::assistant::provider::Message::system(
+                crate::assistant::system_prompt(),
+            )];
+            for turn in turns {
+                let (Some(role), Some(content)) = (
+                    turn.get("role").and_then(Value::as_str),
+                    turn.get("content").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                if role == "user" || role == "assistant" {
+                    messages.push(crate::assistant::provider::Message::plain(role, content));
+                }
+            }
+
+            let provider = crate::assistant::provider::OpenAiProvider::new(
+                provider_cfg.base_url,
+                provider_cfg.api_key,
+            );
+            let executor = ProxyExecutor { resolved };
+            let harness = crate::assistant::Harness {
+                provider: &provider,
+                model: provider_cfg.model,
+                max_tool_calls: provider_cfg.max_tool_calls,
+                tools: crate::assistant::tools_for(session.role),
+                executor: &executor,
+            };
+            match harness.run(messages) {
+                Ok(outcome) => {
+                    state
+                        .audit
+                        .record(Some(&session.user), "assistant.chat", name, "ok");
+                    respond::respond_json(
+                        request,
+                        200,
+                        &json!({ "answer": outcome.answer, "trace": outcome.trace }),
+                    )
+                }
+                Err(e) => {
+                    state
+                        .audit
+                        .record(Some(&session.user), "assistant.chat", name, "failed");
+                    respond::error(request, 502, &e)
+                }
+            }
+        }
+
         // Push this connection's stored (sealed) S3 config to every node of the cluster, so an
         // operator turns replication on without re-entering the secret. S3 config is node-local
         // (each node archives the shards it owns), so it is applied to all seeds, not just one.
@@ -1172,6 +1309,28 @@ fn operation_error(request: Request, error: OperationError) -> std::io::Result<(
         OperationError::Conflict(_) => respond::error(request, 409, &error.to_string()),
         OperationError::Invalid(_) => respond::error(request, 400, &error.to_string()),
         OperationError::Io(_) => respond::error(request, 500, &error.to_string()),
+    }
+}
+
+/// Executes the assistant's read tools against a resolved connection, through the same proxy the UI
+/// uses — so a tool call is subject to the same meshdb-side authorization as a manual click.
+struct ProxyExecutor {
+    resolved: crate::registry::Resolved,
+}
+
+impl crate::assistant::ToolExecutor for ProxyExecutor {
+    fn execute(&self, name: &str, args: &Value) -> Result<Value, String> {
+        if let Some(suffix) = crate::assistant::read_tool_endpoint(name) {
+            return crate::proxy::fetch_json_result(&self.resolved, suffix).map(|(value, _)| value);
+        }
+        if name == "run_query" {
+            let sql = args
+                .get("sql")
+                .and_then(Value::as_str)
+                .ok_or("run_query needs a 'sql' string argument")?;
+            return crate::proxy::post_json_result(&self.resolved, "query_all", &json!({ "sql": sql }));
+        }
+        Err(format!("unknown tool '{name}'"))
     }
 }
 
