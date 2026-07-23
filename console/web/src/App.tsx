@@ -5,6 +5,8 @@ import { Spinner } from "./components/ui";
 import * as api from "./lib/api";
 import Login from "./views/Login";
 import Connections from "./views/Connections";
+import Reports from "./views/Reports";
+import Dashboards from "./views/Dashboards";
 import ConsoleUsers from "./views/ConsoleUsers";
 import AiSettings from "./views/AiSettings";
 import Activity from "./views/Activity";
@@ -54,6 +56,14 @@ function SideNav({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => 
         <NavLink to="/connections" title="Connections" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
           {label("↗", "Connections")}
         </NavLink>
+        {api.permits(me?.role, "observe") && <>
+          <NavLink to="/reports" title="Reports" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
+            {label("▦", "Reports")}
+          </NavLink>
+          <NavLink to="/dashboards" title="Dashboards" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
+            {label("▤", "Dashboards")}
+          </NavLink>
+        </>}
         {me?.role === "admin" && (
           <>
             <NavLink to="/activity" title="Activity" className={({ isActive }) => `${link} ${isActive ? active : ""}`}>
@@ -123,6 +133,8 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Fleet />} />
           <Route path="/connections" element={<Connections />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/dashboards" element={<Dashboards />} />
           {me.role === "admin" && (
             <>
               <Route path="/console-users" element={<ConsoleUsers />} />
