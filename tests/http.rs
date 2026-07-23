@@ -576,6 +576,20 @@ fn phase_c_shard_operations() {
 }
 
 #[test]
+fn phase_d_drain_refused_on_a_standalone_node() {
+    // A standalone node is not a cluster member, so there is nothing to drain: 409, not a silent
+    // no-op. (The clustered drain path exercises ClusterNode::stop, covered by the cluster tests.)
+    let g = gateway(None, false);
+    let err = ureq::post(&format!("{}/v1/cluster/drain", g.base))
+        .send_string("")
+        .unwrap_err();
+    match err {
+        ureq::Error::Status(409, _) => {}
+        other => panic!("expected 409 on a standalone node, got {other:?}"),
+    }
+}
+
+#[test]
 fn frames_endpoint_decodes_the_wal() {
     let g = gateway(None, false);
     ddl(&g, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT");

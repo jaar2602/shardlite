@@ -213,6 +213,9 @@ impl HttpGateway {
             (Method::Post, "/v1/s3/flush") => {
                 return self.handle_s3_flush(req, role);
             }
+            (Method::Post, "/v1/cluster/drain") => {
+                return self.handle_drain(req, role);
+            }
             (Method::Post, "/v1/shardkey") => {
                 return self.handle_shardkey(req, role);
             }
@@ -835,6 +838,34 @@ impl HttpGateway {
             sink.flush().map_err(|e| error_to_http(&e))?;
             Ok((200, serde_json::json!({ "ok": true })))
         }
+    }
+
+    /// `POST /v1/cluster/drain` (Admin) — this node gracefully leaves the cluster: it stops
+    /// counting toward quorum and stops leading, so the remaining members re-derive placement and
+    /// its shards move to them. Intended for maintenance / rolling restarts; the node rejoins on
+    /// restart. A 409 on a standalone node (nothing to drain).
+    fn handle_drain(&self, req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            match self.services.cluster.as_ref() {
+                Some(cluster) => {
+                    let was_leader = cluster.is_leader();
+                    cluster.stop();
+                    Ok((
+                        200,
+                        serde_json::json!({
+                            "ok": true, "draining": true,
+                            "node": cluster.id(), "was_leader": was_leader,
+                        }),
+                    ))
+                }
+                None => Err(HttpError::new(
+                    409,
+                    "this is a standalone node, not a cluster member; nothing to drain",
+                )),
+            }
+        })();
+        respond_json(req, out);
     }
 
     /// `POST /v1/shards/{n}/vacuum` and `.../checkpoint` (Admin) — operator maintenance on one

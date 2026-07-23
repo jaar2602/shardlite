@@ -1122,6 +1122,8 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("POST", ["s3", "config" | "snapshot" | "flush"]) => Some(Permission::Operate),
         // Shard maintenance (vacuum/checkpoint) is an operator action.
         ("POST", ["shards", _, "vacuum" | "checkpoint"]) => Some(Permission::Operate),
+        // Draining a node for maintenance is an operator action.
+        ("POST", ["cluster", "drain"]) => Some(Permission::Operate),
         ("GET", ["frames", _]) => Some(Permission::Operate),
         ("GET" | "POST", ["users"]) | ("DELETE", ["users", _]) => Some(Permission::ManageMeshUsers),
         _ => None,
