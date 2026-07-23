@@ -16,11 +16,17 @@ Two jobs, in one chat panel scoped to a connection:
 1. **Observe & explain** — "is the cluster healthy?", "which shard is hottest?", "why did node 2 step
    down?", "are we reshuffling too often?", "show me orders per region". It calls the read tools,
    grounds itself in live state, and answers with tables/verdicts instead of prose guesses.
-2. **Operate, with a human in the loop** — "drain node 3 for maintenance", "move shard 7 to node 2",
+2. **Author & manage data — full CRUD** — tables ("create an `orders` table", "add a `status`
+   column", "drop the `tmp_import` table"), **reports** ("save this as a monthly-revenue report"),
+   and **dashboards** ("build an ops dashboard from the revenue and shard-health reports"). The model
+   writes the SQL/DDL or composes the tiles; the user confirms before anything is created, changed,
+   or dropped.
+3. **Operate, with a human in the loop** — "drain node 3 for maintenance", "move shard 7 to node 2",
    "vacuum the shards over 1 GB", "recover shard 5 from S3", "turn on S3 archival to this bucket". It
    *proposes* the exact API calls; the user confirms before anything mutates.
 
-Non-goal: autonomous operation. The assistant never mutates without an explicit human confirm (below).
+Non-goal: autonomous operation. The assistant never mutates, creates, or deletes without an explicit
+human confirm — and **every delete confirms**, destructive ones with a typed confirmation (below).
 
 ## Architecture
 
@@ -54,11 +60,14 @@ Non-goal: autonomous operation. The assistant never mutates without an explicit 
 
 ## Tools (mapped to the management surface, grouped by the console `Permission` that gates them)
 
-| Permission | Tools (→ endpoint) | Auto-run? |
+| Permission | Tools (→ endpoint / resource) | Auto-run? |
 |---|---|---|
 | **Observe** | `get_health`→`/v1/health`, `get_topology`, `get_shards`, `get_replication`, `get_stats`, `get_config`, `get_schema_agreement`, `get_s3_status`, `list_schema`→schema-catalog, `shard_inventory`, `get_fleet` | ✅ auto |
 | **Query** | `run_query(sql)` → `/v1/query_all` (read-only SQL) | ✅ auto |
 | **Write** | `run_write(sql)` → `/v1/run` | ⛔ confirm |
+| **Table CRUD** (DDL, Admin) | `create_table` / `alter_table` → durable schema-rollout op; `describe_table` → schema-catalog (read, auto); `drop_table` | ⛔ confirm · **drop = typed confirm** |
+| **Report CRUD** (author = Developer, read = Observe) | `list_reports` / `get_report` / `run_report` (read, auto); `create_report` / `update_report`; `delete_report` | create/update ⛔ confirm · **delete = confirm** |
+| **Dashboard CRUD** (author = Developer, read = Observe) | `list_dashboards` / `get_dashboard` (read, auto); `create_dashboard` / `update_dashboard` (add/remove/arrange tiles); `delete_dashboard` | create/update ⛔ confirm · **delete = confirm** |
 | **Operate** | `vacuum_shard(n)`, `checkpoint_shard(n)`, `cordon_node(bool)`, `prefer_shard(shard,prefer)`, `step_down`, `drain_node`, `recover_shard(n)`, `s3_snapshot`, `s3_flush`, `s3_configure(...)`, `s3_apply` | ⛔ confirm |
 | **Admin** | `declare_shard_key(table,col)`, mesh-user tools | ⛔ confirm |
 
@@ -87,6 +96,41 @@ So the model *plans and explains*; the human *authorises every change*. This als
 prompt-injection: even if untrusted data (a query result, a log line) coaxes the model into proposing
 something harmful, a human sees the concrete action and blast radius before it runs.
 
+## Managed resources: tables, reports, dashboards
+
+The assistant does full CRUD on three kinds of thing. Two are new console-server resources; one is
+meshdb schema. **Every delete confirms** (see below).
+
+- **Tables (meshdb schema).** `create_table` / `alter_table` / `drop_table` are DDL, so they do **not**
+  go through the raw `/v1/run` proxy — they route through the console's existing **durable
+  schema-rollout operation** (`/api/operations` preflight → submit → per-shard rollout with status),
+  the same path the Operations view uses, because a shard-count-wide DDL must be coordinated and
+  resumable, not fire-and-forget. `describe_table` reads the assembled schema catalog. The assistant
+  proposes the DDL; on confirm it opens an operation and reports progress. Adopting a table's primary
+  key as its shard key still happens automatically on `create_table` (no extra step).
+
+- **Reports (new console resource).** A *report* is a saved, named, shareable analytical query:
+  `{ id, name, description, connection, sql, params[], viz: table|bar|line|number, created_by, updated_at }`.
+  Persisted server-side in a `reports.json`-style registry (mirroring `registry.rs`; no secrets, so no
+  sealing), with `GET/POST/PUT/DELETE /api/reports[/…]` and role gating (author = Developer, read =
+  Observe). This promotes the workbench's current *localStorage* saved-queries into first-class,
+  shareable objects. Assistant tools: `list_reports`, `get_report`, `run_report(id, params)` (executes
+  its SQL through the read path), `create_report`, `update_report`, `delete_report`. So "make a report
+  of monthly revenue by region" → the model writes the SQL, previews it via `run_query`, and (on
+  confirm) saves a report.
+
+- **Dashboards (new console resource).** A *dashboard* is an arrangement of report tiles:
+  `{ id, name, description, tiles: [{ report_id, position, size, viz_override }], created_by, updated_at }`.
+  Persisted alongside reports, `GET/POST/PUT/DELETE /api/dashboards[/…]`, same gating. Tools:
+  `list_dashboards`, `get_dashboard`, `create_dashboard`, `update_dashboard` (add/remove/rearrange
+  tiles, referencing existing reports), `delete_dashboard`. So "build me an ops dashboard from the
+  revenue and shard-health reports" → the model composes tiles from existing reports and (on confirm)
+  saves the dashboard.
+
+Reports and dashboards are ordinary console features with their own UI (a Reports gallery + Dashboard
+canvas); the assistant is one way to author them, and the confirm/audit rules apply identically
+whether a change comes from the assistant or the UI.
+
 ## Grounding
 
 - **System prompt** carries meshdb's model so the assistant reasons correctly: shards are fixed at
@@ -114,7 +158,13 @@ model — no vendor lock-in. A self-hosted endpoint also keeps cluster data on-p
 
 - **No new authority.** Tools run through `crate::proxy`; `proxy_permission` and the meshdb `Requirement`
   check both still apply. The assistant can never exceed the user's role or the stored credential.
-- **Confirm every mutation.** Read auto-runs; write/operate/admin require an explicit human confirm.
+- **Confirm every mutation.** Read auto-runs; write/operate/admin/CRUD require an explicit human confirm.
+- **Delete always confirms — and destructive deletes are *typed* confirms.** `drop_table`,
+  `delete_report`, `delete_dashboard`, mesh-user removal, connection removal: every delete requires an
+  explicit confirm, and an irreversible/data-losing one (`drop_table`) requires the user to type the
+  object's name to proceed — the same bar as the manual UI's destructive actions. A delete tool is
+  never auto-run and never batched away behind another action; the confirm card names exactly what
+  disappears and whether it is recoverable.
 - **Audit with provenance.** Every executed tool is written to the append-only ledger as the signed-in
   user with a `via: assistant` marker and the model/prompt id — AI actions are *more* traceable, not less.
 - **Untrusted tool output.** Query results, logs, and node responses fed back to the model are treated
@@ -136,13 +186,18 @@ model — no vendor lock-in. A self-hosted endpoint also keeps cluster data on-p
 
 0. **AI settings** — sealed `base_url`/`model`/`api_key`, admin UI, a "test" round-trip. (registry +
    api + a small settings form.)
-1. **Read-only assistant** — observe + `run_query` tools, streaming answers, tool-call transparency.
-   Highest value, lowest risk: NL Q&A + SQL grounded in live state, *zero* mutation capability.
-2. **Operate with confirm** — write/operate/admin tools behind the proposed-action + confirm flow,
-   audited with `via: assistant`.
-3. **Diagnostics** — proactive summaries from the churn/health signals ("3 handovers in 5 min — node 2
-   is flapping; here's the evidence"), and a one-click "explain this alert".
-4. **Fleet awareness** — operate across connections from one chat; org-scoped guardrails.
+1. **Read-only assistant** — observe + `run_query` + `run_report` tools, streaming answers, tool-call
+   transparency. Highest value, lowest risk: NL Q&A + SQL grounded in live state, *zero* mutation.
+2. **Reports & dashboards resources** — the server-side `reports`/`dashboards` registries + REST API +
+   their own UI (gallery + canvas). A prerequisite for authoring; useful on its own, no AI required.
+3. **CRUD with confirm** — `create/update_table` (via the rollout op) and report/dashboard authoring
+   tools behind the proposed-action + confirm flow; **every delete a typed/plain confirm**; audited
+   with `via: assistant`.
+4. **Operate with confirm** — the cluster control tools (drain / step-down / cordon / prefer / vacuum /
+   checkpoint / recover / S3) behind the same confirm + audit flow.
+5. **Diagnostics** — proactive summaries from the churn/health signals ("3 handovers in 5 min — node 2
+   is flapping; here's the evidence"), a one-click "explain this alert", and "turn this into a report".
+6. **Fleet awareness** — operate across connections from one chat; org-scoped guardrails.
 
 ## Risks / non-goals
 
