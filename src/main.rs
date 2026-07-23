@@ -744,6 +744,8 @@ S3 replication for HA (requires the `s3` build feature):
   --s3-secret-key KEY    secret key (or the AWS_SECRET_ACCESS_KEY env var)
   --s3-prefix PREFIX     key prefix for this cluster's objects (default meshdb)
   --s3-snapshot-secs N   seconds between shard snapshots to S3 (default 60)
+  --s3-ready             capture frames but attach no target yet, so an operator can turn S3
+                         archival on later from the console (POST /v1/s3/config) without a restart
 
   Committed frames stream to S3 as a change-log; each shard is periodically
   snapshotted as a checkpointed base. A failover node opens the S3 replica when
@@ -893,22 +895,15 @@ fn serve_cmd(args: &[String]) -> ExitCode {
                 shard_count: shards,
                 ..meshdb::shard::ShardConfig::floor()
             };
-            // With an S3 sink, capture must be on so committed frames reach it.
+            // Capture must be on for any sink to receive frames. Turn it on when S3 is configured
+            // now, OR when --s3-ready pre-arms the node so an operator can attach S3 later from the
+            // console without a restart.
             #[cfg(feature = "s3")]
-            let opened = if let Some(sink) = &s3_sink {
-                cfg.capture = true;
-                meshdb::shard::ShardManager::open_with_sink(
-                    &dir,
-                    cfg,
-                    Some(std::sync::Arc::clone(sink)
-                        as std::sync::Arc<dyn meshdb::replication::FrameSink>),
-                )
-            } else {
-                meshdb::shard::ShardManager::open(&dir, cfg)
-            };
-            #[cfg(not(feature = "s3"))]
-            let opened = meshdb::shard::ShardManager::open(&dir, cfg);
-
+            {
+                cfg.capture = s3_sink.is_some() || has_flag(args, "--s3-ready");
+            }
+            // Open capture-ready; the sink (if any) is attached uniformly after the match below.
+            let opened = meshdb::shard::ShardManager::open_with_sink(&dir, cfg, None);
             let m = match opened {
                 Ok(m) => std::sync::Arc::new(m),
                 Err(e) => {
@@ -923,6 +918,27 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             (m, services, None)
         }
     };
+
+    // Attach a startup-configured S3 sink to the live writer fleet AND the runtime handle, for both
+    // standalone and clustered nodes, so committed frames archive to S3 and the status/snapshot
+    // endpoints see the sink. Requires capture-ready shards (standalone: via --s3-ready/--s3-bucket;
+    // cluster members capture by default).
+    #[cfg(feature = "s3")]
+    if let Some((sink, summary)) = &s3_sink {
+        if manager.capture_enabled() {
+            manager
+                .set_sink(Some(std::sync::Arc::clone(sink)
+                    as std::sync::Arc<dyn meshdb::replication::FrameSink>));
+            services
+                .s3
+                .attach(std::sync::Arc::clone(sink), summary.clone());
+        } else {
+            eprintln!(
+                "warning: --s3-* was given but this node's shards are not capture-ready; \
+                 archival is inactive"
+            );
+        }
+    }
 
     // Keep a handle for the S3 snapshot task before the manager moves into the server.
     #[cfg(feature = "s3")]
@@ -991,7 +1007,7 @@ fn serve_cmd(args: &[String]) -> ExitCode {
 
     // Periodically archive each shard to S3 so a failover node has a fresh base to open.
     #[cfg(feature = "s3")]
-    if let Some(sink) = &s3_sink {
+    if let Some((sink, _)) = &s3_sink {
         let secs = flag(args, "--s3-snapshot-secs")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(60);
@@ -1045,9 +1061,10 @@ fn parse_peers(s: &str) -> std::result::Result<std::collections::BTreeMap<u64, S
 /// `--s3-bucket` is absent. `--s3-endpoint` makes it work against any S3-compatible store (MinIO,
 /// Cloudflare R2, …), not just AWS; without it the AWS regional endpoint is derived.
 #[cfg(feature = "s3")]
-fn s3_archival(
-    args: &[String],
-) -> std::result::Result<Option<std::sync::Arc<meshdb::s3::S3Sink>>, String> {
+type S3Archival = (std::sync::Arc<meshdb::s3::S3Sink>, meshdb::s3::S3Summary);
+
+#[cfg(feature = "s3")]
+fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, String> {
     use std::sync::Arc;
     let Some(bucket) = flag(args, "--s3-bucket") else {
         return Ok(None);
@@ -1066,13 +1083,20 @@ fn s3_archival(
         .ok_or("S3 needs --s3-secret-key or AWS_SECRET_ACCESS_KEY")?;
     let prefix = flag(args, "--s3-prefix").unwrap_or("meshdb").to_string();
     let client = Arc::new(meshdb::s3::S3Client::new(meshdb::s3::S3Config {
-        endpoint,
+        endpoint: endpoint.clone(),
         bucket: bucket.to_string(),
-        region,
+        region: region.clone(),
         access_key,
         secret_key,
     }));
-    Ok(Some(Arc::new(meshdb::s3::S3Sink::new(client, prefix))))
+    let sink = Arc::new(meshdb::s3::S3Sink::new(client, prefix.clone()));
+    let summary = meshdb::s3::S3Summary {
+        bucket: bucket.to_string(),
+        endpoint,
+        region,
+        prefix,
+    };
+    Ok(Some((sink, summary)))
 }
 
 /// Periodically snapshot every shard to S3, so a failover node always has a recent base to open

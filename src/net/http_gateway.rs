@@ -201,6 +201,18 @@ impl HttpGateway {
             (Method::Post, "/v1/route") => {
                 return self.handle_route(req, role);
             }
+            (Method::Post, "/v1/s3/config") => {
+                return self.handle_s3_config(req, role);
+            }
+            (Method::Get, "/v1/s3/status") => {
+                return self.handle_s3_status(req, role);
+            }
+            (Method::Post, "/v1/s3/snapshot") => {
+                return self.handle_s3_snapshot(req, role);
+            }
+            (Method::Post, "/v1/s3/flush") => {
+                return self.handle_s3_flush(req, role);
+            }
             (Method::Get, "/v1/stats") => {
                 self.route(&req, role, Requirement::Read, || self.stats_json())
             }
@@ -606,6 +618,216 @@ impl HttpGateway {
             Ok(response_to_http(resp))
         });
         respond_json(req, out);
+    }
+
+    /// `POST /v1/s3/config` (Admin) — attach, reconfigure, or (with `enabled:false`) detach the S3
+    /// archival sink at runtime, so an operator turns replication on from the console without a
+    /// restart. Requires the node to be capture-ready; refuses loudly otherwise.
+    fn handle_s3_config(&self, mut req: Request, role: Option<Role>) {
+        let out = self.s3_config_inner(&mut req, role);
+        respond_json(req, out);
+    }
+
+    #[allow(unused_variables, unused_mut)]
+    fn s3_config_inner(
+        &self,
+        req: &mut Request,
+        role: Option<Role>,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        self.check(role, Requirement::Admin)?;
+        let body = read_body(req)?;
+        #[cfg(not(feature = "s3"))]
+        {
+            Err(HttpError::new(
+                501,
+                "this server was built without the s3 feature",
+            ))
+        }
+        #[cfg(feature = "s3")]
+        {
+            #[derive(serde::Deserialize)]
+            struct Body {
+                enabled: Option<bool>,
+                bucket: Option<String>,
+                endpoint: Option<String>,
+                region: Option<String>,
+                access_key: Option<String>,
+                secret_key: Option<String>,
+                prefix: Option<String>,
+            }
+            let b: Body = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            if !b.enabled.unwrap_or(true) {
+                self.shards.set_sink(None);
+                self.services.s3.detach();
+                return Ok((200, serde_json::json!({"ok": true, "configured": false})));
+            }
+            // Capture must already be on for a sink to receive anything; refuse rather than
+            // silently attach a sink that will never see a frame.
+            if !self.shards.capture_enabled() {
+                return Err(HttpError::new(
+                    409,
+                    "this node is not capture-ready: start it with --s3-ready (or --s3-bucket) so \
+                     committed frames are captured, then configure the S3 target",
+                ));
+            }
+            let bucket = b
+                .bucket
+                .ok_or_else(|| HttpError::new(400, "bucket is required"))?;
+            let region = b.region.unwrap_or_else(|| "us-east-1".into());
+            let endpoint = b
+                .endpoint
+                .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+            let access_key = b
+                .access_key
+                .ok_or_else(|| HttpError::new(400, "access_key is required"))?;
+            let secret_key = b
+                .secret_key
+                .ok_or_else(|| HttpError::new(400, "secret_key is required"))?;
+            let prefix = b.prefix.unwrap_or_else(|| "meshdb".into());
+            let client = std::sync::Arc::new(crate::s3::S3Client::new(crate::s3::S3Config {
+                endpoint: endpoint.clone(),
+                bucket: bucket.clone(),
+                region: region.clone(),
+                access_key,
+                secret_key,
+            }));
+            let sink = std::sync::Arc::new(crate::s3::S3Sink::new(client, prefix.clone()));
+            self.shards
+                .set_sink(Some(std::sync::Arc::clone(&sink)
+                    as std::sync::Arc<dyn crate::replication::FrameSink>));
+            self.services.s3.attach(
+                sink,
+                crate::s3::S3Summary {
+                    bucket,
+                    endpoint,
+                    region,
+                    prefix,
+                },
+            );
+            Ok((
+                200,
+                serde_json::json!({"ok": true, "configured": true, "summary": self.services.s3.summary()}),
+            ))
+        }
+    }
+
+    /// `GET /v1/s3/status` (Read) — whether the node is capture-ready and has a sink, where it
+    /// archives to, its health, and per-shard snapshot/change-log progress.
+    fn handle_s3_status(&self, req: Request, role: Option<Role>) {
+        let out = self.s3_status_inner(role);
+        respond_json(req, out);
+    }
+
+    fn s3_status_inner(
+        &self,
+        role: Option<Role>,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        self.check(role, Requirement::Read)?;
+        #[cfg(not(feature = "s3"))]
+        {
+            Ok((200, serde_json::json!({ "supported": false })))
+        }
+        #[cfg(feature = "s3")]
+        {
+            let (summary, status) = match self.services.s3.status() {
+                Some((s, st)) => (Some(s), Some(st)),
+                None => (None, None),
+            };
+            Ok((
+                200,
+                serde_json::json!({
+                    "supported": true,
+                    "capture_ready": self.shards.capture_enabled(),
+                    "configured": self.services.s3.configured(),
+                    "summary": summary,
+                    "health": status.as_ref().map(|s| s.healthy),
+                    "last_error": status.as_ref().and_then(|s| s.last_error.clone()),
+                    "shards": status.map(|s| s.shards),
+                }),
+            ))
+        }
+    }
+
+    /// `POST /v1/s3/snapshot` (Admin) — flush the change-log, then upload a fresh snapshot of every
+    /// shard this node owns, so a failover base is current on demand.
+    fn handle_s3_snapshot(&self, req: Request, role: Option<Role>) {
+        let out = self.s3_snapshot_inner(role);
+        respond_json(req, out);
+    }
+
+    fn s3_snapshot_inner(
+        &self,
+        role: Option<Role>,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        self.check(role, Requirement::Admin)?;
+        #[cfg(not(feature = "s3"))]
+        {
+            Err(HttpError::new(
+                501,
+                "this server was built without the s3 feature",
+            ))
+        }
+        #[cfg(feature = "s3")]
+        {
+            let sink = self
+                .services
+                .s3
+                .sink()
+                .ok_or_else(|| HttpError::new(409, "no S3 sink is configured on this node"))?;
+            sink.flush().map_err(|e| error_to_http(&e))?;
+            let mut snapshotted = 0u64;
+            let mut errors: Vec<String> = Vec::new();
+            for s in 0..self.shards.shard_count() {
+                let shard = crate::shard::ShardId(s);
+                let tmp = std::env::temp_dir().join(format!("meshdb-s3-http-snap-{s}.db"));
+                // A shard this node does not own can't be frozen; skip it rather than fail the call.
+                if let Ok((epoch, lsn)) = self.shards.snapshot(shard, &tmp) {
+                    match std::fs::read(&tmp) {
+                        Ok(bytes) => match sink.put_snapshot(shard, epoch, lsn, &bytes) {
+                            Ok(()) => snapshotted += 1,
+                            Err(e) => errors.push(format!("shard {s}: {e}")),
+                        },
+                        Err(e) => errors.push(format!("shard {s}: reading snapshot: {e}")),
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Ok((
+                200,
+                serde_json::json!({"ok": errors.is_empty(), "snapshotted": snapshotted, "errors": errors}),
+            ))
+        }
+    }
+
+    /// `POST /v1/s3/flush` (Admin) — block until the queued change-log uploads are durable in S3.
+    fn handle_s3_flush(&self, req: Request, role: Option<Role>) {
+        let out = self.s3_flush_inner(role);
+        respond_json(req, out);
+    }
+
+    fn s3_flush_inner(
+        &self,
+        role: Option<Role>,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        self.check(role, Requirement::Admin)?;
+        #[cfg(not(feature = "s3"))]
+        {
+            Err(HttpError::new(
+                501,
+                "this server was built without the s3 feature",
+            ))
+        }
+        #[cfg(feature = "s3")]
+        {
+            let sink = self
+                .services
+                .s3
+                .sink()
+                .ok_or_else(|| HttpError::new(409, "no S3 sink is configured on this node"))?;
+            sink.flush().map_err(|e| error_to_http(&e))?;
+            Ok((200, serde_json::json!({ "ok": true })))
+        }
     }
 
     fn handle_route(&self, mut req: Request, role: Option<Role>) {

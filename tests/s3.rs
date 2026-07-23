@@ -864,3 +864,116 @@ fn a_failover_refuses_a_change_log_with_a_gap() {
         "expected a gap refusal, got: {err}"
     );
 }
+
+// --- Phase B: runtime S3 archival endpoints (needs the http gateway too) ---
+
+#[cfg(feature = "http")]
+#[test]
+fn s3_archival_is_configurable_at_runtime_over_http() {
+    use meshdb::net::{HttpConfig, HttpGateway, NodeServices};
+    use meshdb::shard::{ShardConfig, ShardManager};
+    use meshdb::storage::exec::Statement;
+    use std::time::Duration;
+
+    // A capture-ready node with NO S3 target — exactly what `--s3-ready` gives.
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        ShardManager::open_with_sink(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                capture: true,
+                ..ShardConfig::floor()
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let gateway = Arc::new(
+        HttpGateway::bind(
+            Arc::clone(&manager),
+            NodeServices::default(),
+            HttpConfig {
+                addr: "127.0.0.1:0".into(),
+                workers: 2,
+                insecure: true,
+            },
+        )
+        .unwrap(),
+    );
+    let base = format!("http://{}", gateway.local_addr().unwrap());
+    let g = Arc::clone(&gateway);
+    std::thread::spawn(move || g.serve());
+    std::thread::sleep(Duration::from_millis(50));
+
+    let get = |p: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &ureq::get(&format!("{base}{p}"))
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let post = |p: &str, body: serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(
+            &ureq::post(&format!("{base}{p}"))
+                .send_string(&body.to_string())
+                .unwrap()
+                .into_string()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    // Before configuring: capture-ready but no sink.
+    let before = get("/v1/s3/status");
+    assert_eq!(before["capture_ready"], true);
+    assert_eq!(before["configured"], false);
+
+    // Turn archival on, pointed at a mock S3.
+    let endpoint = spawn_full_s3();
+    let cfg = post(
+        "/v1/s3/config",
+        serde_json::json!({
+            "bucket": "b", "endpoint": endpoint, "access_key": "a",
+            "secret_key": "s", "prefix": "rt",
+        }),
+    );
+    assert_eq!(cfg["configured"], true);
+
+    // Writes now archive through the runtime-attached sink.
+    manager
+        .execute_all_shards(Statement::new(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+        ))
+        .unwrap();
+    manager
+        .execute_one(
+            ShardId(0),
+            Statement::new("INSERT INTO t VALUES (1),(2),(3)"),
+        )
+        .unwrap();
+
+    // On-demand snapshot uploads every shard; status then shows per-shard progress.
+    let snap = post("/v1/s3/snapshot", serde_json::json!({}));
+    assert_eq!(snap["ok"], true, "snapshot errors: {}", snap["errors"]);
+    assert!(snap["snapshotted"].as_u64().unwrap() >= 1);
+
+    let status = get("/v1/s3/status");
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["health"], true);
+    let shards = status["shards"].as_array().unwrap();
+    assert!(
+        shards
+            .iter()
+            .any(|s| s["last_snapshot_lsn"].as_u64().unwrap() >= 1),
+        "a snapshot should have been recorded for at least one shard"
+    );
+
+    // Detach turns it back off.
+    let off = post("/v1/s3/config", serde_json::json!({ "enabled": false }));
+    assert_eq!(off["configured"], false);
+    assert_eq!(get("/v1/s3/status")["configured"], false);
+}

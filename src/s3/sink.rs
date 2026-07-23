@@ -12,6 +12,7 @@
 //! change-log is replayed over the most recent snapshot. Object keys sort by `(epoch, lsn)` so the
 //! newest snapshot and the ordered change-log are both trivially found.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -22,6 +23,31 @@ use crate::shard::ShardId;
 
 use super::{S3Client, S3Error};
 
+/// Per-shard archival progress, for the S3 status endpoint.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ShardArchive {
+    pub shard: u32,
+    /// The `(epoch, lsn)` of the most recent snapshot uploaded, and when (unix ms).
+    pub last_snapshot_epoch: u64,
+    pub last_snapshot_lsn: u64,
+    pub last_snapshot_ms: u64,
+    /// The highest LSN handed to the change-log uploader for this shard.
+    pub last_archived_lsn: u64,
+}
+
+/// A point-in-time view of a sink's health and per-shard archival progress.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct S3SinkStatus {
+    pub healthy: bool,
+    pub last_error: Option<String>,
+    pub shards: Vec<ShardArchive>,
+}
+
+#[derive(Default)]
+struct Progress {
+    shards: BTreeMap<u32, ShardArchive>,
+}
+
 /// Archives a shard's frames and snapshots to S3.
 pub struct S3Sink {
     tx: Sender<Job>,
@@ -30,6 +56,8 @@ pub struct S3Sink {
     /// Set once the background uploader gives up on a change-log object. `accept` then fails, so
     /// the writer stops rather than committing further data that never reached S3.
     failed: Arc<Mutex<Option<String>>>,
+    /// Per-shard snapshot/change-log progress, for `status()`.
+    progress: Mutex<Progress>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -56,7 +84,26 @@ impl S3Sink {
             client,
             prefix: prefix.into(),
             failed,
+            progress: Mutex::new(Progress::default()),
             worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    /// Health plus per-shard archival progress, for the S3 status endpoint.
+    pub fn status(&self) -> S3SinkStatus {
+        let last_error = self.failed.lock().unwrap().clone();
+        let shards = self
+            .progress
+            .lock()
+            .unwrap()
+            .shards
+            .values()
+            .cloned()
+            .collect();
+        S3SinkStatus {
+            healthy: last_error.is_none(),
+            last_error,
+            shards,
         }
     }
 
@@ -86,7 +133,14 @@ impl S3Sink {
         db: &[u8],
     ) -> crate::Result<()> {
         let key = self.snapshot_key(shard, epoch, lsn);
-        self.client.put(&key, db).map_err(to_err)
+        self.client.put(&key, db).map_err(to_err)?;
+        let mut p = self.progress.lock().unwrap();
+        let e = p.shards.entry(shard.0).or_default();
+        e.shard = shard.0;
+        e.last_snapshot_epoch = epoch;
+        e.last_snapshot_lsn = lsn;
+        e.last_snapshot_ms = unix_millis();
+        Ok(())
     }
 
     /// Block until every queued change-log upload has completed, then report health. Call before a
@@ -127,10 +181,17 @@ impl FrameSink for S3Sink {
             return Ok(());
         }
         let first = txns.first().unwrap().lsn;
+        let last = txns.last().unwrap().lsn;
         let bytes = encode_change_log(&txns)?;
         let key = self.wal_key(shard, epoch, first);
         // Enqueue for async upload — the commit is not blocked on S3.
         let _ = self.tx.send(Job::Upload { key, bytes });
+        {
+            let mut p = self.progress.lock().unwrap();
+            let e = p.shards.entry(shard.0).or_default();
+            e.shard = shard.0;
+            e.last_archived_lsn = last;
+        }
         // Surface a persistent *prior* failure so the writer stops before drifting further.
         self.health()
     }
@@ -175,6 +236,13 @@ fn put_with_retry(client: &S3Client, key: &str, bytes: &[u8]) -> std::result::Re
         }
     }
     Err(last.expect("at least one attempt failed"))
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn to_err(e: S3Error) -> crate::Error {

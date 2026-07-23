@@ -100,6 +100,10 @@ pub struct NodeServices {
     /// announced loudly at bind, because an unsecured database should be a decision, not a
     /// discovery.
     pub auth: Option<Arc<super::auth::AuthConfig>>,
+    /// The live S3 archival sink, attachable at runtime from the console. Holds the concrete sink
+    /// (the writer fleet only sees it type-erased) for status, on-demand snapshot, and flush.
+    #[cfg(feature = "s3")]
+    pub s3: Arc<crate::s3::S3Runtime>,
 }
 
 type Wrap = Arc<dyn Fn(TcpStream) -> Result<super::transport::Stream> + Send + Sync>;

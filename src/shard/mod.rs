@@ -578,6 +578,23 @@ impl ShardManager {
 
     /// The primary's stream epoch, if capture is on.
     /// How many shards this manager owns. Fixed at creation.
+    /// Attach, replace, or detach (`None`) the frame sink at runtime — e.g. an operator turning S3
+    /// archival on from the console. Requires the node to have been opened capture-ready
+    /// ([`Self::capture_enabled`]); with capture off there are no frames for a sink to receive.
+    pub fn set_sink(&self, sink: Option<std::sync::Arc<dyn crate::replication::FrameSink>>) {
+        self.writers.set_sink(sink);
+    }
+
+    /// Whether frame capture is on — the precondition for attaching a sink at runtime.
+    pub fn capture_enabled(&self) -> bool {
+        self.writers.capture_enabled()
+    }
+
+    /// Whether a frame sink is currently attached.
+    pub fn has_sink(&self) -> bool {
+        self.writers.has_sink()
+    }
+
     pub fn shard_count(&self) -> u32 {
         self.cfg.shard_count
     }

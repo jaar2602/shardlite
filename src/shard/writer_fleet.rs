@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use rusqlite::Connection;
@@ -145,6 +145,12 @@ impl WriterFleetStats {
     }
 }
 
+/// The active frame sink, shared by every writer thread and swappable at runtime. A batch reads it
+/// under a short read lock in [`drain_capture`]; [`WriterFleet::set_sink`] takes the write lock to
+/// attach/detach a sink (e.g. an operator turning S3 archival on from the console) without a
+/// restart. Capture must already be on for there to be frames to hand it.
+type SharedSink = Arc<RwLock<Option<Arc<dyn FrameSink>>>>;
+
 pub struct WriterFleet {
     senders: Vec<SyncSender<Job>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -152,6 +158,7 @@ pub struct WriterFleet {
     checkpoint_counters: Arc<CheckpointCounters>,
     cfg: ShardConfig,
     positions: Option<Arc<StreamPositions>>,
+    sink: SharedSink,
 }
 
 impl WriterFleet {
@@ -205,6 +212,8 @@ impl WriterFleet {
         let checkpoint_counters = Arc::new(CheckpointCounters::default());
         let mut senders = Vec::with_capacity(cfg.writer_threads);
         let mut threads = Vec::with_capacity(cfg.writer_threads);
+        // One shared, swappable sink for every writer thread, so it can be attached/detached later.
+        let sink: SharedSink = Arc::new(RwLock::new(sink));
 
         for i in 0..cfg.writer_threads {
             let (tx, rx) = sync_channel(cfg.write_queue_depth);
@@ -217,7 +226,7 @@ impl WriterFleet {
                 capture: cfg.capture,
                 max_retained_bytes: cfg.max_retained_bytes,
                 snapshot_hold_max_wal: cfg.snapshot_hold_max_wal,
-                sink: sink.clone(),
+                sink: Arc::clone(&sink),
                 acks: acks.clone(),
                 gate: gate.clone(),
                 modes: modes.clone(),
@@ -240,7 +249,25 @@ impl WriterFleet {
             checkpoint_counters,
             cfg,
             positions,
+            sink,
         })
+    }
+
+    /// Attach, replace, or detach (`None`) the frame sink at runtime. Takes effect on the next
+    /// batch drain on every writer thread. Only meaningful when capture is on; with capture off
+    /// there are no frames to hand a sink.
+    pub fn set_sink(&self, sink: Option<Arc<dyn FrameSink>>) {
+        *self.sink.write().expect("sink lock") = sink;
+    }
+
+    /// Whether frame capture is on — the precondition for a sink to receive anything.
+    pub fn capture_enabled(&self) -> bool {
+        self.cfg.capture
+    }
+
+    /// Whether a sink is currently attached.
+    pub fn has_sink(&self) -> bool {
+        self.sink.read().expect("sink lock").is_some()
     }
 
     fn sender(&self, shard: ShardId) -> Result<&SyncSender<Job>> {
@@ -484,7 +511,7 @@ struct ThreadCtx {
     capture: bool,
     max_retained_bytes: usize,
     snapshot_hold_max_wal: u64,
-    sink: Option<Arc<dyn FrameSink>>,
+    sink: SharedSink,
     /// Quorum confirmation. `None` on a standalone node, which must not wait for reports
     /// that will never come.
     acks: Option<Arc<crate::replication::AckTracker>>,
@@ -835,7 +862,9 @@ fn drain_capture(entry: &mut OpenShard, ctx: &ThreadCtx, shard: ShardId) -> Resu
         .collect();
 
     let count = positioned.len();
-    let result = match &ctx.sink {
+    // Read the current sink under a short lock, so an operator can attach/detach one at runtime.
+    let current = ctx.sink.read().expect("sink lock").clone();
+    let result = match &current {
         Some(sink) => sink.accept(shard, epoch, positioned.clone()),
         // Capture on with no sink: drop them, having proven they were captured. Only
         // sensible for measuring capture's cost, which is why `NullSink` is named as it is.

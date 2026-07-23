@@ -986,10 +986,13 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
     match (method, rest) {
         ("GET", ["info" | "meta" | "health" | "cluster" | "topology" | "shards" | "stats"])
         | ("GET", ["replication"])
+        | ("GET", ["s3", "status"])
         | ("GET", ["schema", _]) => Some(Permission::Observe),
         ("POST", ["query" | "query_all" | "route"]) => Some(Permission::Query),
         // /v1/run auto-routes and can write, so it needs write permission.
         ("POST", ["execute" | "tx" | "run"]) => Some(Permission::Write),
+        // S3 archival config/snapshot/flush are operator actions (meshdb also requires Admin).
+        ("POST", ["s3", "config" | "snapshot" | "flush"]) => Some(Permission::Operate),
         ("GET", ["frames", _]) => Some(Permission::Operate),
         ("GET" | "POST", ["users"]) | ("DELETE", ["users", _]) => Some(Permission::ManageMeshUsers),
         _ => None,
