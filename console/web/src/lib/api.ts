@@ -452,7 +452,78 @@ export function conn(name: string) {
     // Auto-routed: the server picks the shard(s) from the SQL, so no data key is needed. Used for
     // param-less writes; a write returns the affected count.
     run: (sql: string) => req<{ rows_affected: number; last_insert_rowid: number }>("POST", `${b}/run`, { sql }),
+
+    // --- management surface (Phases A–E) ---
+    replication: () => req<ReplicationStatus>("GET", `${b}/replication`),
+    config: () => req<NodeConfig>("GET", `${b}/config`),
+    schemaAgreement: () => req<SchemaAgreement>("GET", `${b}/schema/agreement`),
+    // S3 archival lifecycle. `config`/`snapshot`/`flush`/`status` proxy to the node; `apply` pushes
+    // this connection's stored (sealed) S3 config to every node without re-entering the secret.
+    s3: {
+      status: () => req<S3Status>("GET", `${b}/s3/status`),
+      config: (body: S3ConfigBody) => req<Record<string, unknown>>("POST", `${b}/s3/config`, body),
+      snapshot: () => req<{ ok: boolean; snapshotted: number; errors: string[] }>("POST", `${b}/s3/snapshot`, {}),
+      flush: () => req<{ ok: boolean }>("POST", `${b}/s3/flush`, {}),
+      apply: () => req<{ applied: string[]; failures: string[] }>("POST", `${b}/apply-s3`, {}),
+    },
+    // Shard maintenance.
+    vacuum: (shard: number) => req<{ ok: boolean }>("POST", `${b}/shards/${shard}/vacuum`, {}),
+    checkpoint: (shard: number) =>
+      req<{ ok: boolean; busy: number; log_pages: number; checkpointed: number }>(
+        "POST",
+        `${b}/shards/${shard}/checkpoint`,
+        {},
+      ),
+    // Declares the shard key on every node (per-node metadata).
+    shardkey: (table: string, column: string) =>
+      req<{ applied: string[]; failures: string[] }>("POST", `${b}/shardkey`, { table, column }),
+    // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
+    drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
   };
+}
+
+export interface ReplicationStatus {
+  api_version: number;
+  node: number | null;
+  replicated: boolean;
+  acks: { confirmed: number; timed_out: number; waited_us: number } | null;
+  shards: Array<Record<string, unknown>>;
+}
+
+export interface NodeConfig {
+  api_version: number;
+  node: number | null;
+  settings: Array<{ key: string; value: unknown; mutable: boolean; note: string }>;
+}
+
+export type SchemaAgreement =
+  | { status: "agreed"; version: number }
+  | { status: "disagreed"; lowest: number; highest: number; behind: number; ahead: number };
+
+export interface S3Status {
+  supported: boolean;
+  capture_ready?: boolean;
+  configured?: boolean;
+  summary?: { bucket: string; endpoint: string; region: string; prefix: string } | null;
+  health?: boolean | null;
+  last_error?: string | null;
+  shards?: Array<{
+    shard: number;
+    last_snapshot_epoch: number;
+    last_snapshot_lsn: number;
+    last_snapshot_ms: number;
+    last_archived_lsn: number;
+  }> | null;
+}
+
+export interface S3ConfigBody {
+  enabled?: boolean;
+  bucket?: string;
+  endpoint?: string;
+  region?: string;
+  access_key?: string;
+  secret_key?: string;
+  prefix?: string;
 }
 
 export interface QueryResult {
