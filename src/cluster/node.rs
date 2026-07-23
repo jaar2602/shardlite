@@ -147,6 +147,9 @@ pub struct ClusterNode {
     /// The leader's collected view of every member's preferred shards, gathered from the last
     /// heartbeat round: shard → the node that wants it. Fed into [`Placement::with_preferences`].
     preferences: Mutex<std::collections::BTreeMap<crate::shard::ShardId, NodeId>>,
+    /// Wired by the deployment layer: notified when this node takes over a shard, so it can recover
+    /// the shard's data (e.g. from S3) when it has none locally. `None` disables auto-recovery.
+    recovery: std::sync::OnceLock<Arc<dyn crate::shard::ShardRecovery>>,
 }
 
 impl ClusterNode {
@@ -182,7 +185,14 @@ impl ClusterNode {
             cordoned_members: Mutex::new(std::collections::BTreeSet::new()),
             preferred: Mutex::new(std::collections::BTreeSet::new()),
             preferences: Mutex::new(std::collections::BTreeMap::new()),
+            recovery: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach a recovery hook, notified when this node takes over a shard so it can rebuild the
+    /// shard's data from an archive (see [`crate::shard::ShardRecovery`]). Set once, after build.
+    pub fn set_recovery(&self, recovery: Arc<dyn crate::shard::ShardRecovery>) {
+        let _ = self.recovery.set(recovery);
     }
 
     /// Ask (or stop asking) for this node to host `shards` — an operator's desired-placement hint,
@@ -375,11 +385,21 @@ impl ClusterNode {
         };
 
         let mine = p.shards_for(self.id);
+        // Shards this node is newly taking over (owned now, not before) — the ones that may need
+        // their data recovered from an archive on failover.
+        let newly_mine: Vec<crate::shard::ShardId>;
         {
             let mut current = self.placement.lock().expect("placement mutex");
             if *current == *p {
                 return;
             }
+            let old_mine: std::collections::BTreeSet<crate::shard::ShardId> =
+                current.shards_for(self.id).into_iter().collect();
+            newly_mine = mine
+                .iter()
+                .copied()
+                .filter(|s| !old_mine.contains(s))
+                .collect();
             *current = p.clone();
         }
         // A real reshuffle: record it and when, so operators can see how often shards move.
@@ -433,6 +453,15 @@ impl ClusterNode {
                     }
                 }
                 self.fence.open_for(&mine, p.term)
+            }
+        }
+
+        // A shard newly ours may have no local data (its previous owner is gone). Notify the
+        // recovery hook so it can rebuild it from the archive; the hook returns promptly and does
+        // any download on its own thread, so this does not stall the placement path.
+        if let Some(recovery) = self.recovery.get() {
+            for &shard in &newly_mine {
+                recovery.on_take_ownership(shard);
             }
         }
     }

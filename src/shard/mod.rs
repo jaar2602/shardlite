@@ -349,6 +349,15 @@ impl ShardConfig {
 ///
 /// It is deliberately defined here rather than in `net`: `ShardManager` cannot depend on the
 /// networking layer (that would be a cycle), so the seam is a trait the net layer implements.
+/// Called when this node takes ownership of a shard (a placement handover / failover), so it can
+/// recover the shard's data from an archive when it has none locally. The cluster only knows to
+/// call it; the deployment layer wires an implementation (e.g. S3 recovery). Implementations must
+/// return promptly — do slow work (an S3 download) on their own thread — because this is called
+/// from the placement-apply path.
+pub trait ShardRecovery: Send + Sync {
+    fn on_take_ownership(&self, shard: ShardId);
+}
+
 pub trait PeerRouter: Send + Sync {
     /// Whether this node owns `shard` and should run it against its local file.
     fn is_local(&self, shard: ShardId) -> bool;

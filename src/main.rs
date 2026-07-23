@@ -940,6 +940,18 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         }
     }
 
+    // Auto-recover shards from S3 on failover: when placement hands this clustered node a shard it
+    // has no local data for, rebuild it from the archive on its own thread. Set unconditionally —
+    // the hook no-ops until S3 is configured (now or later via /v1/s3/config) and never touches a
+    // shard that already has a local file.
+    #[cfg(feature = "s3")]
+    if let Some(cluster) = &cluster {
+        cluster.set_recovery(std::sync::Arc::new(S3Recovery {
+            manager: std::sync::Arc::clone(&manager),
+            s3: std::sync::Arc::clone(&services.s3),
+        }));
+    }
+
     // Keep a handle for the S3 snapshot task before the manager moves into the server.
     #[cfg(feature = "s3")]
     let snap_manager = std::sync::Arc::clone(&manager);
@@ -1097,6 +1109,54 @@ fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, Strin
         prefix,
     };
     Ok(Some((sink, summary)))
+}
+
+/// Rebuilds a shard's data from S3 when placement hands this node a shard it has no local copy of
+/// (a failover). Wired onto the [`ClusterNode`](meshdb::cluster::ClusterNode) recovery hook; it
+/// returns promptly and downloads on its own thread so it never stalls the placement path. It only
+/// recovers a shard whose local file is **missing** — never overwriting local data — and treats
+/// "nothing archived" (a fresh cluster) as a no-op rather than an error.
+#[cfg(feature = "s3")]
+struct S3Recovery {
+    manager: std::sync::Arc<meshdb::shard::ShardManager>,
+    s3: std::sync::Arc<meshdb::s3::S3Runtime>,
+}
+
+#[cfg(feature = "s3")]
+impl meshdb::shard::ShardRecovery for S3Recovery {
+    fn on_take_ownership(&self, shard: meshdb::shard::ShardId) {
+        // A local file means this node already has (or is ahead on) this shard — never overwrite it.
+        if shard.path(self.manager.dir()).exists() {
+            return;
+        }
+        let Some((client, prefix)) = self.s3.recovery() else {
+            return; // S3 not configured on this node.
+        };
+        let manager = std::sync::Arc::clone(&self.manager);
+        let _ = std::thread::Builder::new()
+            .name(format!("meshdb-s3-recover-{}", shard.0))
+            .spawn(move || {
+                // Nothing archived for this shard (a fresh cluster) is not a failure.
+                match meshdb::s3::failover::latest_snapshot(&client, &prefix, shard) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::debug!(shard = shard.0, error = %e, "recovery: could not list snapshots");
+                        return;
+                    }
+                }
+                match manager.recover_shard_from_s3(shard, &client, &prefix) {
+                    Ok((epoch, lsn, pages)) => tracing::info!(
+                        shard = shard.0, epoch, snapshot_lsn = lsn, change_log_pages = pages,
+                        "auto-recovered shard from S3 on handover"
+                    ),
+                    Err(e) => tracing::warn!(
+                        shard = shard.0, error = %e,
+                        "auto-recovery from S3 failed; shard stays empty until placement retries or an operator recovers it"
+                    ),
+                }
+            });
+    }
 }
 
 /// Periodically snapshot every shard to S3, so a failover node always has a recent base to open

@@ -938,6 +938,79 @@ fn cordoning_a_node_drains_its_shards_but_keeps_it_voting() {
 }
 
 #[test]
+fn taking_over_a_shard_fires_the_recovery_hook() {
+    // On failover the node inheriting a shard must be told, so it can rebuild the shard's data from
+    // the archive (the S3 recovery impl is tested separately). This proves apply_placement notifies
+    // the recovery hook exactly for the shards a node newly takes over.
+    use std::sync::Mutex;
+    struct Recorder {
+        seen: Arc<Mutex<Vec<ShardId>>>,
+    }
+    impl meshdb::shard::ShardRecovery for Recorder {
+        fn on_take_ownership(&self, shard: ShardId) {
+            self.seen.lock().unwrap().push(shard);
+        }
+    }
+
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Attach recorders AFTER the initial placement, so we capture only the handover.
+    let recs: Vec<Arc<Mutex<Vec<ShardId>>>> = nodes
+        .iter()
+        .map(|n| {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            n.cluster.set_recovery(Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+            }));
+            seen
+        })
+        .collect();
+
+    let victim = nodes
+        .iter()
+        .find(|n| n.id != leader.id && !n.cluster.led_shards().is_empty())
+        .cloned();
+    let Some(victim) = victim else {
+        for n in &nodes {
+            n.stop();
+        }
+        return;
+    };
+    let orphaned = victim.cluster.led_shards();
+    victim.stop();
+
+    // Each orphaned shard is reassigned, and the NEW owner's recovery hook fired for it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut fired = false;
+    while Instant::now() < deadline && !fired {
+        fired = orphaned.iter().all(|s| {
+            let owner = leader.cluster.placement().owner(*s);
+            match owner {
+                Some(o) if o != victim.id => nodes
+                    .iter()
+                    .position(|n| n.id == o)
+                    .is_some_and(|i| recs[i].lock().unwrap().contains(s)),
+                _ => false,
+            }
+        });
+        if !fired {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        fired,
+        "the recovery hook did not fire for the taken-over shards {orphaned:?}"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
 fn a_preferred_shard_moves_to_the_node_that_wants_it() {
     // A desired-placement hint: an operator asks a specific node to host a specific shard, and the
     // coordinator honours it on the next round — the safe way to move one hot shard (cordon can
