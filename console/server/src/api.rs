@@ -1172,7 +1172,13 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 provider_cfg.base_url,
                 provider_cfg.api_key,
             );
-            let executor = ProxyExecutor { resolved };
+            let executor = AssistantExecutor {
+                resolved,
+                reports: Arc::clone(&state.reports),
+                dashboards: Arc::clone(&state.dashboards),
+                user: session.user.clone(),
+                connection: name.to_string(),
+            };
             let harness = Harness {
                 provider: &provider,
                 model: provider_cfg.model,
@@ -1521,34 +1527,139 @@ fn parse_tiles(v: &Value) -> Vec<crate::reports::Tile> {
         .unwrap_or_default()
 }
 
-/// Executes the assistant's read tools against a resolved connection, through the same proxy the UI
-/// uses — so a tool call is subject to the same meshdb-side authorization as a manual click.
-struct ProxyExecutor {
+/// Executes the assistant's tools: meshdb tools go through the same proxy the UI uses (so meshdb-side
+/// authorization still applies), and report/dashboard tools hit the console's own stores as the
+/// signed-in user.
+struct AssistantExecutor {
     resolved: crate::registry::Resolved,
+    reports: Arc<crate::reports::Reports>,
+    dashboards: Arc<crate::reports::Dashboards>,
+    user: String,
+    /// The connection being chatted about, used as the default for a new report.
+    connection: String,
 }
 
-impl crate::assistant::ToolExecutor for ProxyExecutor {
+impl AssistantExecutor {
+    fn create_report(&self, args: &Value) -> Result<Value, String> {
+        let name = args.get("name").and_then(Value::as_str).ok_or("name is required")?;
+        let sql = args.get("sql").and_then(Value::as_str).ok_or("sql is required")?;
+        let connection = args
+            .get("connection")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(self.connection.clone()));
+        self.reports
+            .create(
+                name,
+                args.get("description").and_then(Value::as_str).unwrap_or(""),
+                connection,
+                sql,
+                args.get("viz").and_then(Value::as_str).unwrap_or("table"),
+                &self.user,
+            )
+            .map(|r| json!(r))
+    }
+
+    fn update_report(&self, args: &Value) -> Result<Value, String> {
+        let id = args.get("id").and_then(Value::as_str).ok_or("id is required")?;
+        let cur = self.reports.get(id).ok_or("no such report")?;
+        let connection = if args.get("connection").is_some() {
+            args.get("connection").and_then(Value::as_str).map(str::to_string)
+        } else {
+            cur.connection.clone()
+        };
+        self.reports
+            .update(
+                id,
+                args.get("name").and_then(Value::as_str).unwrap_or(&cur.name),
+                args.get("description").and_then(Value::as_str).unwrap_or(&cur.description),
+                connection,
+                args.get("sql").and_then(Value::as_str).unwrap_or(&cur.sql),
+                args.get("viz").and_then(Value::as_str).unwrap_or(&cur.viz),
+            )
+            .map(|r| json!(r))
+    }
+
+    fn tiles_from(&self, args: &Value) -> Vec<crate::reports::Tile> {
+        args.get("report_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .enumerate()
+                    .map(|(i, id)| crate::reports::Tile {
+                        report_id: id.to_string(),
+                        x: (i % 2) as u32,
+                        y: (i / 2) as u32,
+                        w: 1,
+                        h: 1,
+                        viz: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl crate::assistant::ToolExecutor for AssistantExecutor {
     fn execute(&self, name: &str, args: &Value) -> Result<Value, String> {
+        // meshdb tools → proxy.
         if let Some(suffix) = crate::assistant::read_tool_endpoint(name) {
             return crate::proxy::fetch_json_result(&self.resolved, suffix).map(|(value, _)| value);
         }
-        if name == "run_query" {
-            let sql = args
-                .get("sql")
-                .and_then(Value::as_str)
-                .ok_or("run_query needs a 'sql' string argument")?;
-            return crate::proxy::post_json_result(&self.resolved, "query_all", &json!({ "sql": sql }));
+        match name {
+            "run_query" => {
+                let sql = args.get("sql").and_then(Value::as_str).ok_or("run_query needs 'sql'")?;
+                crate::proxy::post_json_result(&self.resolved, "query_all", &json!({ "sql": sql }))
+            }
+            "run_write" => {
+                // /v1/run handles CREATE/ALTER/DROP (DDL reaches every shard) and keyed writes.
+                let sql = args.get("sql").and_then(Value::as_str).ok_or("run_write needs 'sql'")?;
+                crate::proxy::post_json_result(&self.resolved, "run", &json!({ "sql": sql }))
+            }
+            // Console report/dashboard tools → the local stores, as this user.
+            "list_reports" => Ok(json!(self.reports.list())),
+            "create_report" => self.create_report(args),
+            "update_report" => self.update_report(args),
+            "delete_report" => {
+                let id = args.get("id").and_then(Value::as_str).ok_or("id is required")?;
+                self.reports.delete(id).map(|()| json!({ "ok": true, "id": id }))
+            }
+            "list_dashboards" => Ok(json!(self.dashboards.list())),
+            "create_dashboard" => {
+                let name = args.get("name").and_then(Value::as_str).ok_or("name is required")?;
+                self.dashboards
+                    .create(
+                        name,
+                        args.get("description").and_then(Value::as_str).unwrap_or(""),
+                        self.tiles_from(args),
+                        &self.user,
+                    )
+                    .map(|d| json!(d))
+            }
+            "update_dashboard" => {
+                let id = args.get("id").and_then(Value::as_str).ok_or("id is required")?;
+                let cur = self.dashboards.get(id).ok_or("no such dashboard")?;
+                let tiles = if args.get("report_ids").is_some() {
+                    self.tiles_from(args)
+                } else {
+                    cur.tiles.clone()
+                };
+                self.dashboards
+                    .update(
+                        id,
+                        args.get("name").and_then(Value::as_str).unwrap_or(&cur.name),
+                        args.get("description").and_then(Value::as_str).unwrap_or(&cur.description),
+                        tiles,
+                    )
+                    .map(|d| json!(d))
+            }
+            "delete_dashboard" => {
+                let id = args.get("id").and_then(Value::as_str).ok_or("id is required")?;
+                self.dashboards.delete(id).map(|()| json!({ "ok": true, "id": id }))
+            }
+            _ => Err(format!("unknown tool '{name}'")),
         }
-        if name == "run_write" {
-            // Auto-routed write / DDL. /v1/run handles CREATE/ALTER/DROP (DDL reaches every shard)
-            // and keyed INSERT/UPDATE/DELETE. Only reached after a human confirmed the action.
-            let sql = args
-                .get("sql")
-                .and_then(Value::as_str)
-                .ok_or("run_write needs a 'sql' string argument")?;
-            return crate::proxy::post_json_result(&self.resolved, "run", &json!({ "sql": sql }));
-        }
-        Err(format!("unknown tool '{name}'"))
     }
 }
 
