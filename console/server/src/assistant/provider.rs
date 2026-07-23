@@ -14,6 +14,12 @@ pub struct Message {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The chain-of-thought from a reasoning ("thinking mode") model. DeepSeek's deepseek-reasoner
+    /// returns this alongside tool calls and **requires it to be sent back** on the assistant message
+    /// that made those calls — omitting it fails the next request with "reasoning_content ... must be
+    /// passed back". Non-reasoning providers never set it, so it is skipped when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,6 +39,7 @@ impl Message {
         Self {
             role: role.to_string(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -43,6 +50,7 @@ impl Message {
         Self {
             role: "tool".into(),
             content: Some(content),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             name: Some(name.to_string()),
@@ -82,6 +90,9 @@ pub struct ToolSpec {
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub content: Option<String>,
+    /// Reasoning-model chain-of-thought, when the provider returns one. Preserved so the harness can
+    /// echo it back on the assistant message (see [`Message::reasoning_content`]).
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -173,6 +184,11 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let reasoning_content = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -185,6 +201,7 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, String> {
         .unwrap_or_default();
     Ok(Completion {
         content,
+        reasoning_content,
         tool_calls,
     })
 }

@@ -82,6 +82,7 @@ impl Harness<'_> {
         loop {
             let Completion {
                 content,
+                reasoning_content,
                 tool_calls,
             } = self.provider.chat(&self.model, &messages, &specs)?;
 
@@ -151,6 +152,9 @@ impl Harness<'_> {
             messages.push(Message {
                 role: "assistant".into(),
                 content: content.clone(),
+                // Reasoning models require their chain-of-thought to be echoed back on the message
+                // that carried the tool calls, or the next request is rejected.
+                reasoning_content: reasoning_content.clone(),
                 tool_calls: Some(handled),
                 tool_call_id: None,
                 name: None,
@@ -527,10 +531,12 @@ mod tests {
             steps: Mutex::new(vec![
                 Completion {
                     content: None,
+                    reasoning_content: None,
                     tool_calls: vec![tool_call("c1", "get_health", "{}")],
                 },
                 Completion {
                     content: Some("The cluster is healthy.".into()),
+                    reasoning_content: None,
                     tool_calls: vec![],
                 },
             ]),
@@ -561,6 +567,7 @@ mod tests {
             steps: Mutex::new(vec![
                 Completion {
                     content: None,
+                    reasoning_content: None,
                     tool_calls: vec![tool_call(
                         "w1",
                         "run_write",
@@ -569,6 +576,7 @@ mod tests {
                 },
                 Completion {
                     content: Some("Created table t.".into()),
+                    reasoning_content: None,
                     tool_calls: vec![],
                 },
             ]),
@@ -623,11 +631,66 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_content_is_echoed_back_on_the_tool_call_message() {
+        // A reasoning model (deepseek-reasoner) returns reasoning_content with its tool calls, and
+        // rejects the next request unless that reasoning_content is sent back on the assistant
+        // message. Capture what the harness sends on the second call and assert it round-trips.
+        struct Recorder {
+            steps: Mutex<Vec<Completion>>,
+            second_call_messages: Mutex<Vec<Message>>,
+        }
+        impl Provider for Recorder {
+            fn chat(&self, _m: &str, msgs: &[Message], _t: &[ToolSpec]) -> Result<Completion, String> {
+                let mut steps = self.steps.lock().unwrap();
+                // On the second provider call the tool-call assistant message is already in `msgs`.
+                if steps.len() == 1 {
+                    *self.second_call_messages.lock().unwrap() = msgs.to_vec();
+                }
+                Ok(steps.remove(0))
+            }
+        }
+        let provider = Recorder {
+            steps: Mutex::new(vec![
+                Completion {
+                    content: None,
+                    reasoning_content: Some("Let me check the health endpoint.".into()),
+                    tool_calls: vec![tool_call("c1", "get_health", "{}")],
+                },
+                Completion {
+                    content: Some("Healthy.".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                },
+            ]),
+            second_call_messages: Mutex::new(Vec::new()),
+        };
+        let harness = Harness {
+            provider: &provider,
+            model: "deepseek-reasoner".into(),
+            max_tool_calls: 8,
+            tools: tools_for(Role::Admin),
+            executor: &FakeExecutor,
+        };
+        harness.run(vec![Message::user("healthy?")]).unwrap();
+
+        let msgs = provider.second_call_messages.lock().unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+            .expect("the tool-call assistant message must be sent back");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("Let me check the health endpoint."),
+            "reasoning_content must be echoed back or the provider rejects the request"
+        );
+    }
+
+    #[test]
     fn the_tool_budget_bounds_the_loop() {
         // A provider that always asks for another tool must be stopped by the budget.
         let provider = ScriptedProvider {
             steps: Mutex::new(vec![
-                Completion { content: None, tool_calls: vec![tool_call("c1", "get_health", "{}")] };
+                Completion { content: None, reasoning_content: None, tool_calls: vec![tool_call("c1", "get_health", "{}")] };
                 10
             ]),
         };
