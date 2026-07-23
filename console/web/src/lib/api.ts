@@ -114,9 +114,19 @@ export interface AssistantToolTrace {
   ok: boolean;
   summary: string;
 }
+export interface AssistantPending {
+  id: string;
+  tool: string;
+  arguments: unknown;
+  summary: string;
+}
 export interface AssistantReply {
-  answer: string;
+  // Exactly one of `answer` (done) or `pending` (a change awaiting your confirmation) is set.
+  answer?: string;
   trace: AssistantToolTrace[];
+  pending?: AssistantPending;
+  // Opaque conversation state to pass back verbatim on confirm.
+  resume?: unknown;
 }
 
 export interface Report {
@@ -579,10 +589,13 @@ export function conn(name: string) {
       req<{ applied: string[]; failures: string[] }>("POST", `${b}/shardkey`, { table, column }),
     // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
     drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
-    // One turn of the AI assistant over this connection: send the conversation, get an answer + the
-    // tool calls it made. Read-only in this build.
+    // One turn of the AI assistant over this connection: send the conversation, get back either an
+    // answer or a `pending` change awaiting confirmation (with an opaque `resume`).
     assistant: (messages: AssistantMessage[]) =>
       req<AssistantReply>("POST", `${b}/assistant`, { messages }),
+    // Confirm a pending change: pass the pending action and the opaque resume back verbatim.
+    assistantConfirm: (action: AssistantPending, resume: unknown) =>
+      req<AssistantReply>("POST", `${b}/assistant`, { confirm: { action, resume } }),
   };
 }
 
