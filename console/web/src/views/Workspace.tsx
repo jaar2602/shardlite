@@ -7,6 +7,8 @@ import Cluster from "./Cluster";
 import Stats from "./Stats";
 import MeshUsers from "./MeshUsers";
 import Overview from "./Overview";
+import Replication from "./Replication";
+import Settings from "./Settings";
 import ShardInventory from "./ShardInventory";
 
 const SqlEditor = lazy(() => import("./SqlEditor"));
@@ -24,6 +26,8 @@ export default function Workspace({ name }: { name: string }) {
           <Route path="shard-inventory" element={<Navigate replace to={`/c/${encodeURIComponent(name)}/${api.permits(me?.role, "operate") ? "storage-internals" : "overview"}`} />} />
           <Route path="query" element={<SqlEditor name={name} />} />
           <Route path="schema" element={<Schema name={name} />} />
+          <Route path="replication" element={<Replication name={name} />} />
+          <Route path="settings" element={<Settings name={name} />} />
           {api.permits(me?.role, "write") && <Route path="operations" element={<Operations name={name} />} />}
           <Route path="cluster" element={<Cluster name={name} />} />
           {api.permits(me?.role, "operate") && <Route path="storage-internals" element={<ShardInventory name={name} />} />}

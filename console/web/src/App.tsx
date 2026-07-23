@@ -15,9 +15,11 @@ const WORKSPACE_LINKS: { path: string; label: string; short: string; permission:
   { path: "cluster", label: "Topology", short: "◇", permission: "observe" },
   { path: "query", label: "SQL editor", short: ">_", permission: "query" },
   { path: "schema", label: "Schema", short: "▤", permission: "observe" },
+  { path: "replication", label: "Replication", short: "⇄", permission: "observe" },
   { path: "operations", label: "Operations", short: "↻", permission: "write" },
   { path: "storage-internals", label: "Storage internals", short: "≋", permission: "operate" },
   { path: "stats", label: "Stats", short: "⌁", permission: "observe" },
+  { path: "settings", label: "Settings", short: "⚙", permission: "observe" },
   { path: "users", label: "meshdb users", short: "◎", permission: "admin" },
 ];
 

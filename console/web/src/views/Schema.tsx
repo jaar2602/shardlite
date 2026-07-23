@@ -4,6 +4,7 @@ import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, Tag, TextIn
 
 export default function Schema({ name }: { name: string }) {
   const [catalog, setCatalog] = useState<api.SchemaCatalog | null>(null);
+  const [agreement, setAgreement] = useState<api.SchemaAgreement | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -13,8 +14,12 @@ export default function Schema({ name }: { name: string }) {
     setBusy(true);
     setError(null);
     try {
-      const next = await api.conn(name).schemaCatalog();
+      const [next, agree] = await Promise.all([
+        api.conn(name).schemaCatalog(),
+        api.conn(name).schemaAgreement().catch(() => null),
+      ]);
       setCatalog(next);
+      setAgreement(agree);
       setSelected((current) => current && next.tables.some((table) => table.name === current)
         ? current
         : next.tables[0]?.name ?? null);
@@ -46,6 +51,7 @@ export default function Schema({ name }: { name: string }) {
       <div className="min-w-64 flex-1 max-w-md"><TextInput label="Find a schema object" placeholder="Table, index, trigger…" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
       {catalog?.schema_version != null && <Tag tone="blue">schema version {catalog.schema_version}</Tag>}
       {catalog && <Tag tone={catalog.consistency.status === "consistent" ? "green" : catalog.consistency.status === "drifted" ? "yellow" : "gray"}>{catalog.consistency.status}</Tag>}
+      {agreement && <Tag tone={agreement.status === "agreed" ? "green" : "red"}>{agreement.status === "agreed" ? `agreed · v${agreement.version}` : `disagreed · ${agreement.behind} behind`}</Tag>}
     </div>
 
     {busy && !catalog && <Spinner label="Reading the database schema…" />}

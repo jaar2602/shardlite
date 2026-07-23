@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import TopologyMap, { STATUS_STYLES, TopologyNode } from "../components/TopologyMap";
 import { Banner, Button, Spinner, Tag } from "../components/ui";
@@ -97,10 +98,14 @@ function valueOrDash(value: unknown): string {
 }
 
 export default function Cluster({ name }: { name: string }) {
+  const { me } = useAuth();
+  const canOperate = api.permits(me?.role, "operate");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [draining, setDraining] = useState(false);
+  const [drainMessage, setDrainMessage] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef<{ id: number; name: string } | null>(null);
 
@@ -149,6 +154,21 @@ export default function Cluster({ name }: { name: string }) {
       if (inFlight.current?.name === name) inFlight.current = null;
     };
   }, [load]);
+
+  const drain = async () => {
+    if (!confirm("Drain this node? It is removed from the cluster until restart and its shards move to survivors.")) return;
+    setDraining(true);
+    setDrainMessage(null);
+    try {
+      const result = await api.conn(name).drain();
+      setDrainMessage(`Drain requested${result.was_leader ? " (was leader; handover initiated)" : ""}.`);
+      void load();
+    } catch (e) {
+      setDrainMessage(e instanceof Error ? e.message : "drain failed");
+    } finally {
+      setDraining(false);
+    }
+  };
 
   const nodes = useMemo(() => (snapshot ? topologyNodes(snapshot) : []), [snapshot]);
   const activeId =
@@ -375,6 +395,15 @@ export default function Cluster({ name }: { name: string }) {
                       <DetailRow label="step-downs" value={valueOrDash(observerStats.stepped_down)} />
                       <DetailRow label="unreachable peers" value={valueOrDash(observerStats.peer_unreachable)} />
                       <DetailRow label="handover failures" value={valueOrDash(observerStats.handover_failed)} />
+                    </>
+                  )}
+
+                  {canOperate && selected.isCurrent && (
+                    <>
+                      <div className="my-3 border-t border-carbon-border" />
+                      <div className="mb-2 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">Node maintenance</div>
+                      <Button variant="danger" disabled={draining} onClick={() => void drain()}>{draining ? "Draining…" : "Drain node"}</Button>
+                      {drainMessage && <p className="mt-2 text-xs leading-5 text-carbon-text-2">{drainMessage}</p>}
                     </>
                   )}
                 </>

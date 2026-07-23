@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
 
 export default function ShardInventory({ name }: { name: string }) {
+  const { me } = useAuth();
+  const canOperate = api.permits(me?.role, "operate");
   const [inventory, setInventory] = useState<api.ShardInventory | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [wal, setWal] = useState<Record<string, unknown> | null>(null);
   const [walBusy, setWalBusy] = useState(false);
+  const [maintenance, setMaintenance] = useState<string | null>(null);
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
@@ -47,6 +52,16 @@ export default function ShardInventory({ name }: { name: string }) {
     finally { setWalBusy(false); }
   };
 
+  const maintain = async (label: string, action: () => Promise<unknown>, confirmMessage?: string) => {
+    if (confirmMessage && !confirm(confirmMessage)) return;
+    setMaintenanceBusy(true);
+    setError(null);
+    setMaintenance(null);
+    try { setMaintenance(`${label}: ${JSON.stringify(await action())}`); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : `${label} failed.`); }
+    finally { setMaintenanceBusy(false); }
+  };
+
   if (!inventory) return <div className="p-6">{error ? <Banner tone="error">{error}</Banner> : <Spinner label="Loading storage diagnostics…" />}</div>;
   return <Page>
     <PageHeader eyebrow="Diagnostics / storage internals" title="Storage internals" description="Operator-only placement and replication evidence. Normal database work never requires selecting a storage unit." actions={<><span className="font-mono text-xs text-carbon-text-3">updates every 5s</span><Button variant="secondary" onClick={() => void load()}>Refresh now</Button></>} />
@@ -67,7 +82,7 @@ export default function ShardInventory({ name }: { name: string }) {
             <div className="relative overflow-y-auto" style={{ height: viewport }} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
               {filtered.length === 0 && <div className="absolute inset-0 grid place-items-center text-sm text-carbon-text-3">No storage units match “{filter}”.</div>}
               <div style={{ height: filtered.length * rowHeight, position: "relative" }}>
-                {visible.map((row, index) => <button key={row.id} onClick={() => { setSelectedId(row.id); setWal(null); }} className={`absolute left-0 right-0 grid grid-cols-[80px_1fr_90px_110px_1.2fr_90px_110px] items-center border-t border-carbon-border px-3 text-left font-mono text-carbon-text hover:bg-carbon-layer2/60 ${selectedId === row.id ? "bg-carbon-layer2" : ""}`} style={{ top: (start + index) * rowHeight, height: rowHeight }}>
+                {visible.map((row, index) => <button key={row.id} onClick={() => { setSelectedId(row.id); setWal(null); setMaintenance(null); }} className={`absolute left-0 right-0 grid grid-cols-[80px_1fr_90px_110px_1.2fr_90px_110px] items-center border-t border-carbon-border px-3 text-left font-mono text-carbon-text hover:bg-carbon-layer2/60 ${selectedId === row.id ? "bg-carbon-layer2" : ""}`} style={{ top: (start + index) * rowHeight, height: rowHeight }}>
                   <span>{row.id}</span><span>{row.owner ?? row.primary_node ?? "unknown"}</span><span>{row.epoch}</span><span>{row.primary_lsn}</span>
                   <span className="truncate" title={row.replicas.map((replica) => `${replica.node}: e${replica.epoch}/lsn${replica.lsn}`).join(", ")}>{row.replicas.length ? row.replicas.map((replica) => `${replica.node}:${replica.lsn}`).join(", ") : "none observed"}</span>
                   <span>{row.max_lag ?? "—"}</span><span><Tag tone={row.state === "available" ? "green" : row.state === "unavailable" || row.state === "conflict" ? "red" : "yellow"}>{row.state}</Tag></span>
@@ -84,6 +99,14 @@ export default function ShardInventory({ name }: { name: string }) {
           <Diagnostic label="Evidence sources" value={selected.evidence} />
           <Button variant="secondary" disabled={walBusy} onClick={() => void inspectWal()}>{walBusy ? "Reading WAL…" : "Inspect WAL"}</Button>
           {wal && <pre className="max-h-80 overflow-auto border-t border-carbon-border pt-3 font-mono text-[11px] leading-5 text-carbon-text-2">{JSON.stringify(wal, null, 2)}</pre>}
+          {canOperate && <div className="space-y-2 border-t border-carbon-border pt-3">
+            <div className="text-[10px] uppercase tracking-wider text-carbon-text-3">Maintenance</div>
+            <div className="flex gap-2">
+              <Button variant="secondary" disabled={maintenanceBusy} onClick={() => void maintain("Vacuum", () => api.conn(name).vacuum(selected.id), `Vacuum storage unit ${selected.id}?`)}>Vacuum</Button>
+              <Button variant="secondary" disabled={maintenanceBusy} onClick={() => void maintain("Checkpoint", () => api.conn(name).checkpoint(selected.id))}>Checkpoint</Button>
+            </div>
+            {maintenance && <pre className="max-h-40 overflow-auto font-mono text-[11px] leading-5 text-carbon-text-2">{maintenance}</pre>}
+          </div>}
         </div>}
       </Card>
     </div>
