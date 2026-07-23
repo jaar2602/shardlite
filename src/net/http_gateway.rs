@@ -219,6 +219,9 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/drain") => {
                 return self.handle_drain(req, role);
             }
+            (Method::Post, "/v1/cluster/cordon") => {
+                return self.handle_cordon(req, role);
+            }
             (Method::Post, "/v1/shardkey") => {
                 return self.handle_shardkey(req, role);
             }
@@ -843,6 +846,37 @@ impl HttpGateway {
         }
     }
 
+    /// `POST /v1/cluster/cordon` (Admin) — `{cordoned: bool}`. Cordon this node (drains its shards
+    /// to other members but keeps it voting) or un-cordon it. The safe way to move load off a
+    /// healthy node: purely subtractive, so it cannot create a second writer. 409 on a standalone
+    /// node.
+    fn handle_cordon(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let body = read_body(&mut req)?;
+            #[derive(serde::Deserialize)]
+            struct Body {
+                cordoned: bool,
+            }
+            let b: Body = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            match self.services.cluster.as_ref() {
+                Some(cluster) => {
+                    cluster.set_cordoned(b.cordoned);
+                    Ok((
+                        200,
+                        serde_json::json!({"ok": true, "node": cluster.id(), "cordoned": b.cordoned}),
+                    ))
+                }
+                None => Err(HttpError::new(
+                    409,
+                    "this is a standalone node, not a cluster member; nothing to cordon",
+                )),
+            }
+        })();
+        respond_json(req, out);
+    }
+
     /// `POST /v1/cluster/drain` (Admin) — this node gracefully leaves the cluster: it stops
     /// counting toward quorum and stops leading, so the remaining members re-derive placement and
     /// its shards move to them. Intended for maintenance / rolling restarts; the node rejoins on
@@ -1239,6 +1273,18 @@ impl HttpGateway {
                 "failed_opens": wc.failed_opens,
                 "max_wait_ms": wc.max_wait_ms,
             },
+            // The cluster churn counters, mirrored into /v1/stats so the console's metrics history
+            // (which samples /v1/stats) can trend them and warn when reshuffling gets too frequent.
+            "cluster": self.services.cluster.as_ref().map(|c| {
+                let s = c.stats();
+                serde_json::json!({
+                    "elections_started": s.elections_started,
+                    "stepped_down": s.stepped_down,
+                    "placement_changes": s.placement_changes,
+                    "handover_failed": s.handover_failed,
+                    "last_change_ms": s.last_change_ms,
+                })
+            }),
         })
     }
 
@@ -1257,6 +1303,8 @@ impl HttpGateway {
                 let s = c.stats();
                 let leader_view = c.is_leader();
                 let live: std::collections::BTreeSet<_> = c.live_members().into_iter().collect();
+                let cordoned: std::collections::BTreeSet<_> =
+                    c.cordoned_members().into_iter().collect();
                 let peers = c.peers();
                 let mut members = Vec::with_capacity(peers.len() + 1);
                 members.push(serde_json::json!({
@@ -1264,6 +1312,7 @@ impl HttpGateway {
                     "address": null,
                     "this_node": true,
                     "status": "up",
+                    "cordoned": c.is_cordoned(),
                 }));
                 members.extend(peers.iter().map(|(node, address)| {
                     let status = if leader_view {
@@ -1280,6 +1329,8 @@ impl HttpGateway {
                         "address": address,
                         "this_node": false,
                         "status": status,
+                        // Only the leader observes peers' cordon state; others report false.
+                        "cordoned": cordoned.contains(node),
                     })
                 }));
                 serde_json::json!({

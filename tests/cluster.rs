@@ -877,6 +877,67 @@ fn losing_a_node_reassigns_its_shards() {
 }
 
 #[test]
+fn cordoning_a_node_drains_its_shards_but_keeps_it_voting() {
+    // The safe way to move load off a healthy node: it keeps answering heartbeats (still a voter,
+    // quorum unchanged) but the coordinator assigns it no shards, so its shards drain away via the
+    // ordinary placement handover. Purely subtractive — it can never create a second writer.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let victim = nodes
+        .iter()
+        .find(|n| n.id != leader.id && !n.cluster.led_shards().is_empty())
+        .cloned();
+    let Some(victim) = victim else {
+        for n in &nodes {
+            n.stop();
+        }
+        return;
+    };
+    victim.cluster.set_cordoned(true);
+
+    // Its shards leave, but it stays in the leader's live set (still voting).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut drained = false;
+    while Instant::now() < deadline && !drained {
+        let p = leader.cluster.placement();
+        drained = p.assignments.values().all(|&o| o != victim.id)
+            && leader.cluster.live_members().contains(&victim.id);
+        if !drained {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        drained,
+        "cordoned node still owns shards or dropped out of the cluster: {:?}",
+        leader.cluster.placement()
+    );
+
+    // Un-cordoning lets shards return.
+    victim.cluster.set_cordoned(false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut refilled = false;
+    while Instant::now() < deadline && !refilled {
+        refilled = leader
+            .cluster
+            .placement()
+            .assignments
+            .values()
+            .any(|&o| o == victim.id);
+        if !refilled {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(refilled, "un-cordoned node was never re-assigned shards");
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
 fn ddl_reaches_every_shard_from_any_node() {
     // The piece that makes multi-write usable. No node holds every shard, so a schema change
     // has to reach each shard's owner. This replaces

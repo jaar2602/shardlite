@@ -133,6 +133,14 @@ pub struct ClusterNode {
     peer_timeout: Duration,
     counters: Counters,
     stop: AtomicBool,
+    /// Set by an operator to drain shards off this node WITHOUT removing it: it keeps voting
+    /// (counts for quorum) but the leader assigns it no shards, so its shards move away via the
+    /// ordinary fenced handover. The safe way to rebalance a healthy node — purely subtractive,
+    /// so it cannot create a second writer. Advertised to the leader in each [`HeartbeatReply`].
+    cordoned: AtomicBool,
+    /// Members that reported themselves cordoned in the last heartbeat round; excluded from
+    /// shard assignment (see [`Self::plan`]) but not from quorum.
+    cordoned_members: Mutex<std::collections::BTreeSet<NodeId>>,
 }
 
 impl ClusterNode {
@@ -164,7 +172,31 @@ impl ClusterNode {
             peer_timeout,
             counters: Counters::default(),
             stop: AtomicBool::new(false),
+            cordoned: AtomicBool::new(false),
+            cordoned_members: Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Cordon (`true`) or un-cordon (`false`) this node: while cordoned it keeps voting but is
+    /// assigned no shards, so its shards drain to other members on the next placement round. Safe
+    /// to toggle at any time — it only ever removes this node from *assignment*, never adds a
+    /// conflicting one.
+    pub fn set_cordoned(&self, cordoned: bool) {
+        self.cordoned.store(cordoned, Ordering::Relaxed);
+    }
+
+    pub fn is_cordoned(&self) -> bool {
+        self.cordoned.load(Ordering::Relaxed)
+    }
+
+    /// Members the leader saw report themselves cordoned in the last round (leader's view).
+    pub fn cordoned_members(&self) -> Vec<NodeId> {
+        self.cordoned_members
+            .lock()
+            .expect("cordoned mutex")
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Attach the handover that placement changes drive.
@@ -365,6 +397,28 @@ impl ClusterNode {
         // Always include self: a coordinator is by definition reachable from itself, and a
         // leader that excluded itself would assign away every shard on the first round.
         members.push(self.id);
+
+        // Drop cordoned members from *assignment* only — they still voted (they are in `live`),
+        // so quorum is unchanged; they simply receive no shards, which drains them. If everyone
+        // is cordoned, ignore the cordons rather than leave every shard unowned — an unassigned
+        // shard has no leader at all, which is strictly worse than honouring a cordon.
+        let cordoned = self
+            .cordoned_members
+            .lock()
+            .expect("cordoned mutex")
+            .clone();
+        let self_cordoned = self.is_cordoned();
+        let eligible: Vec<NodeId> = members
+            .iter()
+            .copied()
+            .filter(|n| !cordoned.contains(n) && !(self_cordoned && *n == self.id))
+            .collect();
+        let members = if eligible.is_empty() {
+            members
+        } else {
+            eligible
+        };
+
         Placement::balanced(self.shards.len() as u32, &members, term)
     }
 
@@ -477,6 +531,7 @@ impl ClusterNode {
         };
 
         let mut answered = std::collections::BTreeSet::new();
+        let mut cordoned = std::collections::BTreeSet::new();
         for (&peer, addr) in &self.peers {
             self.counters
                 .heartbeats_sent
@@ -485,6 +540,9 @@ impl ClusterNode {
             let Some(reply) = reply else { continue };
             if reply.ok {
                 answered.insert(peer);
+            }
+            if reply.cordoned {
+                cordoned.insert(peer);
             }
 
             let action = {
@@ -498,6 +556,7 @@ impl ClusterNode {
             }
         }
         *self.live.lock().expect("live mutex") = answered;
+        *self.cordoned_members.lock().expect("cordoned mutex") = cordoned;
         Ok(())
     }
 
@@ -599,12 +658,14 @@ impl ClusterNode {
             self.apply_placement(&hb.placement);
         }
 
-        let (reply, deposed) = {
+        let (mut reply, deposed) = {
             let mut e = self.election.lock().expect("election mutex");
             let was_leader = e.is_leader();
             let reply = e.on_heartbeat(hb, Instant::now())?;
             (reply, was_leader && !e.is_leader())
         };
+        // Tell the coordinator whether we are cordoned, so it drains our shards away.
+        reply.cordoned = self.is_cordoned();
         if deposed {
             let durability = self.durability.durability();
             self.perform(

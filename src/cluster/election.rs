@@ -122,6 +122,11 @@ pub struct HeartbeatReply {
     pub term: Term,
     /// False when the sender is stale — it has been deposed and does not know yet.
     pub ok: bool,
+    /// The replier has been cordoned by an operator: keep counting it for quorum, but do not
+    /// assign it new shards. Set by [`super::node::ClusterNode::handle_heartbeat`] (the election
+    /// itself has no view of node-level operator state). Defaults false for older peers.
+    #[serde(default)]
+    pub cordoned: bool,
 }
 
 /// What the caller must do as a result of a state change. Returned rather than performed, so
@@ -384,6 +389,7 @@ impl Election {
             return Ok(HeartbeatReply {
                 term: current,
                 ok: false,
+                cordoned: false,
             });
         }
 
@@ -403,6 +409,7 @@ impl Election {
         Ok(HeartbeatReply {
             term: self.terms.term(),
             ok: true,
+            cordoned: false,
         })
     }
 
@@ -756,7 +763,11 @@ mod tests {
         )
         .unwrap();
 
-        let ok = HeartbeatReply { term: 1, ok: true };
+        let ok = HeartbeatReply {
+            term: 1,
+            ok: true,
+            cordoned: false,
+        };
         let mut t = t0;
         for _ in 0..30 {
             t += Duration::from_millis(200);
