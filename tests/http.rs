@@ -600,6 +600,24 @@ fn phase_e_config_reports_settings_and_mutability() {
 }
 
 #[test]
+fn phase_d_cluster_controls_refused_on_a_standalone_node() {
+    // cordon and step-down, like drain, have nothing to act on without a cluster: 409, not a no-op.
+    let g = gateway(None, false);
+    for (path, body) in [
+        ("/v1/cluster/cordon", "{\"cordoned\":true}"),
+        ("/v1/cluster/step-down", ""),
+    ] {
+        let err = ureq::post(&format!("{}{path}", g.base))
+            .send_string(body)
+            .unwrap_err();
+        match err {
+            ureq::Error::Status(409, _) => {}
+            other => panic!("expected 409 for {path} on a standalone node, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn phase_d_drain_refused_on_a_standalone_node() {
     // A standalone node is not a cluster member, so there is nothing to drain: 409, not a silent
     // no-op. (The clustered drain path exercises ClusterNode::stop, covered by the cluster tests.)

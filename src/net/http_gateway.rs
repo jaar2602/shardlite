@@ -222,6 +222,9 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/cordon") => {
                 return self.handle_cordon(req, role);
             }
+            (Method::Post, "/v1/cluster/step-down") => {
+                return self.handle_step_down(req, role);
+            }
             (Method::Post, "/v1/shardkey") => {
                 return self.handle_shardkey(req, role);
             }
@@ -844,6 +847,29 @@ impl HttpGateway {
             sink.flush().map_err(|e| error_to_http(&e))?;
             Ok((200, serde_json::json!({ "ok": true })))
         }
+    }
+
+    /// `POST /v1/cluster/step-down` (Admin) — if this node is the leader, it voluntarily gives up
+    /// leadership so a peer takes over, while staying in the cluster with its shards (unlike drain,
+    /// which removes it). Reports whether it was the leader. 409 on a standalone node.
+    fn handle_step_down(&self, req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            match self.services.cluster.as_ref() {
+                Some(cluster) => {
+                    let stepped = cluster.request_step_down().map_err(|e| error_to_http(&e))?;
+                    Ok((
+                        200,
+                        serde_json::json!({"ok": true, "node": cluster.id(), "stepped_down": stepped}),
+                    ))
+                }
+                None => Err(HttpError::new(
+                    409,
+                    "this is a standalone node, not a cluster member; there is no leadership to give up",
+                )),
+            }
+        })();
+        respond_json(req, out);
     }
 
     /// `POST /v1/cluster/cordon` (Admin) — `{cordoned: bool}`. Cordon this node (drains its shards

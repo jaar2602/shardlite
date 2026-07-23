@@ -158,6 +158,11 @@ pub struct Election {
     /// Peers that have acknowledged this node's leadership since `lease_start`.
     acks: BTreeSet<NodeId>,
     lease_start: Instant,
+    /// After a voluntary step-down, don't campaign until this instant — so a peer's election
+    /// timer fires first and takes leadership, instead of this node immediately re-winning. Safe:
+    /// it only *delays* this node, and if no peer steps up the delay lapses and it campaigns again
+    /// (better a leader late than none).
+    stepdown_backoff: Option<Instant>,
 }
 
 impl Election {
@@ -173,6 +178,7 @@ impl Election {
             votes: BTreeSet::new(),
             acks: BTreeSet::new(),
             lease_start: now,
+            stepdown_backoff: None,
         })
     }
 
@@ -227,6 +233,13 @@ impl Election {
     pub fn tick(&mut self, now: Instant, durability: &Durability) -> Result<Option<Action>> {
         match self.role {
             Role::Follower | Role::Candidate => {
+                // Honour a voluntary step-down back-off: stay put so a peer takes leadership first.
+                if let Some(until) = self.stepdown_backoff {
+                    if now < until {
+                        return Ok(None);
+                    }
+                    self.stepdown_backoff = None;
+                }
                 if now.duration_since(self.last_contact) >= self.timeout() {
                     return self.stand_for_election(now, durability);
                 }
@@ -257,6 +270,19 @@ impl Election {
                 Ok(None)
             }
         }
+    }
+
+    /// Operator-requested voluntary step-down: relinquish leadership now, and back off from
+    /// re-campaigning for a couple of election timeouts so a peer takes over instead of this node
+    /// immediately re-winning. Returns the `SteppedDown` action to perform (fence release, counter),
+    /// or `None` if this node is not currently the leader (nothing to give up). It never picks the
+    /// successor or forces a term — the ordinary election does that, so there is never two leaders.
+    pub fn request_step_down(&mut self, now: Instant) -> Option<Action> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        self.stepdown_backoff = Some(now + self.cfg.election_timeout * 2);
+        Some(self.step_down("operator requested step-down".into(), now))
     }
 
     fn stand_for_election(

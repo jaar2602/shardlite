@@ -938,6 +938,42 @@ fn cordoning_a_node_drains_its_shards_but_keeps_it_voting() {
 }
 
 #[test]
+fn a_leader_can_step_down_and_a_peer_takes_over() {
+    // Voluntary step-down hands the coordinator role to a peer while the old leader stays in the
+    // cluster (unlike drain, which removes it). Safe: it only backs off from re-campaigning, so the
+    // ordinary election still elects exactly one leader.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let stepped = leader.cluster.request_step_down().expect("step down");
+    assert!(stepped, "the leader should report it stepped down");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut taken_over = false;
+    while Instant::now() < deadline && !taken_over {
+        taken_over = nodes
+            .iter()
+            .any(|n| n.id != leader.id && n.cluster.is_leader());
+        if !taken_over {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        taken_over,
+        "no peer took over after the leader stepped down"
+    );
+    assert!(
+        !leader.cluster.is_leader(),
+        "the old leader is still leading after stepping down"
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
 fn ddl_reaches_every_shard_from_any_node() {
     // The piece that makes multi-write usable. No node holds every shard, so a schema change
     // has to reach each shard's owner. This replaces

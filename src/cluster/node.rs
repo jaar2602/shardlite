@@ -189,6 +189,26 @@ impl ClusterNode {
         self.cordoned.load(Ordering::Relaxed)
     }
 
+    /// Voluntarily give up leadership (if this node holds it) so a peer takes over, while staying
+    /// in the cluster with its shards — unlike [`Self::stop`], which removes the node. Returns
+    /// `true` if it stepped down, `false` if it was not the leader. Safe: it never picks the
+    /// successor or forces a term, so the ordinary election still guarantees a single leader.
+    pub fn request_step_down(&self) -> Result<bool> {
+        let now = Instant::now();
+        let action = {
+            let mut e = self.election.lock().expect("election mutex");
+            e.request_step_down(now)
+        };
+        match action {
+            Some(action) => {
+                let durability = self.durability.durability();
+                self.perform(action, &durability, now)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Members the leader saw report themselves cordoned in the last round (leader's view).
     pub fn cordoned_members(&self) -> Vec<NodeId> {
         self.cordoned_members
