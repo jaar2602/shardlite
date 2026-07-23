@@ -50,11 +50,9 @@ pub struct Resolved {
     pub meshdb_secret: Option<String>,
     pub timeout_ms: u64,
     pub custom_ca_pem: Option<String>,
-    // Resolved but not yet consumed by the proxy: pushing this to the nodes (so meshdb archives to
-    // S3) is the remaining integration step. Stored and decrypted here so it is ready for it.
-    #[allow(dead_code)]
+    /// S3 replication config, decrypted, ready to push to the nodes via the `apply-s3` action
+    /// (`POST /api/connections/<n>/apply-s3` → each node's `POST /v1/s3/config`).
     pub s3: Option<S3Settings>,
-    #[allow(dead_code)]
     pub s3_secret_key: Option<String>,
 }
 

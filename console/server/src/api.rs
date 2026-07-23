@@ -928,6 +928,83 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             }
         }
 
+        // Push this connection's stored (sealed) S3 config to every node of the cluster, so an
+        // operator turns replication on without re-entering the secret. S3 config is node-local
+        // (each node archives the shards it owns), so it is applied to all seeds, not just one.
+        ("POST", ["connections", name, "apply-s3"]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::Operate,
+                    "meshdb.s3.apply",
+                    name,
+                );
+            }
+            let seeds = match state.registry.resolve_seeds(name) {
+                Ok(seeds) => seeds,
+                Err(RegistryError::NotFound) => {
+                    return respond::error(request, 404, "no such connection")
+                }
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
+                }
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let first = &seeds[0];
+            let Some(s3) = first.s3.clone() else {
+                return respond::error(
+                    request,
+                    400,
+                    "no S3 configuration is stored for this connection",
+                );
+            };
+            let body = if !s3.enabled {
+                serde_json::json!({ "enabled": false })
+            } else {
+                let Some(secret) = first.s3_secret_key.clone() else {
+                    return respond::error(
+                        request,
+                        400,
+                        "S3 is enabled for this connection but no secret key is stored",
+                    );
+                };
+                let mut b = serde_json::json!({
+                    "enabled": true,
+                    "bucket": s3.bucket,
+                    "region": s3.region,
+                    "access_key": s3.access_key,
+                    "secret_key": secret,
+                    "prefix": s3.prefix,
+                });
+                if !s3.endpoint.is_empty() {
+                    b["endpoint"] = serde_json::json!(s3.endpoint);
+                }
+                b
+            };
+            let mut applied = Vec::new();
+            let mut failures = Vec::new();
+            for resolved in &seeds {
+                match crate::proxy::post_json_result(resolved, "s3/config", &body) {
+                    Ok(_) => applied.push(resolved.url.clone()),
+                    Err(e) => failures.push(format!("{}: {e}", resolved.url)),
+                }
+            }
+            state.audit.record(
+                Some(&session.user),
+                "meshdb.s3.apply",
+                name,
+                if failures.is_empty() { "ok" } else { "failed" },
+            );
+            let status = if failures.is_empty() { 200 } else { 502 };
+            respond::respond_json(
+                request,
+                status,
+                &serde_json::json!({ "applied": applied, "failures": failures }),
+            )
+        }
+
         (_, ["connections", name, rest @ ..]) if !rest.is_empty() => {
             let Some(permission) = proxy_permission(&method, rest) else {
                 return respond::error(request, 404, "no such endpoint or method");
