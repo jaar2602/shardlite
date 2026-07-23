@@ -7,7 +7,7 @@ type ChatMessage = api.AssistantMessage & { trace?: api.AssistantToolTrace[] };
 
 // Persisted per connection so leaving the tab or reloading keeps the conversation.
 function conversationKey(name: string): string {
-  return `meshdb.assistant.${name}`;
+  return `shardlite.assistant.${name}`;
 }
 
 function readMessages(key: string): ChatMessage[] {

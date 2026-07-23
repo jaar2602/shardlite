@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::transport::{TlsClientConfig, TlsServerConfig};
-use meshdb::net::{Client, NodeServices, Server, ServerConfig};
-use meshdb::shard::{ShardConfig, ShardManager};
-use meshdb::storage::Value;
+use shardlite::net::transport::{TlsClientConfig, TlsServerConfig};
+use shardlite::net::{Client, NodeServices, Server, ServerConfig};
+use shardlite::shard::{ShardConfig, ShardManager};
+use shardlite::storage::Value;
 use tempfile::TempDir;
 
 /// A self-signed certificate for `127.0.0.1`, written to PEM files under `dir`.
@@ -86,7 +86,7 @@ fn client_verifying(cert: &std::path::Path) -> TlsClientConfig {
     TlsClientConfig::with_ca_pem(cert, "127.0.0.1").unwrap()
 }
 
-fn connect(addr: &str, tls: &TlsClientConfig) -> meshdb::error::Result<Client> {
+fn connect(addr: &str, tls: &TlsClientConfig) -> shardlite::error::Result<Client> {
     Client::connect_tls(
         addr,
         Duration::from_secs(5),
@@ -201,7 +201,7 @@ fn accept_any_cert_still_encrypts_and_works() {
 fn tls_and_authentication_compose() {
     // The two layers are orthogonal and stack: encryption for the channel, credentials for
     // the identity. A caller gets both by giving both.
-    use meshdb::net::{AuthConfig, Role};
+    use shardlite::net::{AuthConfig, Role};
 
     let dir = TempDir::new().unwrap();
     let certs = TempDir::new().unwrap();
@@ -246,7 +246,7 @@ fn tls_and_authentication_compose() {
         &addr,
         Duration::from_secs(5),
         Duration::from_secs(5),
-        Some(("app".into(), meshdb::net::auth::derive_key("secret"))),
+        Some(("app".into(), shardlite::net::auth::derive_key("secret"))),
         &tls,
     )
     .unwrap();

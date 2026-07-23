@@ -1,5 +1,5 @@
 {
-  "name": "meshdb-console-web",
+  "name": "shardlite-console-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",

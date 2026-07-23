@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::{AuthConfig, HttpConfig, HttpGateway, NodeServices, Role};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::exec::Statement;
+use shardlite::net::{AuthConfig, HttpConfig, HttpGateway, NodeServices, Role};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 struct Gw {

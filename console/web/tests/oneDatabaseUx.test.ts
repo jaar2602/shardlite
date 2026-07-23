@@ -25,5 +25,5 @@ test("database overview and topology avoid shard-facing language", () => {
   const topology = source("components/TopologyMap.tsx");
   assert.doesNotMatch(overview, />Shards?</);
   assert.doesNotMatch(topology, /primary shards|shard ownership/i);
-  assert.match(topology, /ONE MESHDB DATABASE/);
+  assert.match(topology, /ONE SHARDLITE DATABASE/);
 });

@@ -301,7 +301,7 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "meshdb-console-{name}-{}-{}.json",
+            "shardlite-console-{name}-{}-{}.json",
             std::process::id(),
             unix_millis()
         ))

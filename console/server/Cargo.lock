@@ -429,26 +429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "meshdb-console"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "base64",
- "blake3",
- "chacha20poly1305",
- "include_dir",
- "rand",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "tiny_http",
- "ureq",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,6 +634,26 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "shardlite-console"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64",
+ "blake3",
+ "chacha20poly1305",
+ "include_dir",
+ "rand",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "ureq",
+ "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ use libsqlite3_sys as ffi;
 
 use super::{S3Client, S3Pager};
 
-pub const VFS_NAME: &str = "meshdb-s3-ro";
+pub const VFS_NAME: &str = "shardlite-s3-ro";
 
 struct S3VfsState {
     base: *mut ffi::sqlite3_vfs,
@@ -55,7 +55,7 @@ pub fn open_readonly(client: Arc<S3Client>, key: &str) -> crate::Result<rusqlite
     let pager = Arc::new(S3Pager::open(client, key).map_err(to_err)?);
 
     // A unique token that identifies this open to `xOpen`. It is not a filesystem path.
-    let token = format!("meshdb-s3-{}", NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
+    let token = format!("shardlite-s3-{}", NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
     state()
         .registry
         .lock()

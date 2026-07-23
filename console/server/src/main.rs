@@ -1,4 +1,4 @@
-//! meshdb console — a standalone web app for managing and observing meshdb clusters.
+//! shardlite console — a standalone web app for managing and observing shardlite clusters.
 //!
 //! It is deliberately separate from the database: its own binary, its own login, its own state.
 //! The browser talks only to this backend (same origin, so no CORS), and this backend talks to
@@ -34,7 +34,7 @@ use users::Users;
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("meshdb-console: {e}");
+        eprintln!("shardlite-console: {e}");
         std::process::exit(1);
     }
 }
@@ -54,13 +54,13 @@ fn run() -> Result<(), String> {
 
     // The master passphrase is required, and required at startup — a console that could not
     // decrypt its stored secrets must fail loudly now, not when someone first opens a connection.
-    let key = std::env::var("MESHDB_CONSOLE_KEY").map_err(|_| {
-        "MESHDB_CONSOLE_KEY is required — the master passphrase that encrypts stored connection \
+    let key = std::env::var("SHARDLITE_CONSOLE_KEY").map_err(|_| {
+        "SHARDLITE_CONSOLE_KEY is required — the master passphrase that encrypts stored connection \
          secrets at rest. Set it in the environment and restart."
             .to_string()
     })?;
     if key.is_empty() {
-        return Err("MESHDB_CONSOLE_KEY must not be empty".into());
+        return Err("SHARDLITE_CONSOLE_KEY must not be empty".into());
     }
 
     let data_dir = std::path::PathBuf::from(&data);
@@ -73,8 +73,8 @@ fn run() -> Result<(), String> {
     // Bootstrap a first admin from the environment when the store has none — otherwise there
     // would be no way to log in and create one.
     let bootstrap = match (
-        std::env::var("MESHDB_CONSOLE_ADMIN"),
-        std::env::var("MESHDB_CONSOLE_ADMIN_PASSWORD"),
+        std::env::var("SHARDLITE_CONSOLE_ADMIN"),
+        std::env::var("SHARDLITE_CONSOLE_ADMIN_PASSWORD"),
     ) {
         (Ok(u), Ok(p)) if !u.is_empty() && !p.is_empty() => Some((u, p)),
         _ => None,
@@ -85,23 +85,23 @@ fn run() -> Result<(), String> {
     let mut registry =
         Registry::open(&conns_path, Sealer::from_passphrase(&key)).map_err(|e| e.to_string())?;
     if args.iter().any(|arg| arg == "--rotate-key") {
-        let new_key = std::env::var("MESHDB_CONSOLE_NEW_KEY")
-            .map_err(|_| "MESHDB_CONSOLE_NEW_KEY is required with --rotate-key".to_string())?;
+        let new_key = std::env::var("SHARDLITE_CONSOLE_NEW_KEY")
+            .map_err(|_| "SHARDLITE_CONSOLE_NEW_KEY is required with --rotate-key".to_string())?;
         if new_key.is_empty() || new_key == key {
-            return Err("MESHDB_CONSOLE_NEW_KEY must be non-empty and different".into());
+            return Err("SHARDLITE_CONSOLE_NEW_KEY must be non-empty and different".into());
         }
         registry
             .rotate_key(Sealer::from_passphrase(&new_key))
             .map_err(|e| format!("rotating connection secrets: {e}"))?;
-        eprintln!("meshdb-console rotated all saved connection secrets; restart with the new key");
+        eprintln!("shardlite-console rotated all saved connection secrets; restart with the new key");
         return Ok(());
     }
     let registry = Arc::new(registry);
     let metrics = Arc::new(Metrics::open(&data_dir.join("observability.json"))?);
     let sessions = Sessions::with_ttl(
-        std::time::Duration::from_secs(env_u64("MESHDB_CONSOLE_SESSION_IDLE_SECS", 30 * 60)),
+        std::time::Duration::from_secs(env_u64("SHARDLITE_CONSOLE_SESSION_IDLE_SECS", 30 * 60)),
         std::time::Duration::from_secs(env_u64(
-            "MESHDB_CONSOLE_SESSION_ABSOLUTE_SECS",
+            "SHARDLITE_CONSOLE_SESSION_ABSOLUTE_SECS",
             12 * 60 * 60,
         )),
     );
@@ -113,7 +113,7 @@ fn run() -> Result<(), String> {
     )?);
     let reports = Arc::new(reports::Reports::open(&data_dir.join("reports.json"))?);
     let dashboards = Arc::new(reports::Dashboards::open(&data_dir.join("dashboards.json"))?);
-    let secure_cookie = env_bool("MESHDB_CONSOLE_SECURE_COOKIE", false);
+    let secure_cookie = env_bool("SHARDLITE_CONSOLE_SECURE_COOKIE", false);
 
     metrics::spawn(Arc::clone(&registry), Arc::clone(&metrics));
     operations.spawn(Arc::clone(&registry), audit.clone());
@@ -137,14 +137,14 @@ fn run() -> Result<(), String> {
         tiny_http::Server::http(listen.as_str()).map_err(|e| format!("binding {listen}: {e}"))?,
     );
     eprintln!(
-        "meshdb-console listening on http://{listen}  (data: {})",
+        "shardlite-console listening on http://{listen}  (data: {})",
         data_dir.display()
     );
     if bootstrap.is_some() {
-        eprintln!("bootstrapped an admin from MESHDB_CONSOLE_ADMIN");
+        eprintln!("bootstrapped an admin from SHARDLITE_CONSOLE_ADMIN");
     }
 
-    // Thread-per-connection over a fixed worker pool, matching the meshdb gateway. Each worker
+    // Thread-per-connection over a fixed worker pool, matching the shardlite gateway. Each worker
     // blocks in recv(); a streaming proxy response holds one worker for the life of the stream,
     // which is why the pool exists rather than a single accept loop.
     let mut handles = Vec::new();

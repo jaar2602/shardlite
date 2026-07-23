@@ -296,7 +296,7 @@ impl ClusterNode {
         self.peers.get(&node).map(|s| s.as_str())
     }
 
-    /// Configured voting peers and their native meshdb addresses, sorted by node ID.
+    /// Configured voting peers and their native shardlite addresses, sorted by node ID.
     ///
     /// This is a snapshot for operator-facing diagnostics. It deliberately says only who is
     /// configured; callers that need liveness must combine it with [`Self::live_members`] and

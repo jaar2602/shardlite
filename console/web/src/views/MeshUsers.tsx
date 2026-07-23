@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Select, Spinner, Tag, TextInput } from "../components/ui";
 
-// meshdb's own users on the cluster (Read/Write/Admin/Cluster), managed through the connection's
+// shardlite's own users on the cluster (Read/Write/Admin/Cluster), managed through the connection's
 // stored credential — which must itself be an Admin for these calls to succeed. A 403 here means
-// the stored meshdb credential lacks the Admin role, and is surfaced as such.
+// the stored shardlite credential lacks the Admin role, and is surfaced as such.
 export default function MeshUsers({ name }: { name: string }) {
   const c = api.conn(name);
   const [users, setUsers] = useState<{ name: string; role: string }[] | null>(null);
@@ -39,7 +39,7 @@ export default function MeshUsers({ name }: { name: string }) {
   };
 
   const remove = async (n: string) => {
-    if (!confirm(`Drop meshdb user "${n}"?`)) return;
+    if (!confirm(`Drop shardlite user "${n}"?`)) return;
     setError(null);
     try {
       await c.meshUsers.remove(n);
@@ -54,10 +54,10 @@ export default function MeshUsers({ name }: { name: string }) {
 
   return (
     <Page>
-      <PageHeader eyebrow="Database / access control" title="MeshDB users" description="Manage identities stored by this database. The connection credential must have MeshDB admin access." />
+      <PageHeader eyebrow="Database / access control" title="ShardLite users" description="Manage identities stored by this database. The connection credential must have ShardLite admin access." />
       {error && <Banner tone="error">{error}</Banner>}
 
-      <Card title="Create meshdb user">
+      <Card title="Create shardlite user">
         <form onSubmit={add} className="grid grid-cols-1 items-end gap-4 md:grid-cols-3">
           <TextInput label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
           <TextInput

@@ -1,14 +1,14 @@
-//! HTTP driver for the meshdb gateway. Streaming reads, thin wrapper over `/v1`.
+//! HTTP driver for the shardlite gateway. Streaming reads, thin wrapper over `/v1`.
 //!
 //! ```no_run
-//! use meshdb_driver::Client;
+//! use shardlite_driver::Client;
 //! let db = Client::with_auth("http://localhost:4680", "app", "s3cret");
 //! for row in db.query("SELECT id, v FROM t WHERE id > ?1", 0, &[serde_json::json!(5)])? {
 //!     let row = row?;
 //!     println!("{} {}", row["id"], row["v"]);
 //! }
 //! db.execute("INSERT INTO t VALUES (?1, ?2)", 0, &[serde_json::json!(1), serde_json::json!("a")])?;
-//! # Ok::<(), meshdb_driver::Error>(())
+//! # Ok::<(), shardlite_driver::Error>(())
 //! ```
 //!
 //! [`Client::query`] returns an iterator that reads rows from the socket one at a time, so a
@@ -255,14 +255,14 @@ fn b64(input: &[u8]) -> String {
 /// The native bincode-over-TCP client — the fastest transport, and the one a Rust program
 /// that is itself a cluster member should use.
 ///
-/// Enabled with `--features native`, which pulls in the meshdb crate. This is a re-export of
-/// `meshdb::net::Client`; see its docs for the full surface (`connect`, `connect_as`,
+/// Enabled with `--features native`, which pulls in the shardlite crate. This is a re-export of
+/// `shardlite::net::Client`; see its docs for the full surface (`connect`, `connect_as`,
 /// `query`, `execute`, `begin`/transactions, and so on). The HTTP [`Client`] above and this
 /// native client are deliberately separate types: HTTP is the stable cross-language edge,
 /// native is the Rust-only fast path.
 #[cfg(feature = "native")]
 pub mod native {
-    pub use meshdb::net::Client;
-    pub use meshdb::storage::Value;
-    pub use meshdb::storage::exec::Statement;
+    pub use shardlite::net::Client;
+    pub use shardlite::storage::Value;
+    pub use shardlite::storage::exec::Statement;
 }

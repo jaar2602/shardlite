@@ -69,7 +69,7 @@ export default function Schema({ name }: { name: string }) {
     <PageHeader
       eyebrow="Database / schema"
       title="Schema explorer"
-      description="Browse the tables, views, indexes, and triggers available throughout this database. MeshDB checks physical storage internally."
+      description="Browse the tables, views, indexes, and triggers available throughout this database. ShardLite checks physical storage internally."
       actions={<Button variant="secondary" onClick={() => void load()} disabled={busy}>{busy ? "Checking…" : "Refresh schema"}</Button>}
     />
 

@@ -35,8 +35,8 @@ pub struct StreamTxn {
     pub txn: CommittedTxn,
 }
 
-const FILE_NAME: &str = "meshdb.stream";
-const HEADER: &str = "meshdb-stream 1";
+const FILE_NAME: &str = "shardlite.stream";
+const HEADER: &str = "shardlite-stream 1";
 
 /// The primary's position in every shard's stream.
 ///

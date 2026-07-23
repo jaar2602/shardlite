@@ -1,8 +1,8 @@
-//! The console's own user store — its identity layer, entirely separate from the meshdb
+//! The console's own user store — its identity layer, entirely separate from the shardlite
 //! credentials it stores per connection (this is scoping decision 1: multi-user from the start).
 //!
-//! Four roles. Console policy is checked before any request reaches a stored meshdb credential;
-//! meshdb then applies its own role as a second, independent boundary. Old persisted `user`
+//! Four roles. Console policy is checked before any request reaches a stored shardlite credential;
+//! shardlite then applies its own role as a second, independent boundary. Old persisted `user`
 //! records deserialize as `Developer` for compatibility with the v1 console.
 
 use std::collections::HashMap;
@@ -184,7 +184,7 @@ mod tests {
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
         let n: u64 = rand::random();
-        p.push(format!("meshdb-console-users-{n}.json"));
+        p.push(format!("shardlite-console-users-{n}.json"));
         p
     }
 

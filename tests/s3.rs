@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use meshdb::s3::{S3Client, S3Config, S3Error, amz_timestamp, sign_v4};
+use shardlite::s3::{S3Client, S3Config, S3Error, amz_timestamp, sign_v4};
 
 #[test]
 fn sigv4_matches_the_aws_worked_example() {
@@ -66,7 +66,7 @@ fn a_signed_request_round_trips_against_a_mock_s3() {
     let (endpoint, seen_auth) = spawn_mock_s3();
     let client = S3Client::new(S3Config {
         endpoint,
-        bucket: "meshdb".into(),
+        bucket: "shardlite".into(),
         region: "us-east-1".into(),
         access_key: "AKIDEXAMPLE".into(),
         secret_key: "secret".into(),
@@ -219,11 +219,11 @@ fn respond(s: &mut TcpStream, status: &str, body: &[u8]) {
 
 // --- slice 2: the S3 sink (change-log + snapshots) ---
 
-use meshdb::replication::{FrameSink, StreamTxn};
-use meshdb::s3::S3Sink;
-use meshdb::s3::sink::decode_change_log;
-use meshdb::shard::ShardId;
-use meshdb::vfs::{CommittedTxn, Frame};
+use shardlite::replication::{FrameSink, StreamTxn};
+use shardlite::s3::S3Sink;
+use shardlite::s3::sink::decode_change_log;
+use shardlite::shard::ShardId;
+use shardlite::vfs::{CommittedTxn, Frame};
 
 fn sample_txn(lsn: u64, page: u32) -> StreamTxn {
     StreamTxn {
@@ -245,7 +245,7 @@ fn the_sink_uploads_the_change_log_and_snapshots() {
     let (endpoint, _seen) = spawn_mock_s3();
     let client = Arc::new(S3Client::new(S3Config {
         endpoint,
-        bucket: "meshdb".into(),
+        bucket: "shardlite".into(),
         region: "us-east-1".into(),
         access_key: "AKIDEXAMPLE".into(),
         secret_key: "s".into(),
@@ -295,7 +295,7 @@ fn a_persistently_failing_sink_reports_unhealthy() {
 
 // --- slice 3: the S3 pager (chunked range reads + LRU cache) ---
 
-use meshdb::s3::S3Pager;
+use shardlite::s3::S3Pager;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A mock serving one fixed object: HEAD returns its size, GET (Range) returns the slice, and
@@ -414,7 +414,7 @@ fn a_snapshot_in_s3_is_queryable_over_the_read_vfs() {
         secret_key: "s".into(),
     }));
 
-    let conn = meshdb::s3::open_readonly(client, "snap.db").unwrap();
+    let conn = shardlite::s3::open_readonly(client, "snap.db").unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -466,7 +466,7 @@ fn a_failed_over_shard_takes_writes_over_a_local_wal() {
         secret_key: "s".into(),
     }));
     let scratch = tempfile::tempdir().unwrap();
-    let conn = meshdb::s3::open_readwrite(client, "base.db", scratch.path()).unwrap();
+    let conn = shardlite::s3::open_readwrite(client, "base.db", scratch.path()).unwrap();
 
     // Old rows are readable straight from the S3 base.
     assert_eq!(
@@ -629,7 +629,7 @@ fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
 
     let client = Arc::new(S3Client::new(S3Config {
         endpoint: spawn_full_s3(),
-        bucket: "meshdb".into(),
+        bucket: "shardlite".into(),
         region: "us-east-1".into(),
         access_key: "a".into(),
         secret_key: "s".into(),
@@ -642,7 +642,7 @@ fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
 
     // The latest snapshot is the epoch-5 one.
     assert_eq!(
-        meshdb::s3::failover::latest_snapshot(&client, "arch", ShardId(3))
+        shardlite::s3::failover::latest_snapshot(&client, "arch", ShardId(3))
             .unwrap()
             .unwrap(),
         "arch/shard_3/snapshot/00000000000000000005_00000000000000000200"
@@ -651,7 +651,7 @@ fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
     // Node B takes over shard 3: opens it from S3, no download, and serves it.
     let scratch = tempfile::tempdir().unwrap();
     let conn =
-        meshdb::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+        shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -688,7 +688,7 @@ fn page_size_of(db: &[u8]) -> usize {
 
 /// The page-level diff `base → after`, as the capture VFS would emit it: every page that changed or
 /// was newly added, plus the resulting database size. Overlaying these on `base` reproduces `after`.
-fn change_log_txn(base: &[u8], after: &[u8], lsn: u64) -> meshdb::replication::StreamTxn {
+fn change_log_txn(base: &[u8], after: &[u8], lsn: u64) -> shardlite::replication::StreamTxn {
     let ps = page_size_of(after);
     let after_pages = after.len() / ps;
     let base_pages = base.len() / ps;
@@ -697,15 +697,15 @@ fn change_log_txn(base: &[u8], after: &[u8], lsn: u64) -> meshdb::replication::S
         let a = &after[p * ps..(p + 1) * ps];
         let changed = p >= base_pages || a != &base[p * ps..(p + 1) * ps];
         if changed {
-            frames.push(meshdb::vfs::Frame {
+            frames.push(shardlite::vfs::Frame {
                 page_no: (p + 1) as u32,
                 data: a.to_vec(),
             });
         }
     }
-    meshdb::replication::StreamTxn {
+    shardlite::replication::StreamTxn {
         lsn,
-        txn: meshdb::vfs::CommittedTxn {
+        txn: shardlite::vfs::CommittedTxn {
             db_size_pages: after_pages as u32,
             page_size: ps as u32,
             frames,
@@ -770,7 +770,7 @@ fn a_failover_replays_the_change_log_since_the_snapshot() {
     // Snapshot at lsn 200; two change-log transactions at lsn 201 and 202.
     let client = Arc::new(S3Client::new(S3Config {
         endpoint: spawn_full_s3(),
-        bucket: "meshdb".into(),
+        bucket: "shardlite".into(),
         region: "us-east-1".into(),
         access_key: "a".into(),
         secret_key: "s".into(),
@@ -780,7 +780,7 @@ fn a_failover_replays_the_change_log_since_the_snapshot() {
     let t1 = change_log_txn(&base_bytes, &after1_bytes, 201);
     let t2 = change_log_txn(&after1_bytes, &after2_bytes, 202);
     // Two separate WAL objects, exactly as the sink would upload two batches.
-    let enc = meshdb::s3::sink::encode_change_log;
+    let enc = shardlite::s3::sink::encode_change_log;
     client
         .put(
             "arch/shard_3/wal/00000000000000000007_00000000000000000201",
@@ -798,7 +798,7 @@ fn a_failover_replays_the_change_log_since_the_snapshot() {
     // replay it is current — 210 rows, and id 11 carries the post-snapshot update.
     let scratch = tempfile::tempdir().unwrap();
     let conn =
-        meshdb::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+        shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -834,17 +834,17 @@ fn a_failover_refuses_a_change_log_with_a_gap() {
     // this would silently drop two transactions, so the overlay build must refuse.
     let client = Arc::new(S3Client::new(S3Config {
         endpoint: spawn_full_s3(),
-        bucket: "meshdb".into(),
+        bucket: "shardlite".into(),
         region: "us-east-1".into(),
         access_key: "a".into(),
         secret_key: "s".into(),
     }));
-    let txn = meshdb::replication::StreamTxn {
+    let txn = shardlite::replication::StreamTxn {
         lsn: 8,
-        txn: meshdb::vfs::CommittedTxn {
+        txn: shardlite::vfs::CommittedTxn {
             db_size_pages: 1,
             page_size: 4096,
-            frames: vec![meshdb::vfs::Frame {
+            frames: vec![shardlite::vfs::Frame {
                 page_no: 1,
                 data: vec![0u8; 4096],
             }],
@@ -854,11 +854,11 @@ fn a_failover_refuses_a_change_log_with_a_gap() {
     client
         .put(
             "arch/shard_1/wal/00000000000000000004_00000000000000000008",
-            &meshdb::s3::sink::encode_change_log(&[txn]).unwrap(),
+            &shardlite::s3::sink::encode_change_log(&[txn]).unwrap(),
         )
         .unwrap();
 
-    let err = meshdb::s3::failover::build_overlay(&client, "arch", ShardId(1), 4, 5).unwrap_err();
+    let err = shardlite::s3::failover::build_overlay(&client, "arch", ShardId(1), 4, 5).unwrap_err();
     assert!(
         err.to_string().contains("gap"),
         "expected a gap refusal, got: {err}"
@@ -870,9 +870,9 @@ fn a_failover_refuses_a_change_log_with_a_gap() {
 #[cfg(feature = "http")]
 #[test]
 fn s3_archival_is_configurable_at_runtime_over_http() {
-    use meshdb::net::{HttpConfig, HttpGateway, NodeServices};
-    use meshdb::shard::{ShardConfig, ShardManager};
-    use meshdb::storage::exec::Statement;
+    use shardlite::net::{HttpConfig, HttpGateway, NodeServices};
+    use shardlite::shard::{ShardConfig, ShardManager};
+    use shardlite::storage::exec::Statement;
     use std::time::Duration;
 
     // A capture-ready node with NO S3 target — exactly what `--s3-ready` gives.
@@ -982,8 +982,8 @@ fn s3_archival_is_configurable_at_runtime_over_http() {
 
 #[test]
 fn a_node_recovers_a_shard_from_s3_snapshot_plus_change_log() {
-    use meshdb::shard::{ShardConfig, ShardManager};
-    use meshdb::storage::exec::{Executed, Outcome, Statement};
+    use shardlite::shard::{ShardConfig, ShardManager};
+    use shardlite::storage::exec::{Executed, Outcome, Statement};
 
     let endpoint = spawn_full_s3();
     let client = Arc::new(S3Client::new(S3Config {
@@ -1004,7 +1004,7 @@ fn a_node_recovers_a_shard_from_s3_snapshot_plus_change_log() {
             capture: true,
             ..ShardConfig::floor()
         },
-        Some(Arc::clone(&sink) as Arc<dyn meshdb::replication::FrameSink>),
+        Some(Arc::clone(&sink) as Arc<dyn shardlite::replication::FrameSink>),
     )
     .unwrap();
     a.execute_all_shards(Statement::new(
@@ -1060,7 +1060,7 @@ fn a_node_recovers_a_shard_from_s3_snapshot_plus_change_log() {
         .unwrap();
     let count = match out {
         Outcome::Ok(Executed::Rows(qr)) => match qr.rows[0][0] {
-            meshdb::storage::Value::Integer(n) => n,
+            shardlite::storage::Value::Integer(n) => n,
             ref v => panic!("expected an integer count, got {v:?}"),
         },
         other => panic!("expected rows, got {other:?}"),

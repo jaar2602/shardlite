@@ -553,32 +553,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "meshdb"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "blake3",
- "flume",
- "hmac",
- "libsqlite3-sys",
- "loom",
- "rcgen",
- "rusqlite",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "sqlparser",
- "tempfile",
- "thiserror",
- "tiny_http",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -920,6 +894,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "shardlite"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "flume",
+ "hmac",
+ "libsqlite3-sys",
+ "loom",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tempfile",
+ "thiserror",
+ "tiny_http",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

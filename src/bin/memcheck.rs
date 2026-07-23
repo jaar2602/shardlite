@@ -17,9 +17,9 @@
 
 use std::process::ExitCode;
 
-use meshdb::replication::NullSink;
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::exec::{Statement, Value};
+use shardlite::replication::NullSink;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::exec::{Statement, Value};
 
 fn peak_rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
@@ -45,7 +45,7 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let dir = std::path::PathBuf::from(args.first().cloned().unwrap_or("/tmp/meshdb-mem".into()));
+    let dir = std::path::PathBuf::from(args.first().cloned().unwrap_or("/tmp/shardlite-mem".into()));
     let shards: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(64);
     let mb_per_shard: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4);
     let limit_mb: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(150);

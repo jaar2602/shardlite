@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Start the meshdb **console** (the web UI) pointed at the 3-node Docker cluster from this demo.
+# Start the shardlite **console** (the web UI) pointed at the 3-node Docker cluster from this demo.
 # It brings the cluster up if needed, launches the console backend, and pre-registers the cluster
 # as a connection so you can log in and immediately browse/query it — no manual setup.
 #
@@ -33,12 +33,12 @@ else
 fi
 
 # --- 2. console binary -----------------------------------------------------------------------
-BIN="$CONSOLE_DIR/server/target/release/meshdb-console"
-[ -x "$BIN" ] || BIN="$CONSOLE_DIR/server/target/debug/meshdb-console"
+BIN="$CONSOLE_DIR/server/target/release/shardlite-console"
+[ -x "$BIN" ] || BIN="$CONSOLE_DIR/server/target/debug/shardlite-console"
 if [ ! -x "$BIN" ]; then
   echo "==> no console binary found; building it (frontend + backend)"
   ( cd "$CONSOLE_DIR" && ./build.sh )
-  BIN="$CONSOLE_DIR/server/target/debug/meshdb-console"
+  BIN="$CONSOLE_DIR/server/target/debug/shardlite-console"
 fi
 
 # --- 3. start the console backend ------------------------------------------------------------
@@ -50,9 +50,9 @@ if [ "${1:-}" = "--fresh" ]; then
 fi
 mkdir -p "$DATA_DIR"
 echo "==> starting console at http://$CONSOLE_ADDR"
-MESHDB_CONSOLE_KEY="$CONSOLE_KEY" \
-MESHDB_CONSOLE_ADMIN="$ADMIN_USER" \
-MESHDB_CONSOLE_ADMIN_PASSWORD="$ADMIN_PASS" \
+SHARDLITE_CONSOLE_KEY="$CONSOLE_KEY" \
+SHARDLITE_CONSOLE_ADMIN="$ADMIN_USER" \
+SHARDLITE_CONSOLE_ADMIN_PASSWORD="$ADMIN_PASS" \
   "$BIN" --listen "$CONSOLE_ADDR" --data "$DATA_DIR" &
 CONSOLE_PID=$!
 cleanup(){ kill "$CONSOLE_PID" 2>/dev/null || true; }
@@ -85,7 +85,7 @@ fi
 cat <<EOF
 
 ============================================================
- meshdb console is running:  http://$CONSOLE_ADDR
+ shardlite console is running:  http://$CONSOLE_ADDR
    sign in:   user  $ADMIN_USER
               pass  $ADMIN_PASS
    connection "docker-cluster" points at the 3 nodes:

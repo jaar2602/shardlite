@@ -350,30 +350,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "meshdb"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "blake3",
- "flume",
- "libsqlite3-sys",
- "rusqlite",
- "serde",
- "sqlparser",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "meshdb-driver"
-version = "0.1.0"
-dependencies = [
- "meshdb",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -544,6 +520,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "shardlite"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "flume",
+ "libsqlite3-sys",
+ "rusqlite",
+ "serde",
+ "sqlparser",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "shardlite-driver"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "shardlite",
+ "ureq",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,6 +584,18 @@ checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
 dependencies = [
  "log",
  "recursive",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

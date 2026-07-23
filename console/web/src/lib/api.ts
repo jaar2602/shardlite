@@ -1,5 +1,5 @@
 // Typed client for the console's own backend API. Same origin, so the session cookie rides along
-// automatically. Everything the SPA does goes through here; nothing talks to meshdb directly.
+// automatically. Everything the SPA does goes through here; nothing talks to shardlite directly.
 
 export type Role = "viewer" | "developer" | "operator" | "admin";
 export type Permission = "observe" | "query" | "write" | "operate" | "admin";
@@ -33,7 +33,7 @@ export interface Connection {
   name: string;
   url: string;
   seeds: string[];
-  meshdb_user?: string | null;
+  shardlite_user?: string | null;
   enabled: boolean;
   timeout_ms: number;
   allow_insecure_http: boolean;
@@ -275,8 +275,8 @@ export const connections = {
     name: string;
     url: string;
     seeds?: string[];
-    meshdb_user?: string;
-    meshdb_secret?: string;
+    shardlite_user?: string;
+    shardlite_secret?: string;
     replace?: boolean;
     enabled?: boolean;
     timeout_ms?: number;
@@ -336,7 +336,7 @@ export const fleet = {
   list: () => req<FleetSummary[]>("GET", "/api/fleet"),
 };
 
-// --- per-connection proxy to meshdb /v1 ---
+// --- per-connection proxy to shardlite /v1 ---
 function base(name: string) {
   return `/api/connections/${encodeURIComponent(name)}`;
 }

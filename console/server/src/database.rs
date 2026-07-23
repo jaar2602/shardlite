@@ -1,4 +1,4 @@
-//! Logical-database views assembled from existing MeshDB endpoints.
+//! Logical-database views assembled from existing ShardLite endpoints.
 //!
 //! Shard identifiers are deliberately kept inside this module. Browser-facing responses describe
 //! one database, while operator-only placement diagnostics continue to use the raw endpoints.
@@ -272,8 +272,8 @@ fn verify_contracts(
     };
     let guidance = match status {
         "incompatible" => vec!["Use a node version and API contract compatible with this database."],
-        "wrong_database" => vec!["This endpoint reports membership in a different MeshDB database. Check the deployment configuration and endpoint."],
-        "not_member" => vec!["Join the node using the existing MeshDB deployment process.", "Return here and verify the endpoint again."],
+        "wrong_database" => vec!["This endpoint reports membership in a different ShardLite database. Check the deployment configuration and endpoint."],
+        "not_member" => vec!["Join the node using the existing ShardLite deployment process.", "Return here and verify the endpoint again."],
         "unhealthy" => vec!["Resolve the node health checks before adding it as a failover endpoint."],
         "stabilizing" => vec!["Wait for leadership and data distribution to stabilize, then verify again."],
         _ => vec!["The endpoint can be added to this connection as a failover path."],

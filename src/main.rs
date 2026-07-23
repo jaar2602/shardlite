@@ -1,22 +1,22 @@
-//! meshdb CLI — open a data directory and run SQL against it.
+//! shardlite CLI — open a data directory and run SQL against it.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use meshdb::db::Db;
-use meshdb::query::{Route, route_statement};
-use meshdb::shard::ShardId;
-use meshdb::shard::manifest::Manifest;
-use meshdb::storage::exec::{Executed, Outcome, QueryResult};
+use shardlite::db::Db;
+use shardlite::query::{Route, route_statement};
+use shardlite::shard::ShardId;
+use shardlite::shard::manifest::Manifest;
+use shardlite::storage::exec::{Executed, Outcome, QueryResult};
 
 const USAGE: &str = "\
-meshdb — HA multi-write SQLite server (single-node)
+shardlite — HA multi-write SQLite server (single-node)
 
 usage:
-  meshdb <data-dir> --shards N          create a new data directory
-  meshdb <data-dir>                     interactive shell (existing directory)
-  meshdb <data-dir> -c \"SQL\"            run one statement and exit
-  meshdb <data-dir> -f <file>           run statements from a file, one per line
+  shardlite <data-dir> --shards N          create a new data directory
+  shardlite <data-dir>                     interactive shell (existing directory)
+  shardlite <data-dir> -c \"SQL\"            run one statement and exit
+  shardlite <data-dir> -f <file>           run statements from a file, one per line
 
 --shards N is REQUIRED when creating a new directory and is refused for an
 existing one. It is recorded in the manifest and cannot be changed afterwards,
@@ -201,7 +201,7 @@ fn run_file(db: &Db, file: &str) -> ExitCode {
 
 fn repl(db: &Db) -> ExitCode {
     println!(
-        "meshdb — {} ({} shard(s))",
+        "shardlite — {} ({} shard(s))",
         db.dir().display(),
         db.shard_count()
     );
@@ -210,7 +210,7 @@ fn repl(db: &Db) -> ExitCode {
     let mut current = ShardId::FIRST;
     let stdin = io::stdin();
     loop {
-        print!("meshdb:{current}> ");
+        print!("shardlite:{current}> ");
         if io::stdout().flush().is_err() {
             return ExitCode::FAILURE;
         }
@@ -251,7 +251,7 @@ fn repl(db: &Db) -> ExitCode {
                 let w = db.writer_stats();
                 let r = db.reader_stats();
                 let c = db.shards().checkpoint_stats();
-                let wc = meshdb::storage::wal_conversion_stats();
+                let wc = shardlite::storage::wal_conversion_stats();
                 println!(
                     "writer: threads={} batches={} requests={} max_batch={} mean_batch={:.2}",
                     w.threads,
@@ -369,7 +369,7 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
             Route::Refuse(msg) => {
                 eprintln!("cannot route: {msg}");
                 eprintln!(
-                    "(declare the table's shard key with `meshdb shardkey <table> <column>`)"
+                    "(declare the table's shard key with `shardlite shardkey <table> <column>`)"
                 );
                 return false;
             }
@@ -388,7 +388,7 @@ fn run_and_print(db: &Db, shard: ShardId, sql: &str) -> bool {
                 print_table(&result);
                 return true;
             }
-            Err(meshdb::Error::Unsupported(msg)) => {
+            Err(shardlite::Error::Unsupported(msg)) => {
                 eprintln!("cannot fan out: {msg}");
                 eprintln!("(use `.shard N` to target one shard)");
                 return false;
@@ -544,7 +544,7 @@ fn print_table(r: &QueryResult) {
 /// Only the binary does this. The library emits through the `tracing` facade and installs
 /// nothing, so an embedding consumer picks its own destination — or none.
 ///
-/// Defaults to warnings and above; `MESHDB_LOG=debug` (or any `RUST_LOG`-style filter)
+/// Defaults to warnings and above; `SHARDLITE_LOG=debug` (or any `RUST_LOG`-style filter)
 /// turns up the detail.
 /// The value after `--name`, if present.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -573,8 +573,8 @@ fn positionals(args: &[String]) -> Vec<&str> {
 
 const FRAMES_USAGE: &str = "\
 usage:
-  meshdb frames <data-dir> --shard N     inspect one shard's WAL
-  meshdb frames --file <path-to-wal>     inspect a WAL file directly
+  shardlite frames <data-dir> --shard N     inspect one shard's WAL
+  shardlite frames --file <path-to-wal>     inspect a WAL file directly
 
   --all      show every frame, including uncommitted and leftover ones
              (default: a summary plus per-transaction commit frames)
@@ -600,7 +600,7 @@ fn frames_cmd(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let db = std::path::Path::new(dir).join(format!("shard_{shard}.db"));
-            meshdb::storage::checkpoint::wal_path_for(&db)
+            shardlite::storage::checkpoint::wal_path_for(&db)
         }
     };
 
@@ -619,12 +619,12 @@ fn frames_cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    let report = meshdb::vfs::inspect_wal(&bytes);
+    let report = shardlite::vfs::inspect_wal(&bytes);
     render_frames(&report, &path, args.iter().any(|a| a == "--all"));
     ExitCode::SUCCESS
 }
 
-fn render_frames(report: &meshdb::vfs::WalReport, path: &std::path::Path, all: bool) {
+fn render_frames(report: &shardlite::vfs::WalReport, path: &std::path::Path, all: bool) {
     println!("WAL: {}", path.display());
     println!("  file size:      {} bytes", report.file_bytes);
 
@@ -710,11 +710,11 @@ fn render_frames(report: &meshdb::vfs::WalReport, path: &std::path::Path, all: b
     }
 }
 
-const SERVE_USAGE: &str = "usage: meshdb serve <data-dir> [options]
+const SERVE_USAGE: &str = "usage: shardlite serve <data-dir> [options]
 
   --listen ADDR      address to accept connections on (default 127.0.0.1:4600)
   --shards N         required when creating a new data directory
-  --users FILE       enable authentication from this users file (see `meshdb user`)
+  --users FILE       enable authentication from this users file (see `shardlite user`)
   --max-conn N       connection cap (default 256)
   --tls-cert FILE    PEM certificate; enables TLS (requires the `tls` build feature)
   --tls-key FILE     PEM private key for the certificate
@@ -731,9 +731,9 @@ Clustering (deploy across hosts):
   This is placement-only — each shard is single-copy on its owner (no replicas).
 
   Example (3 nodes):
-    meshdb serve /data --shards 12 --listen A:4600 --node-id 1 --peers 2=B:4600,3=C:4600
-    meshdb serve /data --shards 12 --listen B:4600 --node-id 2 --peers 1=A:4600,3=C:4600
-    meshdb serve /data --shards 12 --listen C:4600 --node-id 3 --peers 1=A:4600,2=B:4600
+    shardlite serve /data --shards 12 --listen A:4600 --node-id 1 --peers 2=B:4600,3=C:4600
+    shardlite serve /data --shards 12 --listen B:4600 --node-id 2 --peers 1=A:4600,3=C:4600
+    shardlite serve /data --shards 12 --listen C:4600 --node-id 3 --peers 1=A:4600,2=B:4600
 
 S3 replication for HA (requires the `s3` build feature):
   --s3-bucket NAME       enable archival to this bucket (turns on S3 replication)
@@ -742,7 +742,7 @@ S3 replication for HA (requires the `s3` build feature):
   --s3-region NAME       region (default us-east-1)
   --s3-access-key KEY    access key (or the AWS_ACCESS_KEY_ID env var)
   --s3-secret-key KEY    secret key (or the AWS_SECRET_ACCESS_KEY env var)
-  --s3-prefix PREFIX     key prefix for this cluster's objects (default meshdb)
+  --s3-prefix PREFIX     key prefix for this cluster's objects (default shardlite)
   --s3-snapshot-secs N   seconds between shard snapshots to S3 (default 60)
   --s3-ready             capture frames but attach no target yet, so an operator can turn S3
                          archival on later from the console (POST /v1/s3/config) without a restart
@@ -760,30 +760,30 @@ fn has_flag(args: &[String], name: &str) -> bool {
 
 #[cfg(feature = "http")]
 fn start_http(
-    server: &meshdb::net::Server,
+    server: &shardlite::net::Server,
     addr: &str,
     insecure: bool,
 ) -> std::result::Result<(), String> {
     // The gateway shares the same shards and services as the TCP server, so both speak to one
     // core. It runs on its own threads; the TCP server keeps the main thread.
-    let gateway = meshdb::net::HttpGateway::bind(
+    let gateway = shardlite::net::HttpGateway::bind(
         server.shards_arc(),
         server.services_clone(),
-        meshdb::net::HttpConfig {
+        shardlite::net::HttpConfig {
             addr: addr.to_string(),
             insecure,
             ..Default::default()
         },
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("meshdb HTTP gateway on {addr}");
+    eprintln!("shardlite HTTP gateway on {addr}");
     std::thread::spawn(move || gateway.serve());
     Ok(())
 }
 
 #[cfg(not(feature = "http"))]
 fn start_http(
-    _server: &meshdb::net::Server,
+    _server: &shardlite::net::Server,
     _addr: &str,
     _insecure: bool,
 ) -> std::result::Result<(), String> {
@@ -792,27 +792,27 @@ fn start_http(
 
 #[cfg(feature = "json-tcp")]
 fn start_json_tcp(
-    server: &meshdb::net::Server,
+    server: &shardlite::net::Server,
     addr: &str,
     insecure: bool,
 ) -> std::result::Result<(), String> {
-    let jt = meshdb::net::JsonTcpServer::bind(
+    let jt = shardlite::net::JsonTcpServer::bind(
         server.shards_arc(),
         server.services_clone(),
-        meshdb::net::JsonTcpConfig {
+        shardlite::net::JsonTcpConfig {
             addr: addr.to_string(),
             insecure,
         },
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("meshdb JSON-TCP on {addr}");
+    eprintln!("shardlite JSON-TCP on {addr}");
     std::thread::spawn(move || jt.serve());
     Ok(())
 }
 
 #[cfg(not(feature = "json-tcp"))]
 fn start_json_tcp(
-    _server: &meshdb::net::Server,
+    _server: &shardlite::net::Server,
     _addr: &str,
     _insecure: bool,
 ) -> std::result::Result<(), String> {
@@ -838,7 +838,7 @@ fn serve_cmd(args: &[String]) -> ExitCode {
 
     // Authentication, if a users file was given.
     let auth = match flag(args, "--users") {
-        Some(path) => match meshdb::net::AuthConfig::open(std::path::Path::new(path)) {
+        Some(path) => match shardlite::net::AuthConfig::open(std::path::Path::new(path)) {
             Ok(a) => Some(std::sync::Arc::new(a)),
             Err(e) => {
                 eprintln!("error: reading users file: {e}");
@@ -891,9 +891,9 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         },
         None => {
             #[allow(unused_mut)]
-            let mut cfg = meshdb::shard::ShardConfig {
+            let mut cfg = shardlite::shard::ShardConfig {
                 shard_count: shards,
-                ..meshdb::shard::ShardConfig::floor()
+                ..shardlite::shard::ShardConfig::floor()
             };
             // Capture must be on for any sink to receive frames. Turn it on when S3 is configured
             // now, OR when --s3-ready pre-arms the node so an operator can attach S3 later from the
@@ -903,7 +903,7 @@ fn serve_cmd(args: &[String]) -> ExitCode {
                 cfg.capture = s3_sink.is_some() || has_flag(args, "--s3-ready");
             }
             // Open capture-ready; the sink (if any) is attached uniformly after the match below.
-            let opened = meshdb::shard::ShardManager::open_with_sink(&dir, cfg, None);
+            let opened = shardlite::shard::ShardManager::open_with_sink(&dir, cfg, None);
             let m = match opened {
                 Ok(m) => std::sync::Arc::new(m),
                 Err(e) => {
@@ -911,7 +911,7 @@ fn serve_cmd(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let services = meshdb::net::NodeServices {
+            let services = shardlite::net::NodeServices {
                 auth,
                 ..Default::default()
             };
@@ -928,7 +928,7 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         if manager.capture_enabled() {
             manager
                 .set_sink(Some(std::sync::Arc::clone(sink)
-                    as std::sync::Arc<dyn meshdb::replication::FrameSink>));
+                    as std::sync::Arc<dyn shardlite::replication::FrameSink>));
             services
                 .s3
                 .attach(std::sync::Arc::clone(sink), summary.clone());
@@ -956,15 +956,15 @@ fn serve_cmd(args: &[String]) -> ExitCode {
     #[cfg(feature = "s3")]
     let snap_manager = std::sync::Arc::clone(&manager);
 
-    let mut cfg = meshdb::net::ServerConfig {
+    let mut cfg = shardlite::net::ServerConfig {
         addr: listen.clone(),
-        ..meshdb::net::ServerConfig::default()
+        ..shardlite::net::ServerConfig::default()
     };
     if let Some(n) = flag(args, "--max-conn").and_then(|v| v.parse::<usize>().ok()) {
         cfg.max_connections = n;
     }
 
-    let server = match meshdb::net::Server::bind_with(manager, services, cfg) {
+    let server = match shardlite::net::Server::bind_with(manager, services, cfg) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -1028,12 +1028,12 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             std::sync::Arc::clone(sink),
             std::time::Duration::from_secs(secs),
         );
-        eprintln!("meshdb archiving to S3 every {secs}s");
+        eprintln!("shardlite archiving to S3 every {secs}s");
     }
 
     match node_id {
-        Some(id) => eprintln!("meshdb serving {shards} shards on {listen} as cluster node {id}"),
-        None => eprintln!("meshdb serving {shards} shards on {listen}"),
+        Some(id) => eprintln!("shardlite serving {shards} shards on {listen} as cluster node {id}"),
+        None => eprintln!("shardlite serving {shards} shards on {listen}"),
     }
     match server.serve() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1073,7 +1073,7 @@ fn parse_peers(s: &str) -> std::result::Result<std::collections::BTreeMap<u64, S
 /// `--s3-bucket` is absent. `--s3-endpoint` makes it work against any S3-compatible store (MinIO,
 /// Cloudflare R2, …), not just AWS; without it the AWS regional endpoint is derived.
 #[cfg(feature = "s3")]
-type S3Archival = (std::sync::Arc<meshdb::s3::S3Sink>, meshdb::s3::S3Summary);
+type S3Archival = (std::sync::Arc<shardlite::s3::S3Sink>, shardlite::s3::S3Summary);
 
 #[cfg(feature = "s3")]
 fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, String> {
@@ -1093,16 +1093,16 @@ fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, Strin
         .map(str::to_string)
         .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
         .ok_or("S3 needs --s3-secret-key or AWS_SECRET_ACCESS_KEY")?;
-    let prefix = flag(args, "--s3-prefix").unwrap_or("meshdb").to_string();
-    let client = Arc::new(meshdb::s3::S3Client::new(meshdb::s3::S3Config {
+    let prefix = flag(args, "--s3-prefix").unwrap_or("shardlite").to_string();
+    let client = Arc::new(shardlite::s3::S3Client::new(shardlite::s3::S3Config {
         endpoint: endpoint.clone(),
         bucket: bucket.to_string(),
         region: region.clone(),
         access_key,
         secret_key,
     }));
-    let sink = Arc::new(meshdb::s3::S3Sink::new(client, prefix.clone()));
-    let summary = meshdb::s3::S3Summary {
+    let sink = Arc::new(shardlite::s3::S3Sink::new(client, prefix.clone()));
+    let summary = shardlite::s3::S3Summary {
         bucket: bucket.to_string(),
         endpoint,
         region,
@@ -1112,19 +1112,19 @@ fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, Strin
 }
 
 /// Rebuilds a shard's data from S3 when placement hands this node a shard it has no local copy of
-/// (a failover). Wired onto the [`ClusterNode`](meshdb::cluster::ClusterNode) recovery hook; it
+/// (a failover). Wired onto the [`ClusterNode`](shardlite::cluster::ClusterNode) recovery hook; it
 /// returns promptly and downloads on its own thread so it never stalls the placement path. It only
 /// recovers a shard whose local file is **missing** — never overwriting local data — and treats
 /// "nothing archived" (a fresh cluster) as a no-op rather than an error.
 #[cfg(feature = "s3")]
 struct S3Recovery {
-    manager: std::sync::Arc<meshdb::shard::ShardManager>,
-    s3: std::sync::Arc<meshdb::s3::S3Runtime>,
+    manager: std::sync::Arc<shardlite::shard::ShardManager>,
+    s3: std::sync::Arc<shardlite::s3::S3Runtime>,
 }
 
 #[cfg(feature = "s3")]
-impl meshdb::shard::ShardRecovery for S3Recovery {
-    fn on_take_ownership(&self, shard: meshdb::shard::ShardId) {
+impl shardlite::shard::ShardRecovery for S3Recovery {
+    fn on_take_ownership(&self, shard: shardlite::shard::ShardId) {
         // A local file means this node already has (or is ahead on) this shard — never overwrite it.
         if shard.path(self.manager.dir()).exists() {
             return;
@@ -1134,10 +1134,10 @@ impl meshdb::shard::ShardRecovery for S3Recovery {
         };
         let manager = std::sync::Arc::clone(&self.manager);
         let _ = std::thread::Builder::new()
-            .name(format!("meshdb-s3-recover-{}", shard.0))
+            .name(format!("shardlite-s3-recover-{}", shard.0))
             .spawn(move || {
                 // Nothing archived for this shard (a fresh cluster) is not a failure.
-                match meshdb::s3::failover::latest_snapshot(&client, &prefix, shard) {
+                match shardlite::s3::failover::latest_snapshot(&client, &prefix, shard) {
                     Ok(Some(_)) => {}
                     Ok(None) => return,
                     Err(e) => {
@@ -1164,18 +1164,18 @@ impl meshdb::shard::ShardRecovery for S3Recovery {
 /// writer thread; `interval` trades RPO/failover-freshness against the cost of a checkpoint.
 #[cfg(feature = "s3")]
 fn spawn_s3_snapshots(
-    manager: std::sync::Arc<meshdb::shard::ShardManager>,
-    sink: std::sync::Arc<meshdb::s3::S3Sink>,
+    manager: std::sync::Arc<shardlite::shard::ShardManager>,
+    sink: std::sync::Arc<shardlite::s3::S3Sink>,
     interval: std::time::Duration,
 ) {
-    use meshdb::shard::ShardId;
+    use shardlite::shard::ShardId;
     let _ = std::thread::Builder::new()
-        .name("meshdb-s3-snap".into())
+        .name("shardlite-s3-snap".into())
         .spawn(move || {
             loop {
                 for s in 0..manager.shard_count() {
                     let shard = ShardId(s);
-                    let tmp = std::env::temp_dir().join(format!("meshdb-s3-snap-{s}.db"));
+                    let tmp = std::env::temp_dir().join(format!("shardlite-s3-snap-{s}.db"));
                     match manager.snapshot(shard, &tmp) {
                         Ok((epoch, lsn)) => {
                             if let Ok(bytes) = std::fs::read(&tmp) {
@@ -1201,20 +1201,20 @@ fn build_cluster(
     shards: u32,
     id: u64,
     peers: std::collections::BTreeMap<u64, String>,
-    auth: Option<std::sync::Arc<meshdb::net::AuthConfig>>,
+    auth: Option<std::sync::Arc<shardlite::net::AuthConfig>>,
 ) -> std::result::Result<
     (
-        std::sync::Arc<meshdb::shard::ShardManager>,
-        meshdb::net::NodeServices,
-        std::sync::Arc<meshdb::cluster::ClusterNode>,
+        std::sync::Arc<shardlite::shard::ShardManager>,
+        shardlite::net::NodeServices,
+        std::sync::Arc<shardlite::cluster::ClusterNode>,
     ),
     String,
 > {
-    use meshdb::cluster::{
+    use shardlite::cluster::{
         ClusterNode, DurabilitySource, Election, ElectionConfig, Fence, TermStore,
     };
-    use meshdb::replication::{FrameLog, FrameLogConfig};
-    use meshdb::shard::{PeerRouter, ShardConfig, ShardId, ShardManager, WriteGate};
+    use shardlite::replication::{FrameLog, FrameLogConfig};
+    use shardlite::shard::{PeerRouter, ShardConfig, ShardId, ShardManager, WriteGate};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1263,11 +1263,11 @@ fn build_cluster(
         .with_modes(Arc::clone(manager.modes())),
     );
 
-    let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
+    let router = Arc::new(shardlite::net::Router::new(Arc::clone(&cluster)));
     // The seam that makes fan-outs cross-host: shards this node does not own are forwarded here.
     manager.set_peer_router(Arc::clone(&router) as Arc<dyn PeerRouter>);
 
-    let services = meshdb::net::NodeServices {
+    let services = shardlite::net::NodeServices {
         auth,
         frames: Some(frames),
         cluster: Some(Arc::clone(&cluster)),
@@ -1279,11 +1279,11 @@ fn build_cluster(
 
 #[cfg(feature = "tls")]
 fn enable_tls(
-    server: meshdb::net::Server,
+    server: shardlite::net::Server,
     cert: &str,
     key: &str,
-) -> std::result::Result<meshdb::net::Server, String> {
-    let tls = meshdb::net::transport::TlsServerConfig::from_pem_files(
+) -> std::result::Result<shardlite::net::Server, String> {
+    let tls = shardlite::net::transport::TlsServerConfig::from_pem_files(
         std::path::Path::new(cert),
         std::path::Path::new(key),
     )
@@ -1293,21 +1293,21 @@ fn enable_tls(
 
 #[cfg(not(feature = "tls"))]
 fn enable_tls(
-    _server: meshdb::net::Server,
+    _server: shardlite::net::Server,
     _cert: &str,
     _key: &str,
-) -> std::result::Result<meshdb::net::Server, String> {
+) -> std::result::Result<shardlite::net::Server, String> {
     Err("this build has no TLS support; rebuild with `--features tls`".into())
 }
 
 /// Resolve the shard count the same way the main path does: the manifest decides for an
 /// existing directory, and `--shards` is required to create one.
 const SHARDKEY_USAGE: &str = "usage:
-  meshdb shardkey <dir> <table> <column>   declare a table's shard key (co-partitioning)
-  meshdb shardkey <dir> --list             list declared shard keys
+  shardlite shardkey <dir> <table> <column>   declare a table's shard key (co-partitioning)
+  shardlite shardkey <dir> --list             list declared shard keys
 
 Two tables declared on their shard keys may be joined in a cross-shard read on those keys.
-This asserts how the app routes those tables — meshdb trusts it, as it cannot verify placement.";
+This asserts how the app routes those tables — shardlite trusts it, as it cannot verify placement.";
 
 fn shardkey_cmd(args: &[String]) -> ExitCode {
     // args[0] == "shardkey"
@@ -1384,9 +1384,9 @@ fn resolve_shards(
 }
 
 const USER_USAGE: &str = "usage:
-  meshdb user add  <name> <secret> --role <read|write|admin> [target]
-  meshdb user drop <name>                                    [target]
-  meshdb user list                                           [target]
+  shardlite user add  <name> <secret> --role <read|write|admin> [target]
+  shardlite user drop <name>                                    [target]
+  shardlite user list                                           [target]
 
 target is one of:
   --users FILE                          edit the users file directly (offline)
@@ -1409,11 +1409,11 @@ fn user_cmd(args: &[String]) -> ExitCode {
 
     // Offline (a file) or online (a running server)?
     enum Target {
-        File(meshdb::net::AuthConfig),
-        Server(meshdb::net::Client),
+        File(shardlite::net::AuthConfig),
+        Server(shardlite::net::Client),
     }
     let target = match (flag(args, "--users"), flag(args, "--server")) {
-        (Some(file), None) => match meshdb::net::AuthConfig::open(std::path::Path::new(file)) {
+        (Some(file), None) => match shardlite::net::AuthConfig::open(std::path::Path::new(file)) {
             Ok(a) => Target::File(a),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1426,7 +1426,7 @@ fn user_cmd(args: &[String]) -> ExitCode {
                 eprintln!("error: --server needs --as ADMIN and --admin-secret S");
                 return ExitCode::FAILURE;
             };
-            match meshdb::net::Client::connect_as(addr, admin, secret) {
+            match shardlite::net::Client::connect_as(addr, admin, secret) {
                 Ok(c) => Target::Server(c),
                 Err(e) => {
                     eprintln!("error: connecting as admin: {e}");
@@ -1451,7 +1451,7 @@ fn user_cmd(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let role_str = flag(args, "--role").unwrap_or("");
-            let role: meshdb::net::Role = match role_str.parse() {
+            let role: shardlite::net::Role = match role_str.parse() {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1460,7 +1460,7 @@ fn user_cmd(args: &[String]) -> ExitCode {
             };
             let result = match target {
                 Target::File(auth) => {
-                    auth.create(name, meshdb::net::auth::derive_key(secret), role)
+                    auth.create(name, shardlite::net::auth::derive_key(secret), role)
                 }
                 Target::Server(mut c) => c.create_user(name, secret, role),
             };
@@ -1529,7 +1529,7 @@ fn user_cmd(args: &[String]) -> ExitCode {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("MESHDB_LOG")
+    let filter = EnvFilter::try_from_env("SHARDLITE_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()

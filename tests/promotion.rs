@@ -10,13 +10,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use meshdb::cluster::{Fence, Promotion};
-use meshdb::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
-use meshdb::replication::{AckTracker, Follower, FrameLog, FrameLogConfig};
-use meshdb::shard::mode::ShardMode;
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::cluster::{Fence, Promotion};
+use shardlite::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
+use shardlite::replication::{AckTracker, Follower, FrameLog, FrameLogConfig};
+use shardlite::shard::mode::ShardMode;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -44,9 +44,9 @@ fn await_caught_up(p: &Primary, r: &Replicant, shard: ShardId, within: Duration)
 }
 
 /// The single scalar a query returned.
-fn scalar(o: meshdb::storage::exec::Outcome) -> Value {
+fn scalar(o: shardlite::storage::exec::Outcome) -> Value {
     match o {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
             r.rows[0][0].clone()
         }
         other => panic!("expected rows, got {other:?}"),
@@ -147,7 +147,7 @@ fn replicant_with_shards(p: &Primary, shards: u32) -> Replicant {
             },
             None,
             None,
-            Some(Arc::clone(&fence) as Arc<dyn meshdb::shard::WriteGate>),
+            Some(Arc::clone(&fence) as Arc<dyn shardlite::shard::WriteGate>),
         )
         .unwrap(),
     );
@@ -634,8 +634,8 @@ fn applying_the_same_placement_twice_changes_nothing() {
 fn a_stale_read_is_answered_by_the_replica_and_a_strong_one_is_not() {
     // The levels only mean something if they route differently. Here the replica genuinely
     // holds the shard, so a weak read can be served from it while a strong one cannot.
-    use meshdb::net::ReadConsistency;
-    use meshdb::net::protocol::{Request, Response};
+    use shardlite::net::ReadConsistency;
+    use shardlite::net::protocol::{Request, Response};
 
     let p = primary(2);
     let r = replicant(&p);

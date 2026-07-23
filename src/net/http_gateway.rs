@@ -706,7 +706,7 @@ impl HttpGateway {
             let secret_key = b
                 .secret_key
                 .ok_or_else(|| HttpError::new(400, "secret_key is required"))?;
-            let prefix = b.prefix.unwrap_or_else(|| "meshdb".into());
+            let prefix = b.prefix.unwrap_or_else(|| "shardlite".into());
             let client = std::sync::Arc::new(crate::s3::S3Client::new(crate::s3::S3Config {
                 endpoint: endpoint.clone(),
                 bucket: bucket.clone(),
@@ -802,7 +802,7 @@ impl HttpGateway {
             let mut errors: Vec<String> = Vec::new();
             for s in 0..self.shards.shard_count() {
                 let shard = crate::shard::ShardId(s);
-                let tmp = std::env::temp_dir().join(format!("meshdb-s3-http-snap-{s}.db"));
+                let tmp = std::env::temp_dir().join(format!("shardlite-s3-http-snap-{s}.db"));
                 // A shard this node does not own can't be frozen; skip it rather than fail the call.
                 if let Ok((epoch, lsn)) = self.shards.snapshot(shard, &tmp) {
                     match std::fs::read(&tmp) {
@@ -1551,7 +1551,7 @@ fn json_params(vals: &[serde_json::Value]) -> std::result::Result<Vec<Value>, Ht
 
 // ---- value / response JSON ----
 
-/// A WAL inspection report as JSON, matching the `meshdb frames` view.
+/// A WAL inspection report as JSON, matching the `shardlite frames` view.
 fn frames_json(report: &crate::vfs::WalReport) -> serde_json::Value {
     match &report.header {
         None => serde_json::json!({ "wal": false, "file_bytes": report.file_bytes }),

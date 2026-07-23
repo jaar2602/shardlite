@@ -1,5 +1,5 @@
 //! A minimal, **blocking** S3 client — enough to archive a shard to object storage and read it
-//! back, without pulling in an async runtime. meshdb is deliberately tokio-free, so this signs
+//! back, without pulling in an async runtime. shardlite is deliberately tokio-free, so this signs
 //! requests with AWS Signature Version 4 by hand and speaks HTTP/1.1 (+ TLS) over `ureq`.
 //!
 //! Scope is deliberately small: `PUT` / `GET` (with byte ranges) / `DELETE` / `LIST`, path-style

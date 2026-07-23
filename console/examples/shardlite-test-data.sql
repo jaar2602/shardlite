@@ -1,4 +1,4 @@
--- Synthetic MeshDB console data
+-- Synthetic ShardLite console data
 -- seed=42 accounts=100 events_per_account=2 updates=40
 -- Generated locally from fixed word lists and Python's pseudo-random generator; no AI is used.
 -- Run the schema section of workbench-test.sql first.

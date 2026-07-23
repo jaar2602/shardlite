@@ -1,4 +1,4 @@
-//! meshdb — a high-availability, multi-write SQLite server.
+//! shardlite — a high-availability, multi-write SQLite server.
 //!
 //! Writes to any single database file are serialized through one writer connection and
 //! batched into shared transactions (group commit); concurrency for writers comes from

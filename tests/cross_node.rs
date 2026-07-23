@@ -7,9 +7,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use meshdb::shard::{PeerRouter, ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome, Statement};
+use shardlite::shard::{PeerRouter, ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome, Statement};
 use tempfile::TempDir;
 
 const N: u32 = 8;
@@ -37,10 +37,10 @@ impl PeerRouter for Split {
     fn is_local(&self, shard: ShardId) -> bool {
         self.mine.contains(&shard.0)
     }
-    fn query_remote(&self, shard: ShardId, stmt: Statement) -> meshdb::Result<Outcome> {
+    fn query_remote(&self, shard: ShardId, stmt: Statement) -> shardlite::Result<Outcome> {
         self.other.query(shard, stmt)
     }
-    fn execute_remote(&self, shard: ShardId, stmt: Statement) -> meshdb::Result<Outcome> {
+    fn execute_remote(&self, shard: ShardId, stmt: Statement) -> shardlite::Result<Outcome> {
         self.other.execute_one(shard, stmt)
     }
     fn fan_out(
@@ -48,7 +48,7 @@ impl PeerRouter for Split {
         shards: &[ShardId],
         statement: &Statement,
         write: bool,
-    ) -> Vec<meshdb::Result<Outcome>> {
+    ) -> Vec<shardlite::Result<Outcome>> {
         // One call, all remote shards — the whole point of batching. (There is only one peer here,
         // so every remote shard is in this single call; a real Router splits by owner node.)
         self.fan_out_calls.fetch_add(1, Ordering::SeqCst);

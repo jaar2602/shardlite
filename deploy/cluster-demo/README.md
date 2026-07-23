@@ -1,6 +1,6 @@
-# meshdb cluster demo (3 nodes, containers)
+# shardlite cluster demo (3 nodes, containers)
 
-Spins up **three meshdb nodes**, each in its own container, forming one cluster on a shared
+Spins up **three shardlite nodes**, each in its own container, forming one cluster on a shared
 Docker network. It demonstrates the point of the whole design: **a client connects to any node,
 runs plain SQL, and never knows the data is sharded across all three.**
 
@@ -54,7 +54,7 @@ It brings the cluster up (reusing `docker-compose.yml`), generates the data with
 - **Q6** (Forecasting Revenue Change) — a filtered `sum` fanned out across shards.
 - a grouped aggregate on `orders`, a point lookup routed to one shard, and a 3-way
   `customer⋈nation⋈region` **join** — which shards by different keys, so it is not co-located and
-  meshdb answers it by materialising centrally.
+  shardlite answers it by materialising centrally.
 
 Money is modelled as **integer cents** and discount as an integer percent (with the discounted
 price precomputed), so the cross-shard merged answers are *exactly* equal to a single-node one —
@@ -68,7 +68,7 @@ after the walkthrough instead (e.g. a non-interactive run).
 
 ## Web console
 
-`./console.sh` starts the meshdb **console** (the web UI) pointed at this cluster. It brings the
+`./console.sh` starts the shardlite **console** (the web UI) pointed at this cluster. It brings the
 cluster up if needed, launches the console backend on `localhost:7100`, and pre-registers the
 cluster as a connection, so you just sign in and browse/query it:
 
@@ -92,7 +92,7 @@ docker compose down
 Each node is started with (see `docker-compose.yml`):
 
 ```
-meshdb serve /data --shards 12 \
+shardlite serve /data --shards 12 \
   --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure \
   --node-id <N> --peers <the other two as id=host:4600>
 ```
@@ -109,5 +109,5 @@ meshdb serve /data --shards 12 \
   replicas and writes are acknowledged locally (no quorum wait). Lose a node and its shards are
   unavailable until it returns. Data-level HA (replicas + quorum ack) is a further step.
 - **No security.** `--http-insecure` serves a plaintext gateway with no auth. For anything real,
-  put TLS and `--users` (see `meshdb serve --help`) in front.
+  put TLS and `--users` (see `shardlite serve --help`) in front.
 - Containers use ephemeral `/data`; a full teardown starts fresh.

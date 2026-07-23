@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::{AuthConfig, Client, NodeServices, Role, Server, ServerConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
+use shardlite::net::{AuthConfig, Client, NodeServices, Role, Server, ServerConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
 use tempfile::TempDir;
 
 struct Node {
@@ -152,7 +152,7 @@ fn correct_credentials_work_and_roles_bound_what_they_may_do() {
 fn client_roles_cannot_touch_the_replication_stream() {
     // The wall between the ladders. Subscribe and snapshots hand out whole shards; an
     // administrator's stolen credentials must not include the exfiltration path.
-    use meshdb::net::protocol::Request;
+    use shardlite::net::protocol::Request;
 
     let n = serve(Some(full_auth()));
     let mut ops = Client::connect_as(&n.addr, "ops", "admin-secret").unwrap();
@@ -186,7 +186,7 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
     // The property that makes challenge–response worth its round trip: a captured handshake
     // is useless against any other connection. Driven by hand, because the property is the
     // protocol's, not the client wrapper's.
-    use meshdb::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
     use std::net::TcpStream;
 
     let n = serve(Some(full_auth()));
@@ -207,7 +207,7 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
             panic!("expected a challenge");
         };
         let proof = auth_reply.unwrap_or_else(|| {
-            meshdb::net::auth::prove(&meshdb::net::auth::derive_key("write-secret"), &nonce)
+            shardlite::net::auth::prove(&shardlite::net::auth::derive_key("write-secret"), &nonce)
         });
         write_message(
             &mut w,
@@ -237,7 +237,7 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
         panic!("expected a challenge");
     };
     let captured_proof =
-        meshdb::net::auth::prove(&meshdb::net::auth::derive_key("write-secret"), &first_nonce);
+        shardlite::net::auth::prove(&shardlite::net::auth::derive_key("write-secret"), &first_nonce);
 
     // A new connection gets a different nonce, and the captured proof fails against it.
     let (second_nonce, replay_outcome) = handshake(Some(captured_proof));
@@ -264,9 +264,9 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
 fn an_authenticated_replica_pulls_frames_from_an_authenticated_primary() {
     // The cluster principal end to end: subscription is a cluster verb, so a replica must
     // authenticate to follow — and with credentials configured, it simply works.
-    use meshdb::net::{Replica, ReplicaConfig};
-    use meshdb::replication::{Follower, FrameLog, FrameLogConfig};
-    use meshdb::storage::exec::Statement;
+    use shardlite::net::{Replica, ReplicaConfig};
+    use shardlite::replication::{Follower, FrameLog, FrameLogConfig};
+    use shardlite::storage::exec::Statement;
 
     let dir = TempDir::new().unwrap();
     let frames = Arc::new(FrameLog::new(FrameLogConfig {
@@ -454,7 +454,7 @@ fn runtime_changes_survive_a_restart_through_the_users_file() {
         let auth = AuthConfig::open(&users_file).unwrap();
         auth.create(
             "boss",
-            meshdb::net::auth::derive_key("boss-pw"),
+            shardlite::net::auth::derive_key("boss-pw"),
             Role::Admin,
         )
         .unwrap();

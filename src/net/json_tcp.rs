@@ -121,7 +121,7 @@ impl JsonTcpServer {
             let services = self.services.clone();
             let counters = Arc::clone(&self.counters);
             std::thread::Builder::new()
-                .name("meshdb-jsontcp".into())
+                .name("shardlite-jsontcp".into())
                 .spawn(move || {
                     if let Err(e) = serve_conn(stream, &shards, &services, &counters) {
                         tracing::debug!(error = %e, "JSON-TCP connection ended");

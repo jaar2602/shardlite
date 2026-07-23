@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use meshdb::shard::{ShardConfig, ShardId, ShardManager, shard_of};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager, shard_of};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome};
 use tempfile::TempDir;
 
 fn scalar(o: &Outcome) -> i64 {

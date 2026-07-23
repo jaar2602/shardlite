@@ -121,7 +121,7 @@ fn has_rowid(conn: &Connection, table: &str) -> bool {
 /// to be — different vacuum history, different checkpoint timing, different freelist.
 pub fn content_hash(conn: &Connection) -> Result<ContentHash> {
     let mut h = blake3::Hasher::new();
-    h.update(b"meshdb-content-v1");
+    h.update(b"shardlite-content-v1");
 
     // The schema itself is part of the data: a replica with the right rows and the wrong
     // schema has still diverged.

@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::{Client, Replica, ReplicaConfig, Server, ServerConfig};
-use meshdb::replication::{Follower, FrameLog, FrameLogConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::net::{Client, Replica, ReplicaConfig, Server, ServerConfig};
+use shardlite::replication::{Follower, FrameLog, FrameLogConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -96,7 +96,7 @@ fn insert(i: i64) -> Statement {
 /// differ legitimately. Measured while building `storage::verify`: switching that module to
 /// a byte hash made `a_correctly_replicated_shard_matches_its_primary` fail outright.
 fn assert_converged(p: &Primary, r: &Replica, shard: ShardId) {
-    use meshdb::storage::verify::{hash_file, hex};
+    use shardlite::storage::verify::{hash_file, hex};
 
     let tmp = TempDir::new().unwrap();
     let snap = tmp.path().join("cmp.db");
@@ -113,7 +113,7 @@ fn assert_converged(p: &Primary, r: &Replica, shard: ShardId) {
     // Still worth checking, and worth knowing it is not sufficient: a follower holding valid
     // pages that are the wrong pages passes this happily. The content hash above is what
     // actually catches that.
-    let conn = meshdb::rusqlite::Connection::open(shard.path(r.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(shard.path(r.follower().dir())).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
@@ -137,7 +137,7 @@ fn a_follower_replicates_over_the_network() {
     r.sync_once().unwrap();
     assert_converged(&p, &r, S0);
 
-    let conn = meshdb::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |x| x.get(0))
         .unwrap();
@@ -184,7 +184,7 @@ fn a_follower_catches_up_after_a_disconnect() {
     assert!(after_second.applied_txns > after_first.applied_txns);
 
     assert_converged(&p, &r, S0);
-    let conn = meshdb::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |x| x.get(0))
         .unwrap();
@@ -233,7 +233,7 @@ fn a_follower_too_far_behind_bootstraps_over_the_network() {
     println!("{stats:?} / primary log {log_stats:?}");
 
     assert_converged(&p, &r, S0);
-    let conn = meshdb::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |x| x.get(0))
         .unwrap();
@@ -304,7 +304,7 @@ fn a_follower_from_another_generation_is_refused() {
     // the primary's answer against itself and always pass — and a follower holding a copy
     // from an older generation would be fed a newer generation's frames as though they
     // continued its own, which is silent corruption rather than a detected gap.
-    use meshdb::net::protocol::{Request, Response};
+    use shardlite::net::protocol::{Request, Response};
 
     let p = primary(1, 8 * 1024 * 1024);
     let mut c = Client::connect(&p.addr).unwrap();
@@ -389,7 +389,7 @@ fn a_freeze_abandoned_by_a_dead_follower_is_released() {
     // A follower that takes a snapshot freeze and then dies must not pin the primary. The
     // freeze suspends checkpointing, so one left held forever grows the WAL without bound —
     // a crashed follower would slowly take the primary down with it.
-    use meshdb::net::protocol::{Request, Response};
+    use shardlite::net::protocol::{Request, Response};
 
     let p = primary(1, 8 * 1024 * 1024);
     let mut c = Client::connect(&p.addr).unwrap();

@@ -85,7 +85,7 @@ impl FrameHeader {
 
 /// One frame as it physically sits in a WAL file, for offline inspection.
 ///
-/// This is what `meshdb frames` reports: the raw physical stream, not the reconstructed
+/// This is what `shardlite frames` reports: the raw physical stream, not the reconstructed
 /// transaction view the live capture builds. It reads a file at rest and reports every frame
 /// slot, so a frame past the last commit — an in-progress or leftover write — is shown rather
 /// than hidden.

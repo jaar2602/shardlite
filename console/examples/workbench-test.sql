@@ -1,11 +1,11 @@
--- meshdb console workbench test kit
+-- shardlite console workbench test kit
 --
 -- This is a runbook, not one batch. Copy one statement at a time into the mode named by each
 -- section. Start on a disposable cluster. Names are prefixed with console_test_ so cleanup is
 -- predictable.
 --
 -- The workbench uses one editor. Run the statement at the cursor, select SQL, or run the complete
--- document. MeshDB recognizes reads, keyed writes, atomic write groups, and schema changes.
+-- document. ShardLite recognizes reads, keyed writes, atomic write groups, and schema changes.
 -- Physical shard controls appear only in Options and are needed only by the optional diagnostic
 -- sections near the end of this file.
 
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS console_test_export (
 -- -----------------------------------------------------------------------------
 -- 2. DATA KEY + TYPED PARAMETERS — run the statement at the cursor
 -- -----------------------------------------------------------------------------
--- Enter Data key: acct:alice. MeshDB resolves placement automatically.
+-- Enter Data key: acct:alice. ShardLite resolves placement automatically.
 -- SQL parameters, in order:
 --   1 text     acct:alice
 --   2 text     alice@example.test
@@ -159,7 +159,7 @@ SELECT account_id, balance_cents
 -- -----------------------------------------------------------------------------
 -- 7. DATABASE-WIDE READS — default execution, with no bound parameters
 -- -----------------------------------------------------------------------------
--- MeshDB plans and merges these reads across the database. Populate two or more data keys first
+-- ShardLite plans and merges these reads across the database. Populate two or more data keys first
 -- for more interesting results.
 
 SELECT COUNT(*) AS account_count,

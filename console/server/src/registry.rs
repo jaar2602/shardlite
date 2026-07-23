@@ -1,5 +1,5 @@
-//! The saved meshdb connections — the console's equivalent of a database client's connection
-//! list. Each profile names a cluster's HTTP `/v1` edge and the meshdb credential to use against
+//! The saved shardlite connections — the console's equivalent of a database client's connection
+//! list. Each profile names a cluster's HTTP `/v1` edge and the shardlite credential to use against
 //! it. The credential is a real secret, so it is **sealed at rest** (scoping decision 3): the
 //! file stores ciphertext, and only the console master passphrase can open it.
 
@@ -33,7 +33,7 @@ pub struct ConnectionInfo {
     pub name: String,
     pub url: String,
     pub seeds: Vec<String>,
-    pub meshdb_user: Option<String>,
+    pub shardlite_user: Option<String>,
     pub enabled: bool,
     pub timeout_ms: u64,
     pub allow_insecure_http: bool,
@@ -46,8 +46,8 @@ pub struct ConnectionInfo {
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub url: String,
-    pub meshdb_user: Option<String>,
-    pub meshdb_secret: Option<String>,
+    pub shardlite_user: Option<String>,
+    pub shardlite_secret: Option<String>,
     pub timeout_ms: u64,
     pub custom_ca_pem: Option<String>,
     /// S3 replication config, decrypted, ready to push to the nodes via the `apply-s3` action
@@ -65,9 +65,9 @@ struct Record {
     /// remains the single seed.
     #[serde(default)]
     seeds: Vec<String>,
-    /// meshdb username, if the cluster requires auth. Not a secret.
-    meshdb_user: Option<String>,
-    /// The meshdb secret, sealed. `None` when the cluster runs without auth.
+    /// shardlite username, if the cluster requires auth. Not a secret.
+    shardlite_user: Option<String>,
+    /// The shardlite secret, sealed. `None` when the cluster runs without auth.
     sealed_secret: Option<String>,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -171,15 +171,15 @@ impl Registry {
         &self,
         name: &str,
         url: &str,
-        meshdb_user: Option<String>,
-        meshdb_secret: Option<String>,
+        shardlite_user: Option<String>,
+        shardlite_secret: Option<String>,
         replace: bool,
     ) -> Result<(), RegistryError> {
         self.put_config(
             name,
             url,
-            meshdb_user,
-            meshdb_secret,
+            shardlite_user,
+            shardlite_secret,
             replace,
             true,
             default_timeout_ms(),
@@ -193,8 +193,8 @@ impl Registry {
         &self,
         name: &str,
         url: &str,
-        meshdb_user: Option<String>,
-        meshdb_secret: Option<String>,
+        shardlite_user: Option<String>,
+        shardlite_secret: Option<String>,
         replace: bool,
         enabled: bool,
         timeout_ms: u64,
@@ -204,8 +204,8 @@ impl Registry {
         self.put_config_seeds(
             name,
             vec![url.to_string()],
-            meshdb_user,
-            meshdb_secret,
+            shardlite_user,
+            shardlite_secret,
             replace,
             enabled,
             timeout_ms,
@@ -221,8 +221,8 @@ impl Registry {
         &self,
         name: &str,
         seeds: Vec<String>,
-        meshdb_user: Option<String>,
-        meshdb_secret: Option<String>,
+        shardlite_user: Option<String>,
+        shardlite_secret: Option<String>,
         replace: bool,
         enabled: bool,
         timeout_ms: u64,
@@ -254,7 +254,7 @@ impl Registry {
         if !replace && map.contains_key(name) {
             return Err(RegistryError::Exists);
         }
-        let sealed_secret = match meshdb_secret {
+        let sealed_secret = match shardlite_secret {
             Some(secret) => Some(self.sealer.seal(secret.as_bytes())),
             None if replace => map
                 .get(name)
@@ -276,7 +276,7 @@ impl Registry {
                 name: name.to_string(),
                 url: normalized[0].clone(),
                 seeds: normalized.clone(),
-                meshdb_user,
+                shardlite_user,
                 sealed_secret,
                 enabled,
                 timeout_ms,
@@ -312,7 +312,7 @@ impl Registry {
                 name: r.name.clone(),
                 url: record_seeds(r)[0].clone(),
                 seeds: record_seeds(r),
-                meshdb_user: r.meshdb_user.clone(),
+                shardlite_user: r.shardlite_user.clone(),
                 enabled: r.enabled,
                 timeout_ms: r.timeout_ms,
                 allow_insecure_http: r.allow_insecure_http,
@@ -439,7 +439,7 @@ fn resolve_record(
     url: String,
     sealer: &Sealer,
 ) -> Result<Resolved, RegistryError> {
-    let meshdb_secret = match &record.sealed_secret {
+    let shardlite_secret = match &record.sealed_secret {
         None => None,
         Some(sealed) => {
             let bytes = sealer.open(sealed).ok_or(RegistryError::Unsealable)?;
@@ -455,8 +455,8 @@ fn resolve_record(
     };
     Ok(Resolved {
         url,
-        meshdb_user: record.meshdb_user.clone(),
-        meshdb_secret,
+        shardlite_user: record.shardlite_user.clone(),
+        shardlite_secret,
         timeout_ms: record.timeout_ms,
         custom_ca_pem: record.custom_ca_pem.clone(),
         s3: record.s3.clone(),
@@ -551,7 +551,7 @@ mod tests {
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
         let n: u64 = rand::random();
-        p.push(format!("meshdb-console-conns-{n}.json"));
+        p.push(format!("shardlite-console-conns-{n}.json"));
         p
     }
 
@@ -577,7 +577,7 @@ mod tests {
 
         // ...but resolve opens it for the proxy.
         let r = reg.resolve("prod").unwrap();
-        assert_eq!(r.meshdb_secret.as_deref(), Some("s3cret"));
+        assert_eq!(r.shardlite_secret.as_deref(), Some("s3cret"));
 
         // and the on-disk file must not contain the plaintext.
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -600,7 +600,7 @@ mod tests {
             true,
             None,
             Some(S3Settings {
-                bucket: "meshdb-backup".into(),
+                bucket: "shardlite-backup".into(),
                 region: "us-east-1".into(),
                 endpoint: String::new(),
                 access_key: "AKIAEXAMPLE".into(),
@@ -614,14 +614,14 @@ mod tests {
         // list surfaces the non-secret S3 settings, never the key.
         let listed = reg.list();
         let s3 = listed[0].s3.as_ref().unwrap();
-        assert_eq!(s3.bucket, "meshdb-backup");
+        assert_eq!(s3.bucket, "shardlite-backup");
         assert_eq!(s3.access_key, "AKIAEXAMPLE");
         assert!(s3.enabled);
 
         // resolve decrypts the secret key for the proxy.
         let r = reg.resolve("prod").unwrap();
         assert_eq!(r.s3_secret_key.as_deref(), Some("s3-secret-key-material"));
-        assert_eq!(r.s3.as_ref().unwrap().bucket, "meshdb-backup");
+        assert_eq!(r.s3.as_ref().unwrap().bucket, "shardlite-backup");
 
         // the sealed key is never written to disk in plaintext.
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -746,7 +746,7 @@ mod tests {
         )
         .unwrap();
         let resolved = reg.resolve_any("prod").unwrap();
-        assert_eq!(resolved.meshdb_secret.as_deref(), Some("secret"));
+        assert_eq!(resolved.shardlite_secret.as_deref(), Some("secret"));
         assert_eq!(resolved.timeout_ms, 10_000);
         assert!(matches!(reg.resolve("prod"), Err(RegistryError::Disabled)));
         assert!(reg.names().is_empty());
@@ -771,7 +771,7 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_ne!(before, after);
         assert_eq!(
-            reg.resolve("prod").unwrap().meshdb_secret.as_deref(),
+            reg.resolve("prod").unwrap().shardlite_secret.as_deref(),
             Some("secret")
         );
         drop(reg);
@@ -786,7 +786,7 @@ mod tests {
                 .unwrap()
                 .resolve("prod")
                 .unwrap()
-                .meshdb_secret
+                .shardlite_secret
                 .as_deref(),
             Some("secret")
         );
@@ -879,8 +879,8 @@ mod tests {
             .resolve_candidate("prod", "https://node-2:4680/")
             .unwrap();
         assert_eq!(candidate.url, "https://node-2:4680");
-        assert_eq!(candidate.meshdb_user.as_deref(), Some("app"));
-        assert_eq!(candidate.meshdb_secret.as_deref(), Some("secret"));
+        assert_eq!(candidate.shardlite_user.as_deref(), Some("app"));
+        assert_eq!(candidate.shardlite_secret.as_deref(), Some("secret"));
         assert_eq!(reg.list()[0].seeds, vec!["https://node-1:4680"]);
         std::fs::remove_file(&path).ok();
     }

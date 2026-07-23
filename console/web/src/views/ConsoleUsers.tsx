@@ -47,7 +47,7 @@ export default function ConsoleUsers() {
 
   return (
     <Page>
-      <PageHeader eyebrow="Console / access control" title="Console users" description="Accounts for this console, separate from credentials stored for each MeshDB connection. Roles limit which observations and actions are available." />
+      <PageHeader eyebrow="Console / access control" title="Console users" description="Accounts for this console, separate from credentials stored for each ShardLite connection. Roles limit which observations and actions are available." />
 
       {error && <div className="mb-4"><Banner tone="error">{error}</Banner></div>}
 

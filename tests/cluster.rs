@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use meshdb::cluster::{
+use shardlite::cluster::{
     ClusterNode, Durability, DurabilitySource, Election, ElectionConfig, Fence, FenceToken, NodeId,
     TermStore,
 };
-use meshdb::net::{Server, ServerConfig};
-use meshdb::replication::{FrameLog, FrameLogConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::net::{Server, ServerConfig};
+use shardlite::replication::{FrameLog, FrameLogConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
 use tempfile::TempDir;
 
 /// Fast enough that a test finishes quickly, still far enough apart that a healthy leader is
@@ -33,7 +33,7 @@ struct Node {
     #[allow(dead_code)]
     addr: String,
     #[cfg(feature = "http")]
-    http: Arc<meshdb::net::HttpGateway>,
+    http: Arc<shardlite::net::HttpGateway>,
     #[cfg(feature = "http")]
     http_base: String,
     _dir: TempDir,
@@ -91,7 +91,7 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
                 },
                 Some(frames.clone()),
                 None,
-                Some(Arc::clone(&fence) as Arc<dyn meshdb::shard::WriteGate>),
+                Some(Arc::clone(&fence) as Arc<dyn shardlite::shard::WriteGate>),
             )
             .unwrap(),
         );
@@ -157,8 +157,8 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
             .with_modes(Arc::clone(manager.modes())),
         );
 
-        let router = Arc::new(meshdb::net::Router::new(Arc::clone(&cluster)));
-        let services = meshdb::net::NodeServices {
+        let router = Arc::new(shardlite::net::Router::new(Arc::clone(&cluster)));
+        let services = shardlite::net::NodeServices {
             frames: Some(frames),
             cluster: Some(Arc::clone(&cluster)),
             router: Some(router),
@@ -185,10 +185,10 @@ fn cluster(n: usize) -> Vec<Arc<Node>> {
         #[cfg(feature = "http")]
         let (http, http_base) = {
             let gateway = Arc::new(
-                meshdb::net::HttpGateway::bind(
+                shardlite::net::HttpGateway::bind(
                     Arc::clone(&manager),
                     services,
-                    meshdb::net::HttpConfig {
+                    shardlite::net::HttpConfig {
                         addr: "127.0.0.1:0".into(),
                         workers: 2,
                         insecure: false,
@@ -315,7 +315,7 @@ fn await_leader(live: &[Arc<Node>], within: Duration) -> Option<Arc<Node>> {
 }
 
 /// Wait until placement has spread shards over more than one node.
-fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<meshdb::cluster::Placement> {
+fn await_spread(live: &[Arc<Node>], within: Duration) -> Option<shardlite::cluster::Placement> {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         for n in live {
@@ -560,7 +560,7 @@ fn a_candidate_that_is_behind_cannot_win() {
         .manager
         .execute_one(
             shard,
-            meshdb::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+            shardlite::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
         )
         .unwrap();
     for i in 1..=20 {
@@ -568,7 +568,7 @@ fn a_candidate_that_is_behind_cannot_win() {
             .manager
             .execute_one(
                 shard,
-                meshdb::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({i})")),
+                shardlite::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({i})")),
             )
             .unwrap();
     }
@@ -595,7 +595,7 @@ fn a_candidate_that_is_behind_cannot_win() {
 fn a_standalone_node_says_it_is_not_a_cluster_member() {
     // Answering a vote request with silence would look exactly like an unreachable peer, and
     // a node misconfigured out of its cluster would present as a network fault forever.
-    use meshdb::net::protocol::Request;
+    use shardlite::net::protocol::Request;
 
     let dir = TempDir::new().unwrap();
     let manager = Arc::new(
@@ -625,8 +625,8 @@ fn a_standalone_node_says_it_is_not_a_cluster_member() {
     });
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut c = meshdb::net::Client::connect(&addr).unwrap();
-    let req = meshdb::cluster::VoteRequest {
+    let mut c = shardlite::net::Client::connect(&addr).unwrap();
+    let req = shardlite::cluster::VoteRequest {
         term: 1,
         candidate: 9,
         durability: Durability::new(0),
@@ -665,7 +665,7 @@ fn a_hung_peer_cannot_freeze_the_election_loop() {
     let bound = election_timeout / 3;
 
     let started = Instant::now();
-    let result = meshdb::net::Client::connect_bounded(&addr, bound, bound);
+    let result = shardlite::net::Client::connect_bounded(&addr, bound, bound);
     let took = started.elapsed();
 
     assert!(
@@ -706,7 +706,7 @@ fn a_deposed_leader_stops_writing() {
         .manager
         .execute_one(
             shard,
-            meshdb::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+            shardlite::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
         )
         .unwrap();
     assert!(leader.cluster.fence().is_open(shard));
@@ -729,7 +729,7 @@ fn a_deposed_leader_stops_writing() {
         .manager
         .execute_one(
             shard,
-            meshdb::storage::exec::Statement::new("INSERT INTO t VALUES (99)"),
+            shardlite::storage::exec::Statement::new("INSERT INTO t VALUES (99)"),
         )
         .expect_err("a deposed leader must refuse to write, even locally");
     assert!(err.to_string().contains("not the leader"), "{err}");
@@ -800,7 +800,7 @@ fn a_node_writes_only_the_shards_placement_gave_it() {
                 n.manager
                     .execute_one(
                         shard,
-                        meshdb::storage::exec::Statement::new(
+                        shardlite::storage::exec::Statement::new(
                             "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
                         ),
                     )
@@ -946,7 +946,7 @@ fn taking_over_a_shard_fires_the_recovery_hook() {
     struct Recorder {
         seen: Arc<Mutex<Vec<ShardId>>>,
     }
-    impl meshdb::shard::ShardRecovery for Recorder {
+    impl shardlite::shard::ShardRecovery for Recorder {
         fn on_take_ownership(&self, shard: ShardId) {
             self.seen.lock().unwrap().push(shard);
         }
@@ -1099,7 +1099,7 @@ fn ddl_reaches_every_shard_from_any_node() {
     );
 
     // Ask a node that does NOT own every shard — under placement, none does.
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     let outcomes = c
         .execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
         .unwrap();
@@ -1107,7 +1107,7 @@ fn ddl_reaches_every_shard_from_any_node() {
     for (shard, o) in &outcomes {
         assert_eq!(
             *o,
-            meshdb::net::ShardOutcome::Ok,
+            shardlite::net::ShardOutcome::Ok,
             "shard {shard} did not get the schema change: {o:?}"
         );
     }
@@ -1121,7 +1121,7 @@ fn ddl_reaches_every_shard_from_any_node() {
             .manager
             .execute_one(
                 shard,
-                meshdb::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({s})")),
+                shardlite::storage::exec::Statement::new(format!("INSERT INTO t VALUES ({s})")),
             )
             .unwrap_or_else(|e| panic!("{shard} on node {owner_id} has no table: {e}"));
         assert_eq!(
@@ -1145,7 +1145,7 @@ fn a_write_is_forwarded_to_the_node_that_owns_the_shard() {
     let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
     std::thread::sleep(Duration::from_millis(400));
 
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
         .unwrap();
 
@@ -1166,12 +1166,12 @@ fn a_write_is_forwarded_to_the_node_that_owns_the_shard() {
         .manager
         .query(
             elsewhere,
-            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 77"),
+            shardlite::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 77"),
         )
         .unwrap();
     match n {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
-            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(1));
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
+            assert_eq!(r.rows[0][0], shardlite::storage::Value::Integer(1));
         }
         other => panic!("expected rows, got {other:?}"),
     }
@@ -1189,7 +1189,7 @@ fn a_forwarded_request_is_answered_or_refused_but_never_forwarded_again() {
     //
     // A `Direct` request means "handle this here or refuse it", so sending one to a node that
     // does not own the shard must come back as a refusal, promptly.
-    use meshdb::net::protocol::Request;
+    use shardlite::net::protocol::Request;
 
     let nodes = cluster(3);
     let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
@@ -1202,11 +1202,11 @@ fn a_forwarded_request_is_answered_or_refused_but_never_forwarded_again() {
         .find(|s| placement.owner(*s) != Some(nodes[0].id))
         .expect("some shard should live on another node");
 
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     let started = Instant::now();
     let result = c.request(Request::Direct(Box::new(Request::Execute {
         shard: elsewhere.0,
-        statements: vec![meshdb::storage::exec::Statement::new(
+        statements: vec![shardlite::storage::exec::Statement::new(
             "CREATE TABLE loop_guard (a INTEGER)",
         )],
     })));
@@ -1238,7 +1238,7 @@ fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
     // failure it prevents — two nodes bouncing a request forever — only shows up when their
     // placement maps disagree, which is precisely the state that is hard to arrange on
     // purpose and certain to happen eventually.
-    use meshdb::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -1294,17 +1294,17 @@ fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
     let mut assignments = std::collections::BTreeMap::new();
     assignments.insert(ShardId(0), 2u64);
     assignments.insert(ShardId(1), 1u64);
-    node.handle_heartbeat(&meshdb::cluster::Heartbeat {
+    node.handle_heartbeat(&shardlite::cluster::Heartbeat {
         term: 1,
         leader: 2,
-        placement: meshdb::cluster::Placement {
+        placement: shardlite::cluster::Placement {
             term: 1,
             assignments,
         },
     })
     .unwrap();
 
-    let router = meshdb::net::Router::new(Arc::clone(&node));
+    let router = shardlite::net::Router::new(Arc::clone(&node));
     assert!(
         !router.is_mine(ShardId(0)),
         "shard 0 should belong to node 2"
@@ -1312,7 +1312,7 @@ fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
 
     let sent = Request::Execute {
         shard: 0,
-        statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+        statements: vec![shardlite::storage::exec::Statement::new("SELECT 1")],
     };
     router.forward(ShardId(0), sent.clone()).unwrap();
 
@@ -1333,14 +1333,14 @@ fn read_consistency_levels_decide_where_a_read_is_answered() {
     // The point of step 12: a caller trades freshness for not going to the leader. The levels
     // are only meaningful if they actually route differently, so this checks the routing, not
     // just that each returns rows.
-    use meshdb::net::ReadConsistency;
+    use shardlite::net::ReadConsistency;
 
     let nodes = cluster(3);
     let _ = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
     let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
     std::thread::sleep(Duration::from_millis(400));
 
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
         .unwrap();
 
@@ -1359,7 +1359,7 @@ fn read_consistency_levels_decide_where_a_read_is_answered() {
             ReadConsistency::Linearizable,
         )
         .unwrap();
-    assert_eq!(strong.rows[0][0], meshdb::storage::Value::Integer(1));
+    assert_eq!(strong.rows[0][0], shardlite::storage::Value::Integer(1));
 
     // Stale is answerable by whichever node took the request. It must still be answered —
     // the level is about freshness, not about failing.
@@ -1371,8 +1371,8 @@ fn read_consistency_levels_decide_where_a_read_is_answered() {
         )
         .unwrap();
     assert!(
-        stale.rows[0][0] == meshdb::storage::Value::Integer(0)
-            || stale.rows[0][0] == meshdb::storage::Value::Integer(1),
+        stale.rows[0][0] == shardlite::storage::Value::Integer(0)
+            || stale.rows[0][0] == shardlite::storage::Value::Integer(1),
         "a stale read may lag but must be a real answer: {:?}",
         stale.rows[0][0]
     );
@@ -1388,7 +1388,7 @@ fn read_consistency_levels_decide_where_a_read_is_answered() {
         .unwrap();
     assert_eq!(
         bounded.rows[0][0],
-        meshdb::storage::Value::Integer(1),
+        shardlite::storage::Value::Integer(1),
         "a bounded-staleness read must not be answered by a copy that is behind it"
     );
 
@@ -1402,7 +1402,7 @@ fn the_default_read_level_is_the_strong_one() {
     // A caller that says nothing about freshness must get the strongest guarantee. The
     // opposite default would hand stale rows to code that never considered the question, and
     // it would do it silently.
-    use meshdb::net::ReadConsistency;
+    use shardlite::net::ReadConsistency;
     assert_eq!(ReadConsistency::default(), ReadConsistency::Linearizable);
 
     let nodes = cluster(3);
@@ -1410,7 +1410,7 @@ fn the_default_read_level_is_the_strong_one() {
     let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
     std::thread::sleep(Duration::from_millis(400));
 
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
         .unwrap();
     let elsewhere = (0..2u32)
@@ -1427,7 +1427,7 @@ fn the_default_read_level_is_the_strong_one() {
     let rows = c.query(elsewhere.0, "SELECT count(*) FROM t").unwrap();
     assert_eq!(
         rows.rows[0][0],
-        meshdb::storage::Value::Integer(5),
+        shardlite::storage::Value::Integer(5),
         "the default read must reflect every acknowledged write"
     );
 
@@ -1442,7 +1442,7 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     // owner that accepted connections and answered nothing would then block every forward on
     // the node — any shard, any owner — for the full timeout. Same disease that froze the
     // election loop, sitting in the write path.
-    use meshdb::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
     use std::net::TcpListener;
 
     // Owner of shard 0: accepts, says hello, then never answers anything again.
@@ -1522,10 +1522,10 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     let mut assignments = std::collections::BTreeMap::new();
     assignments.insert(ShardId(0), 2u64);
     assignments.insert(ShardId(1), 3u64);
-    node.handle_heartbeat(&meshdb::cluster::Heartbeat {
+    node.handle_heartbeat(&shardlite::cluster::Heartbeat {
         term: 1,
         leader: 2,
-        placement: meshdb::cluster::Placement {
+        placement: shardlite::cluster::Placement {
             term: 1,
             assignments,
         },
@@ -1533,7 +1533,7 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     .unwrap();
 
     let router =
-        Arc::new(meshdb::net::Router::new(Arc::clone(&node)).with_timeout(Duration::from_secs(2)));
+        Arc::new(shardlite::net::Router::new(Arc::clone(&node)).with_timeout(Duration::from_secs(2)));
 
     // Thread A forwards into the hung owner and will sit there until its timeout.
     let ra = Arc::clone(&router);
@@ -1542,7 +1542,7 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
             ShardId(0),
             Request::Execute {
                 shard: 0,
-                statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+                statements: vec![shardlite::storage::exec::Statement::new("SELECT 1")],
             },
         );
     });
@@ -1555,7 +1555,7 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
         ShardId(1),
         Request::Execute {
             shard: 1,
-            statements: vec![meshdb::storage::exec::Statement::new("SELECT 1")],
+            statements: vec![shardlite::storage::exec::Statement::new("SELECT 1")],
         },
     );
     let took = started.elapsed();
@@ -1581,7 +1581,7 @@ fn a_transaction_commits_on_the_shard_owner_through_forwarding() {
     let placement = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
     std::thread::sleep(Duration::from_millis(400));
 
-    let mut c = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT")
         .unwrap();
 
@@ -1610,19 +1610,19 @@ fn a_transaction_commits_on_the_shard_owner_through_forwarding() {
         .manager
         .query(
             elsewhere,
-            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t"),
+            shardlite::storage::exec::Statement::new("SELECT count(*) FROM t"),
         )
         .unwrap();
     match n {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
-            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(15));
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
+            assert_eq!(r.rows[0][0], shardlite::storage::Value::Integer(15));
         }
         other => panic!("expected rows, got {other:?}"),
     }
 
     // A forwarded transaction that fails on the owner rolls back there too — atomicity
     // survives the hop.
-    let mut c2 = meshdb::net::Client::connect(&nodes[0].addr).unwrap();
+    let mut c2 = shardlite::net::Client::connect(&nodes[0].addr).unwrap();
     let mut bad = c2.begin(elsewhere.0).unwrap();
     bad.execute("INSERT INTO t VALUES (500, 'ok')").unwrap();
     bad.execute("INSERT INTO t VALUES (1, 'dup')").unwrap(); // duplicate PK
@@ -1634,14 +1634,14 @@ fn a_transaction_commits_on_the_shard_owner_through_forwarding() {
         .manager
         .query(
             elsewhere,
-            meshdb::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 500"),
+            shardlite::storage::exec::Statement::new("SELECT count(*) FROM t WHERE id = 500"),
         )
         .unwrap();
     match after {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
             assert_eq!(
                 r.rows[0][0],
-                meshdb::storage::Value::Integer(0),
+                shardlite::storage::Value::Integer(0),
                 "the failed forwarded transaction left nothing"
             );
         }

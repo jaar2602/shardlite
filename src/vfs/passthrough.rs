@@ -30,7 +30,7 @@ use libsqlite3_sys as ffi;
 
 use super::wal::WalCapture;
 
-pub const VFS_NAME: &str = "meshdb-capture";
+pub const VFS_NAME: &str = "shardlite-capture";
 
 const KIND_OTHER: u32 = 0;
 const KIND_MAIN: u32 = 1;

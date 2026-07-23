@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use meshdb::config::{PragmaProfile, Synchronous};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::exec::{Statement, Value};
-use meshdb::storage::open::open_writer;
+use shardlite::config::{PragmaProfile, Synchronous};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::exec::{Statement, Value};
+use shardlite::storage::open::open_writer;
 
 const S0: ShardId = ShardId(0);
 const TOTAL_WRITES: usize = 4_000;
@@ -101,7 +101,7 @@ fn variant_a(dir: &Path, threads: usize, sync: Synchronous) -> Sample {
                     let t0 = Instant::now();
                     let r = conn.execute(
                         "INSERT INTO t (who, pad) VALUES (?1, ?2)",
-                        meshdb::rusqlite::params![who as i64, "x".repeat(64)],
+                        shardlite::rusqlite::params![who as i64, "x".repeat(64)],
                     );
                     mine.push(t0.elapsed());
                     if r.is_err() {
@@ -194,7 +194,7 @@ fn row(name: &str, threads: usize, s: &Sample) {
 }
 
 fn main() {
-    println!("meshdb write throughput — {TOTAL_WRITES} writes per configuration");
+    println!("shardlite write throughput — {TOTAL_WRITES} writes per configuration");
     println!(
         "host: {} cores (NOT the 1-CPU floor profile)\n",
         num_threads()

@@ -1,6 +1,6 @@
-# Console → full meshdb management — completion plan
+# Console → full shardlite management — completion plan
 
-Goal: make the console able to **manage the entire meshdb**, not just observe it and run SQL.
+Goal: make the console able to **manage the entire shardlite**, not just observe it and run SQL.
 
 This plan builds on [`console-v2-plan.md`](console-v2-plan.md). That plan's observability phases are
 largely **done**; this one completes the **control plane** it deferred ("Later operator endpoints…
@@ -15,26 +15,26 @@ Already shipped in the console (`console/…`) and drivable over HTTP `/v1/*`:
   replicas, lag, state), Stats (writer/reader/checkpoint/http counters), Schema explorer + drift.
 - **Operate (data & schema)**: SQL workbench (streaming reads, auto-routed writes, EXPLAIN),
   durable **schema-rollout Operations** (preflight → submit → per-shard rollout → cancel).
-- **Administer**: meshdb user CRUD (`/v1/users`), console users, audit ledger, sealed connection
+- **Administer**: shardlite user CRUD (`/v1/users`), console users, audit ledger, sealed connection
   secrets, per-connection **S3 settings stored & sealed**.
 
 The read/observe surface is essentially complete. The gap is **actions that change cluster or
-storage state** — and most of them have **no meshdb network endpoint yet**, so the UI cannot drive
+storage state** — and most of them have **no shardlite network endpoint yet**, so the UI cannot drive
 them regardless of front-end work.
 
 ## The one hard constraint that shapes everything
 
-**Almost every management action needs a meshdb endpoint first.** Today these are CLI/startup-only
+**Almost every management action needs a shardlite endpoint first.** Today these are CLI/startup-only
 with no network path: vacuum, manual checkpoint, shard-key declaration, schema-agreement report,
 force-election/step-down/drain/move-shard, S3 config (startup flag only), on-demand S3
 snapshot/flush, failover trigger, runtime config. The console literally stores S3 config it **cannot
-apply**, because meshdb only accepts S3 as `serve` flags (`registry.rs` even has a dead-code TODO
+apply**, because shardlite only accepts S3 as `serve` flags (`registry.rs` even has a dead-code TODO
 saying so).
 
 So the unit of work is a **vertical slice**, in this order:
 
-1. **meshdb**: a typed, versioned, authorized, **tested** endpoint — idempotent, fenced, with
-   explicit failure semantics (honoring meshdb's "refuse over approximate" rule).
+1. **shardlite**: a typed, versioned, authorized, **tested** endpoint — idempotent, fenced, with
+   explicit failure semantics (honoring shardlite's "refuse over approximate" rule).
 2. **console backend**: extend the `proxy_permission` allowlist (or add a server-aggregated route),
    enforce the role, **audit** the mutation.
 3. **console frontend**: a view/action, with a confirmation modal for anything destructive.
@@ -87,7 +87,7 @@ The console already has the sealed config UI — it just has nowhere to send it.
 ### Phase D — Cluster control plane (highest risk; needs real core design)
 
 Placement is currently **derived from liveness only** — there is no operator override. These require
-genuine meshdb work (fencing, handover, safety proofs), so they come last and each ships behind
+genuine shardlite work (fencing, handover, safety proofs), so they come last and each ships behind
 confirmation + audit + Operator role.
 
 - **D1 · Drain a node** — wire `ClusterNode::stop` (exists, unwired) to `POST /v1/cluster/drain`
@@ -107,9 +107,9 @@ confirmation + audit + Operator role.
 
 ## Cross-cutting requirements
 
-- **Authorization, twice**: every mutating endpoint enforces a meshdb `Requirement` *and* the console
+- **Authorization, twice**: every mutating endpoint enforces a shardlite `Requirement` *and* the console
   `proxy_permission` allowlist. Add/confirm the **Operator** role (console-v2-plan proposes it;
-  meshdb already has read/write/admin/cluster). Never use SQL-keyword parsing as a boundary.
+  shardlite already has read/write/admin/cluster). Never use SQL-keyword parsing as a boundary.
 - **Audit everything**: extend the append-only ledger to every new operation (it already records
   writes/user/connection/operation changes).
 - **Idempotency + refuse-over-approximate**: operations take an idempotency key; a partial or
@@ -117,19 +117,19 @@ confirmation + audit + Operator role.
 - **Confirmation UX**: destructive/cluster-affecting actions (drain, move-shard, failover, vacuum)
   require a typed confirmation and show blast radius.
 - **Contract tests**: per `console-v2-plan.md`'s "contract ownership" — checked JSON fixtures so the
-  console and meshdb API versions can't silently drift.
+  console and shardlite API versions can't silently drift.
 
 ## Suggested first slice
 
 **Phase B1 + B2 (S3 config apply + status).** It is the one feature that is visibly half-done (config
 sealed on disk but never sent to any node), it is high user value, and it exercises the entire stack
-— a new meshdb runtime endpoint, console proxy/policy + un-sealing the stored secret to push it, and
+— a new shardlite runtime endpoint, console proxy/policy + un-sealing the stored secret to push it, and
 a new Replication/S3 view. Delivering it proves the vertical-slice pattern the rest of the plan
 repeats.
 
 ## Effort / risk at a glance
 
-| Phase | Core (meshdb) work | Risk | Value |
+| Phase | Core (shardlite) work | Risk | Value |
 |---|---|---|---|
 | A — observability gaps | small (read endpoints) | low | medium |
 | B — S3 lifecycle | medium (runtime sink attach) | medium | **high** |

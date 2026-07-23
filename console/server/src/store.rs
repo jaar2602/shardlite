@@ -3,7 +3,7 @@
 //! A half-written users or connections file is a lockout or, worse, a silent loss of a stored
 //! credential. So every write lands atomically: write a sibling temp file, fsync it, then rename
 //! over the target. A crash leaves either the old file or the new one, never a torn one — the
-//! same discipline meshdb's term store uses.
+//! same discipline shardlite's term store uses.
 
 use std::fs::OpenOptions;
 use std::io::Write;

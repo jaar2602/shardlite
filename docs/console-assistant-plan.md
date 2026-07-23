@@ -1,6 +1,6 @@
-# meshdb console — AI assistant design
+# shardlite console — AI assistant design
 
-An in-console assistant that manages a meshdb cluster from natural language, backed by an
+An in-console assistant that manages a shardlite cluster from natural language, backed by an
 **OpenAI-compatible** chat-completions endpoint (OpenAI, Azure OpenAI, or a self-hosted
 vLLM/Ollama/LiteLLM gateway — anything that speaks `/v1/chat/completions` with tool calling).
 
@@ -43,7 +43,7 @@ human confirm — and **every delete confirms**, destructive ones with a typed c
                                         └──────────────┬───────────────────────────────────┘
                                                        │ reuses proxy.rs (forward / post_json_result)
                                                        ▼
-                                        meshdb  /v1/*  (Admin/Operate/... enforced AGAIN)
+                                        shardlite  /v1/*  (Admin/Operate/... enforced AGAIN)
 ```
 
 - **Frontend**: a `views/Assistant.tsx` workspace sub-view (permission `observe`), a streaming chat
@@ -55,7 +55,7 @@ human confirm — and **every delete confirms**, destructive ones with a typed c
 - **LLM client**: `assistant/llm.rs` — a small blocking `ureq` client for `POST {base}/chat/completions`
   (streaming), reusing the console's existing HTTP/TLS setup.
 - **Tool layer**: each tool maps 1:1 to an existing `conn(name).*` capability and is executed through
-  the SAME `crate::proxy` call the manual UI uses — so `proxy_permission` and the meshdb-side
+  the SAME `crate::proxy` call the manual UI uses — so `proxy_permission` and the shardlite-side
   `Requirement` check both still run.
 
 ## The AI harness (the agent runtime the assistant owns and maintains)
@@ -114,7 +114,7 @@ it *cannot* propose a mutation because the function isn't in its schema. This is
 construction, not by prompt instruction.
 
 Tool arguments are validated in the backend before use (shard/node numbers in range, identifiers for
-`declare_shard_key` match `[A-Za-z_][A-Za-z0-9_]*`), and SQL is still subject to meshdb's own
+`declare_shard_key` match `[A-Za-z_][A-Za-z0-9_]*`), and SQL is still subject to shardlite's own
 read/write classification — the model's output is never trusted as a security boundary.
 
 ## The tool-calling loop + human-in-the-loop
@@ -126,7 +126,7 @@ A **mutating** tool call does NOT execute. Instead the orchestrator:
 1. stops the loop and returns a **proposed action** `{tool, args, endpoint, http_method, human_summary}`;
 2. the frontend renders it as a confirm card with the *exact* call and its blast radius;
 3. on **Confirm**, the frontend re-posts with `confirm_action_id`; the backend executes it through
-   the proxy (policy + meshdb authz + audit), feeds the result back to the model, and continues;
+   the proxy (policy + shardlite authz + audit), feeds the result back to the model, and continues;
 4. on **Reject**, the rejection is fed back so the model can revise.
 
 So the model *plans and explains*; the human *authorises every change*. This also neutralises
@@ -136,9 +136,9 @@ something harmful, a human sees the concrete action and blast radius before it r
 ## Managed resources: tables, reports, dashboards
 
 The assistant does full CRUD on three kinds of thing. Two are new console-server resources; one is
-meshdb schema. **Every delete confirms** (see below).
+shardlite schema. **Every delete confirms** (see below).
 
-- **Tables (meshdb schema).** `create_table` / `alter_table` / `drop_table` are DDL, so they do **not**
+- **Tables (shardlite schema).** `create_table` / `alter_table` / `drop_table` are DDL, so they do **not**
   go through the raw `/v1/run` proxy — they route through the console's existing **durable
   schema-rollout operation** (`/api/operations` preflight → submit → per-shard rollout with status),
   the same path the Operations view uses, because a shard-count-wide DDL must be coordinated and
@@ -170,7 +170,7 @@ whether a change comes from the assistant or the UI.
 
 ## Grounding
 
-- **System prompt** carries meshdb's model so the assistant reasons correctly: shards are fixed at
+- **System prompt** carries shardlite's model so the assistant reasons correctly: shards are fixed at
   creation; cross-shard transactions are unavailable; the *safe* control operations (drain / step-down
   / cordon / prefer are subtractive/advisory, never an imperative override); reads fan out and merge;
   "refuse over approximate". A trimmed version of `docs/console-management-plan.md` seeds it.
@@ -184,7 +184,7 @@ whether a change comes from the assistant or the UI.
 Console-global AI settings (admin-managed), stored like connection secrets:
 - `base_url` (e.g. `https://api.openai.com/v1`, an Azure deployment URL, or `http://localhost:11434/v1`),
 - `model` (e.g. `gpt-4o`, `claude-sonnet-…` via a gateway, a local model name),
-- `api_key` — **sealed** with the existing `crypto::Sealer` (ChaCha20-Poly1305 under `MESHDB_CONSOLE_KEY`),
+- `api_key` — **sealed** with the existing `crypto::Sealer` (ChaCha20-Poly1305 under `SHARDLITE_CONSOLE_KEY`),
   never returned by the API, preserve-on-omit on edit — identical to connection/S3 secrets in `registry.rs`,
 - `enabled`, optional `organization`, per-turn `max_tool_calls`, token budget, request timeout.
 
@@ -193,7 +193,7 @@ model — no vendor lock-in. A self-hosted endpoint also keeps cluster data on-p
 
 ## Safety model (this is the point)
 
-- **No new authority.** Tools run through `crate::proxy`; `proxy_permission` and the meshdb `Requirement`
+- **No new authority.** Tools run through `crate::proxy`; `proxy_permission` and the shardlite `Requirement`
   check both still apply. The assistant can never exceed the user's role or the stored credential.
 - **Confirm every mutation.** Read auto-runs; write/operate/admin/CRUD require an explicit human confirm.
 - **Delete always confirms — and destructive deletes are *typed* confirms.** `drop_table`,

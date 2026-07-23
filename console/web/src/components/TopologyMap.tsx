@@ -245,7 +245,7 @@ export default function TopologyMap({
         viewBox="0 0 630 410"
         className="w-full min-w-[520px]"
         role="img"
-        aria-label="Interactive isometric map of one MeshDB database and its worker nodes"
+        aria-label="Interactive isometric map of one ShardLite database and its worker nodes"
       >
         <defs>
           <linearGradient id="topology-plane" x1="0" y1="0" x2="1" y2="1">
@@ -268,7 +268,7 @@ export default function TopologyMap({
           <line x1="178" y1="285" x2="453" y2="132" />
           <line x1="247" y1="320" x2="522" y2="167" />
         </g>
-        <text x="315" y="344" textAnchor="middle" fill="#8d8d8d" fontSize="10" fontFamily="IBM Plex Mono, monospace" letterSpacing="1.5">ONE MESHDB DATABASE</text>
+        <text x="315" y="344" textAnchor="middle" fill="#8d8d8d" fontSize="10" fontFamily="IBM Plex Mono, monospace" letterSpacing="1.5">ONE SHARDLITE DATABASE</text>
 
         <g filter="url(#topology-shadow)">
           {placed.map((node) => (

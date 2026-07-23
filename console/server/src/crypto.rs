@@ -2,7 +2,7 @@
 //!
 //! - **Console passwords** are hashed with Argon2id (memory-hard), stored as PHC strings, and
 //!   verified in constant time by the library. The plaintext is never stored.
-//! - **Stored meshdb secrets** are sealed with ChaCha20-Poly1305 under a key derived from a
+//! - **Stored shardlite secrets** are sealed with ChaCha20-Poly1305 under a key derived from a
 //!   console master passphrase. The registry file alone therefore grants no cluster access —
 //!   an attacker needs the file *and* the passphrase (which lives in the environment, not on
 //!   disk). This is scoping decision 3: encrypted at rest.
@@ -50,12 +50,12 @@ impl Sealer {
         Argon2::default()
             .hash_password_into(
                 passphrase.as_bytes(),
-                b"meshdb-console-v2-registry",
+                b"shardlite-console-v2-registry",
                 &mut key_bytes,
             )
             .expect("fixed Argon2id key derivation parameters are valid");
         let legacy_bytes = blake3::derive_key(
-            "meshdb-console 2026 registry secret encryption key",
+            "shardlite-console 2026 registry secret encryption key",
             passphrase.as_bytes(),
         );
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
@@ -135,7 +135,7 @@ mod tests {
     fn v1_ciphertext_remains_readable_during_migration() {
         let passphrase = "master-key";
         let key = blake3::derive_key(
-            "meshdb-console 2026 registry secret encryption key",
+            "shardlite-console 2026 registry secret encryption key",
             passphrase.as_bytes(),
         );
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));

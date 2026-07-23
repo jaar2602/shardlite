@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bootstrap the 3-node meshdb cluster with a small TPC-H-shaped dataset and run a walkthrough of
+# Bootstrap the 3-node shardlite cluster with a small TPC-H-shaped dataset and run a walkthrough of
 # the classic TPC-H query shapes against it. The point, as with demo.sh, is that a client talks to
 # ANY node in plain SQL and never knows the data is sharded across all three — here with a realistic
 # star-schema workload instead of a single toy table.
@@ -127,7 +127,7 @@ show "${PORTS[0]}" "SELECT o_orderstatus, count(*) AS orders, sum(o_totalprice_c
 
 echo
 echo "# Customers per region — a 3-way JOIN (customer⋈nation⋈region), asked of node 2."
-echo "#   These tables shard by different keys, so the join is NOT co-located; meshdb still returns"
+echo "#   These tables shard by different keys, so the join is NOT co-located; shardlite still returns"
 echo "#   the correct answer by materialising it centrally."
 show "${PORTS[1]}" "SELECT r.r_name AS region, count(*) AS customers
   FROM customer c JOIN nation n ON c.c_nationkey = n.n_nationkey

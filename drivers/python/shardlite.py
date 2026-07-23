@@ -1,10 +1,10 @@
-"""meshdb HTTP driver — pure standard library, streaming reads.
+"""shardlite HTTP driver — pure standard library, streaming reads.
 
-A thin client over the meshdb HTTP gateway (`meshdb serve --http ADDR`). No third-party
+A thin client over the shardlite HTTP gateway (`shardlite serve --http ADDR`). No third-party
 dependencies: it uses urllib. Queries stream — `query()` is a generator that yields one row
 at a time, so a million-row result costs the driver almost nothing, matching the gateway.
 
-    from meshdb import Client
+    from shardlite import Client
     db = Client("http://localhost:4680", user="app", secret="s3cret")
     for row in db.query("SELECT id, v FROM t WHERE id > ?", params=[5]):
         print(row["id"], row["v"])
@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 
 
-class MeshdbError(Exception):
+class ShardliteError(Exception):
     def __init__(self, status, message):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
@@ -57,7 +57,7 @@ class Client:
                 msg = json.loads(raw).get("error", raw)
             except Exception:
                 pass
-            raise MeshdbError(e.code, msg) from None
+            raise ShardliteError(e.code, msg) from None
 
     def _json(self, method, path, body=None):
         with self._open(method, path, body) as resp:
@@ -81,7 +81,7 @@ class Client:
                     continue
                 if isinstance(obj, dict) and "error" in obj:
                     # An error after the 200 header, reported as a trailing object.
-                    raise MeshdbError(200, obj["error"])
+                    raise ShardliteError(200, obj["error"])
                 yield dict(zip(columns, obj)) if columns else obj
 
     def query_all(self, sql):
@@ -146,7 +146,7 @@ import struct
 
 
 class TcpClient:
-    """A persistent-connection client over meshdb's JSON-over-TCP protocol.
+    """A persistent-connection client over shardlite's JSON-over-TCP protocol.
 
     Lower per-request overhead than HTTP (no headers, one held socket). One request at a time
     per connection — not safe to share across threads. `query()` streams rows like the HTTP
@@ -165,7 +165,7 @@ class TcpClient:
         if user is not None and secret is not None:
             r = self._call({"op": "auth", "name": user, "secret": secret})
             if not r.get("ok"):
-                raise MeshdbError(401, "authentication failed")
+                raise ShardliteError(401, "authentication failed")
 
     def close(self):
         try:
@@ -186,7 +186,7 @@ class TcpClient:
     def _recv(self):
         header = self._buf.read(4)
         if len(header) < 4:
-            raise MeshdbError(0, "connection closed")
+            raise ShardliteError(0, "connection closed")
         (n,) = struct.unpack(">I", header)
         return json.loads(self._buf.read(n))
 
@@ -195,7 +195,7 @@ class TcpClient:
         self._send(frame)
         r = self._recv()
         if "error" in r:
-            raise MeshdbError(r.get("status", 0), r["error"])
+            raise ShardliteError(r.get("status", 0), r["error"])
         return r["result"]
 
     # -- reads --
@@ -213,7 +213,7 @@ class TcpClient:
             elif "end" in f:
                 return
             elif "error" in f:
-                raise MeshdbError(f.get("status", 200), f["error"])
+                raise ShardliteError(f.get("status", 200), f["error"])
 
     def query_all(self, sql):
         return self._call({"op": "query_all", "sql": sql})

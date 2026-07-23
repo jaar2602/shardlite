@@ -1,10 +1,10 @@
-# meshdb — Progress Report
+# shardlite — Progress Report
 
 **Updated:** 2026-07-21 · **Steps complete:** 9 of 12 · **Status:** replication converges; native TCP, HTTP, and JSON/TCP edges live; drivers in four languages (Phase 2); standalone web console built and verified (Phase 3)
 
 ---
 
-## What meshdb is meant to be
+## What shardlite is meant to be
 
 A high-availability, multi-write SQLite server. Users issue arbitrary SQL and define their
 own tables. Runs from a 0.5 GB / 1 CPU instance (three containers, ~150 MB each) and scales
@@ -115,7 +115,7 @@ atomicity in this design, so that is a property of the answer rather than a gap 
 The library emits through the `tracing` facade and installs **no** subscriber, so an
 embedding consumer picks its own destination — or none, in which case the macros compile to
 near-nothing. Only the binary installs one, behind the `cli` feature, writing to stderr so
-logs never mix with query results on stdout. `MESHDB_LOG=debug` turns up detail; the default
+logs never mix with query results on stdout. `SHARDLITE_LOG=debug` turns up detail; the default
 is warnings and above.
 
 Instrumented where an operator would actually be debugging: checkpoint stalls and TRUNCATE
@@ -202,9 +202,9 @@ and per-machine errors cannot make a replica diverge.
 
 ### CLI (`src/main.rs`, `src/db.rs`)
 ```
-meshdb <db-path>              interactive shell
-meshdb <db-path> -c "SQL"     one statement
-meshdb <db-path> -f <file>    statements from a file
+shardlite <db-path>              interactive shell
+shardlite <db-path> -c "SQL"     one statement
+shardlite <db-path> -f <file>    statements from a file
 ```
 Shell commands: `.help` `.stats` `.tables` `.quit`. Statements route by
 `Statement::readonly()` — SQLite's own classification, not text matching.
@@ -793,7 +793,7 @@ let a node with no copy answer reads for shards it did not hold.
 ### HTTP/JSON gateway (Phase 1) — `--features http`
 
 An optional HTTP edge over the same core the TCP server drives, so any language with an HTTP
-client — and a browser — can talk to meshdb. Off by default: a native-only deployment compiles
+client — and a browser — can talk to shardlite. Off by default: a native-only deployment compiles
 none of it. Sync (`tiny_http`, thread-per-connection), matching the TCP server and keeping the
 core tokio-free; the async variant is a documented future drop-in behind the same `handle()`
 boundary.
@@ -824,7 +824,7 @@ are revert-verified. Two credential schemes are accepted, the caller's choice: `
 (browser-friendly) and `Bearer` (same `base64(name:secret)` payload, no browser login prompt —
 what programmatic clients prefer).
 
-CLI: `meshdb serve <dir> --http ADDR [--http-insecure]` runs the gateway alongside the native
+CLI: `shardlite serve <dir> --http ADDR [--http-insecure]` runs the gateway alongside the native
 TCP server on one core. Remaining for a later phase: the standalone console (Phase 3).
 
 ### JSON-over-TCP gateway (Phase 2) — `--features json-tcp`
@@ -849,7 +849,7 @@ verification and the same `Read`/`Write`/`Admin` roles apply. And the same start
 auth enabled without transport security is rejected unless `--json-tcp-insecure` is passed,
 because the secret crosses the wire in clear.
 
-CLI: `meshdb serve <dir> --json-tcp ADDR [--json-tcp-insecure]`, alongside `--http` and the
+CLI: `shardlite serve <dir> --json-tcp ADDR [--json-tcp-insecure]`, alongside `--http` and the
 native server on one core. Verified by `tests/json_tcp.rs` (6): 100k-row streaming, a
 persistent connection carrying many ops, auth gating, role enforcement, and the insecure-refusal
 posture.
@@ -864,7 +864,7 @@ Three transports, two of them cross-language. **HTTP/JSON** is the stable statel
 driver speaks. **JSON/TCP** is the persistent-socket edge — Python, JS, and Go each ship a
 `TcpClient` over it (manual `[len][JSON]` framing, auth-on-connect, streaming query). **Native
 bincode over TCP** is Rust-only and version-locked (a bincode bump breaks non-Rust clients), so
-the Rust crate re-exports `meshdb::net::Client` under `--features native` and the other
+the Rust crate re-exports `shardlite::net::Client` under `--features native` and the other
 languages deliberately use JSON/TCP instead — the stable contract without the fragility.
 
 Verified live by `scripts/driver_test.sh`, which runs each present driver against a gateway
@@ -879,13 +879,13 @@ A separate app — its own binary, its own login, its own state — for managing
 clusters, the way a database client manages many connections. Deliberately **not** part of the
 database binary: keeping it out of the 150 MB / 0.33 CPU database avoids a browser-facing surface
 and request load there, and a standalone backend owns its own login with no CORS. Design and
-confirmed scope in `docs/console-plan.md`; it adds **no meshdb core changes** — every feature is
+confirmed scope in `docs/console-plan.md`; it adds **no shardlite core changes** — every feature is
 composition over endpoints the gateway already exposes.
 
 **Backend** (`console/server/`, its own Rust crate outside the workspace). Reaches clusters over
-the stable HTTP `/v1` edge, so it is decoupled from the exact meshdb build. Multi-user console
+the stable HTTP `/v1` edge, so it is decoupled from the exact shardlite build. Multi-user console
 login (Argon2id passwords, in-memory sessions, `admin`/`user` roles — admin gates user and
-connection management). A connection registry whose stored meshdb secrets are **sealed at rest**
+connection management). A connection registry whose stored shardlite secrets are **sealed at rest**
 with ChaCha20-Poly1305 under a master passphrase (the file alone grants no cluster access; a wrong
 passphrase fails loudly, never silently as "no auth"). A **uniform streaming proxy**: whatever the
 browser asks of a connection goes to `/v1` with the same method and body, and the reply streams
@@ -900,7 +900,7 @@ Tailwind**, not the heavy `@carbon/react` library — a small hand-built primiti
 Button, Tabs, SideNav, sparklines) carrying Carbon's g100 palette, blue-60, and IBM Plex. Views:
 Connections and Console-users (management), and per-connection SQL editor (streaming grid),
 Schema (via `sqlite_schema`), Cluster (topology + placement), Shards & frames (the WAL inspector),
-Stats (live sparklines), and meshdb Users.
+Stats (live sparklines), and shardlite Users.
 
 Verified end to end by `scripts/console_smoke.sh` (13 checks): the embedded SPA and its client-side
 routing fallback, login and session, multi-user role enforcement (a `user` may read connections
@@ -909,12 +909,12 @@ result, atomic transactions, the frames report, and unauthenticated calls refuse
 tests cover the crypto, user store, registry sealing, and sessions (including the revert-checked
 negatives: wrong passphrase fails closed, the last admin cannot be removed).
 
-### Frame inspection: `meshdb frames`
+### Frame inspection: `shardlite frames`
 
 Physical replication ships WAL frames, not SQL — the honest cost of deterministic
 replication is an opaque stream. This is the observability answer: `vfs::inspect_wal` decodes
 a WAL file offline into a `WalReport` (header, per-frame page/commit/salt, transaction
-grouping), and `meshdb frames <dir> --shard N` (or `--file PATH`, `--all`) renders it.
+grouping), and `shardlite frames <dir> --shard N` (or `--file PATH`, `--all`) renders it.
 
 Read-only and offline by construction: it reads a file at rest and never touches the live
 capture path, so inspecting a shard can never disturb replication. It reports what is
@@ -980,8 +980,8 @@ file-only act; and the wire carries the derived key, not the secret, so the plai
 leaves the operator's machine. The key still grants access, so runtime management belongs over
 TLS — documented at every entry point.
 
-**The CLI.** `meshdb serve <dir> --listen ADDR [--users FILE] [--tls-cert/-key]` runs a
-server; `meshdb user add|drop|list` manages users either offline (`--users FILE`, how the
+**The CLI.** `shardlite serve <dir> --listen ADDR [--users FILE] [--tls-cert/-key]` runs a
+server; `shardlite user add|drop|list` manages users either offline (`--users FILE`, how the
 first admin is bootstrapped before any server exists) or at runtime (`--server ADDR --as ADMIN
 --admin-secret S`). Both paths converge on the same file. Existing invocations are untouched —
 `serve`/`user` are new leading subcommands, everything else still runs local SQL.
@@ -1259,7 +1259,7 @@ membership is also static — configured at startup, with no join/leave protocol
 cargo build
 cargo test                 # 24 tests, ~26s (checkpoint tests dominate)
 ./scripts/smoke.sh         # 26 end-to-end CLI assertions
-./target/debug/meshdb /tmp/demo.db
+./target/debug/shardlite /tmp/demo.db
 ```
 
 ## Layout

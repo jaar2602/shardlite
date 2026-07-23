@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
-use meshdb::config::{CheckpointConfig, PragmaProfile};
-use meshdb::shard::writer_fleet::WriterFleet;
-use meshdb::shard::{ShardConfig, ShardId};
-use meshdb::storage::checkpoint::wal_path_for;
-use meshdb::storage::open::open_reader_existing;
+use shardlite::config::{CheckpointConfig, PragmaProfile};
+use shardlite::shard::writer_fleet::WriterFleet;
+use shardlite::shard::{ShardConfig, ShardId};
+use shardlite::storage::checkpoint::wal_path_for;
+use shardlite::storage::open::open_reader_existing;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -222,8 +222,8 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
             .execute_one(S0, "SELECT count(*), sum(id) FROM t")
             .unwrap();
         match out {
-            meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
-                assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(120));
+            shardlite::storage::Outcome::Ok(shardlite::storage::Executed::Rows(r)) => {
+                assert_eq!(r.rows[0][0], shardlite::storage::Value::Integer(120));
             }
             other => panic!("expected rows, got {other:?}"),
         }
@@ -235,10 +235,10 @@ fn checkpointing_does_not_lose_or_corrupt_data() {
         .execute_one(S0, "SELECT count(*), sum(id) FROM t")
         .unwrap();
     match out {
-        meshdb::storage::Outcome::Ok(meshdb::storage::Executed::Rows(r)) => {
-            assert_eq!(r.rows[0][0], meshdb::storage::Value::Integer(120));
+        shardlite::storage::Outcome::Ok(shardlite::storage::Executed::Rows(r)) => {
+            assert_eq!(r.rows[0][0], shardlite::storage::Value::Integer(120));
             // 1 + 2 + ... + 120
-            assert_eq!(r.rows[0][1], meshdb::storage::Value::Integer(7_260));
+            assert_eq!(r.rows[0][1], shardlite::storage::Value::Integer(7_260));
         }
         other => panic!("expected rows, got {other:?}"),
     }

@@ -240,7 +240,7 @@ impl WriterFleet {
                 checkpoint_counters: Arc::clone(&checkpoint_counters),
             };
             let handle = std::thread::Builder::new()
-                .name(format!("meshdb-writer-{i}"))
+                .name(format!("shardlite-writer-{i}"))
                 .spawn(move || writer_loop(rx, ctx))
                 .expect("spawning a writer thread");
             senders.push(tx);

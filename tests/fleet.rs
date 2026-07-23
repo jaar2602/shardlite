@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use meshdb::config::{CheckpointConfig, PragmaProfile, ReaderPoolConfig};
-use meshdb::error::Error;
-use meshdb::shard::reader_fleet::ReaderFleet;
-use meshdb::shard::writer_fleet::WriterFleet;
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome, Statement};
+use shardlite::config::{CheckpointConfig, PragmaProfile, ReaderPoolConfig};
+use shardlite::error::Error;
+use shardlite::shard::reader_fleet::ReaderFleet;
+use shardlite::shard::writer_fleet::WriterFleet;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome, Statement};
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -267,7 +267,7 @@ fn a_full_read_queue_sheds_load_instead_of_growing() {
             &pool,
             PragmaProfile::reader_shard(),
             Arc::downgrade(&writers),
-            Arc::new(meshdb::shard::mode::ShardModes::new()),
+            Arc::new(shardlite::shard::mode::ShardModes::new()),
         )
         .unwrap(),
     );
@@ -335,7 +335,7 @@ fn a_runaway_query_is_cancelled_at_the_deadline() {
         &pool,
         PragmaProfile::reader_shard(),
         Arc::downgrade(&writers),
-        Arc::new(meshdb::shard::mode::ShardModes::new()),
+        Arc::new(shardlite::shard::mode::ShardModes::new()),
     )
     .unwrap();
 

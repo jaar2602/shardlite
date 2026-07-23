@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use meshdb::error::Error;
-use meshdb::replication::{Follower, FollowerSink, MemorySink, Need, StreamTxn};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::error::Error;
+use shardlite::replication::{Follower, FollowerSink, MemorySink, Need, StreamTxn};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -48,7 +48,7 @@ fn assert_converged(primary: &ShardManager, follower: &Follower, shard: ShardId)
     assert_eq!(a.len(), b.len(), "{shard}: sizes differ");
     assert!(a == b, "{shard}: follower diverged from primary");
 
-    let conn = meshdb::rusqlite::Connection::open(shard.path(follower.dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(shard.path(follower.dir())).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
@@ -82,7 +82,7 @@ fn a_follower_converges_with_its_primary() {
 
     assert_converged(&primary, &follower, S0);
 
-    let conn = meshdb::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -240,7 +240,7 @@ fn a_follower_bootstraps_from_a_snapshot_and_then_streams() {
     follower.apply(S0, epoch, &tail).unwrap();
 
     assert_converged(&primary, &follower, S0);
-    let conn = meshdb::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -458,7 +458,7 @@ fn snapshotting_a_large_shard_does_not_block_the_writer_thread() {
     );
 
     // And the snapshot is usable.
-    let conn = meshdb::rusqlite::Connection::open(&dest).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(&dest).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
@@ -507,7 +507,7 @@ fn the_frozen_file_does_not_change_while_a_snapshot_is_held() {
     let tmp = TempDir::new().unwrap();
     let snap = tmp.path().join("after.db");
     primary.snapshot(S0, &snap).unwrap();
-    let conn = meshdb::rusqlite::Connection::open(&snap).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(&snap).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -520,7 +520,7 @@ fn the_frozen_file_does_not_change_while_a_snapshot_is_held() {
 fn a_snapshot_transfer_resumes_where_it_stopped() {
     // A failure at 99% must not start again from zero. At a few hundred GB that is not a
     // retry, it is a second outage.
-    use meshdb::replication::bootstrap::{SnapshotSource, SnapshotTransfer, pump};
+    use shardlite::replication::bootstrap::{SnapshotSource, SnapshotTransfer, pump};
 
     let pdir = TempDir::new().unwrap();
     let fdir = TempDir::new().unwrap();
@@ -591,7 +591,7 @@ fn a_snapshot_transfer_resumes_where_it_stopped() {
     assert_eq!(a.len(), b.len(), "sizes differ after a resumed transfer");
     assert!(a == b, "the resumed transfer produced a different file");
 
-    let conn = meshdb::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(follower.dir())).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
@@ -603,7 +603,7 @@ fn a_snapshot_transfer_resumes_where_it_stopped() {
 
     assert_eq!(
         follower.position(S0),
-        meshdb::replication::Position {
+        shardlite::replication::Position {
             epoch,
             applied_lsn: lsn
         }
@@ -617,7 +617,7 @@ fn a_partial_transfer_of_a_different_snapshot_is_discarded() {
     // bytes onto a prefix of the old one gives a database that is corrupt in a way nothing
     // detects, because every page in it is individually valid. Restarting a large copy is
     // expensive; that is not.
-    use meshdb::replication::bootstrap::{SnapshotId, SnapshotTransfer};
+    use shardlite::replication::bootstrap::{SnapshotId, SnapshotTransfer};
 
     let stage = TempDir::new().unwrap();
     let first = SnapshotId {
@@ -648,7 +648,7 @@ fn a_partial_transfer_of_a_different_snapshot_is_discarded() {
 
 #[test]
 fn a_transfer_cannot_be_installed_half_finished() {
-    use meshdb::replication::bootstrap::{SnapshotId, SnapshotTransfer};
+    use shardlite::replication::bootstrap::{SnapshotId, SnapshotTransfer};
 
     let stage = TempDir::new().unwrap();
     let fdir = TempDir::new().unwrap();
@@ -671,7 +671,7 @@ fn a_transfer_cannot_be_installed_half_finished() {
 
 #[test]
 fn pump_refuses_a_source_that_is_not_the_snapshot_being_transferred() {
-    use meshdb::replication::bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer, pump};
+    use shardlite::replication::bootstrap::{SnapshotId, SnapshotSource, SnapshotTransfer, pump};
 
     let pdir = TempDir::new().unwrap();
     let stage = TempDir::new().unwrap();

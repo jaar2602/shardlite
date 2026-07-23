@@ -1,6 +1,6 @@
-//! Durable console-side coordination for operations MeshDB already exposes.
+//! Durable console-side coordination for operations ShardLite already exposes.
 //!
-//! This module deliberately does not touch MeshDB files or invent new server capabilities. A
+//! This module deliberately does not touch ShardLite files or invent new server capabilities. A
 //! schema rollout is a persisted wrapper around existing read-only preflight endpoints and
 //! `POST /v1/execute_all`. One worker serializes operations, idempotency prevents duplicate
 //! submission, and a process restart marks in-flight work interrupted rather than replaying DDL.
@@ -339,7 +339,7 @@ impl Operations {
             }
             Status::Running => {
                 return Err(OperationError::Conflict(
-                    "the rollout has reached MeshDB and can no longer be cancelled safely".into(),
+                    "the rollout has reached ShardLite and can no longer be cancelled safely".into(),
                 ));
             }
             _ => {
@@ -447,7 +447,7 @@ impl Operations {
             .map_err(ExecutionFailure::safe)?;
         if preflight.token != operation.preflight_token {
             return Err(ExecutionFailure::safe(
-                "schema changed after approval; the rollout was not sent to MeshDB. Run a new preflight and review the new versions",
+                "schema changed after approval; the rollout was not sent to ShardLite. Run a new preflight and review the new versions",
             ));
         }
         let resolved = registry
@@ -472,7 +472,7 @@ impl Operations {
         let outcomes: Vec<ShardOutcome> =
             serde_json::from_value(response.get("shards").cloned().ok_or_else(|| {
                 ExecutionFailure::ambiguous(
-                    "MeshDB returned no database-wide rollout outcomes; verify the database schema",
+                    "ShardLite returned no database-wide rollout outcomes; verify the database schema",
                 )
             })?)
             .map_err(|error| {
@@ -482,14 +482,14 @@ impl Operations {
             })?;
         if outcomes.is_empty() {
             return Err(ExecutionFailure::ambiguous(
-                "MeshDB returned an empty database-wide rollout result; verify the database schema",
+                "ShardLite returned an empty database-wide rollout result; verify the database schema",
             ));
         }
         Ok(Some((outcomes, preflight.versions)))
     }
 
     /// Move from cancellable revalidation to the point of no return immediately before the
-    /// existing MeshDB endpoint is called.
+    /// existing ShardLite endpoint is called.
     fn begin_execute(&self, id: &str, versions: &[ShardVersion]) -> Result<bool, String> {
         let mut records = self.inner.records.lock().unwrap();
         let operation = records
@@ -504,7 +504,7 @@ impl Operations {
             self.persist(&records)?;
             return Ok(false);
         }
-        operation.stage = "executing_on_meshdb".into();
+        operation.stage = "executing_on_shardlite".into();
         operation.updated_at_ms = unix_millis();
         operation.observed_versions = versions.to_vec();
         self.persist(&records)?;
@@ -587,7 +587,7 @@ mod tests {
 
     fn path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "meshdb-console-operations-{}.json",
+            "shardlite-console-operations-{}.json",
             rand::random::<u64>()
         ))
     }

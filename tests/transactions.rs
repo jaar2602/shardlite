@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::{Client, NodeServices, Server, ServerConfig};
-use meshdb::replication::{AckTracker, FrameLog, FrameLogConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
+use shardlite::net::{Client, NodeServices, Server, ServerConfig};
+use shardlite::replication::{AckTracker, FrameLog, FrameLogConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -178,11 +178,11 @@ fn a_read_inside_a_transaction_is_refused_not_answered_wrongly() {
     let mut tx = c.begin(0).unwrap();
     tx.execute("INSERT INTO t VALUES (1)").unwrap();
     // Reach past the guard to issue a raw read on the same connection.
-    use meshdb::net::protocol::{ReadConsistency, Request};
+    use shardlite::net::protocol::{ReadConsistency, Request};
     let err = tx
         .raw(Request::Query {
             shard: 0,
-            statement: meshdb::storage::exec::Statement::new("SELECT count(*) FROM t"),
+            statement: shardlite::storage::exec::Statement::new("SELECT count(*) FROM t"),
             consistency: ReadConsistency::Linearizable,
         })
         .expect_err("a read inside a transaction must be refused");
@@ -199,11 +199,11 @@ fn a_transaction_is_limited_to_one_shard() {
     let mut tx = c.begin(0).unwrap();
     tx.execute("INSERT INTO t VALUES (1)").unwrap();
     // A write aimed at another shard within the same transaction must be refused.
-    use meshdb::net::protocol::Request;
+    use shardlite::net::protocol::Request;
     let err = tx
         .raw(Request::Execute {
             shard: 1,
-            statements: vec![meshdb::storage::exec::Statement::new(
+            statements: vec![shardlite::storage::exec::Statement::new(
                 "INSERT INTO t VALUES (2)",
             )],
         })
@@ -330,7 +330,7 @@ fn a_transaction_that_exceeds_the_buffer_cap_is_refused() {
     let big = vec![0u8; 4 * 1024 * 1024];
     let mut refused = false;
     for i in 0..40 {
-        let stmt = meshdb::storage::exec::Statement::with_params(
+        let stmt = shardlite::storage::exec::Statement::with_params(
             "INSERT INTO t VALUES (?1, ?2)",
             vec![Value::Integer(i), Value::Blob(big.clone())],
         );

@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn key_is_sealed_and_preserved_on_omit() {
         let path = std::env::temp_dir().join(format!(
-            "meshdb-console-ai-{}-{}.json",
+            "shardlite-console-ai-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

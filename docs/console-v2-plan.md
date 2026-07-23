@@ -1,4 +1,4 @@
-# meshdb console v2 — distributed database management plan
+# shardlite console v2 — distributed database management plan
 
 > Status: Phase 0, Phase 1, Phase 2, and the console-only Phase 3 controlled-operation slice are
 > implemented as of 2026-07-21. Remaining production gates are recorded under each phase instead
@@ -23,8 +23,8 @@ The current project already has a sound initial shape:
 
 - React, TypeScript, Vite, and Tailwind frontend embedded in one Rust console binary.
 - Separate console login with `admin` and `user` roles.
-- Saved multi-cluster connections with meshdb secrets encrypted at rest.
-- Streaming proxy to meshdb's HTTP `/v1` API.
+- Saved multi-cluster connections with shardlite secrets encrypted at rest.
+- Streaming proxy to shardlite's HTTP `/v1` API.
 - Initial screens for connections, SQL, schema, cluster placement, WAL frames, stats, and users.
 - A bounded in-memory metrics sampler and an end-to-end smoke script.
 
@@ -45,8 +45,8 @@ current implementation has several gaps that must be fixed before adding operati
   at the cap also means the complete result is not actually downloaded.
 - Transactions, all-shard query/DDL, and key-to-shard routing exist in the client but have no
   complete UI workflow.
-- Any authenticated console user can exercise the stored meshdb credential through the proxy.
-  If that credential is an admin, a regular console user can manage meshdb users and inspect admin
+- Any authenticated console user can exercise the stored shardlite credential through the proxy.
+  If that credential is an admin, a regular console user can manage shardlite users and inspect admin
   endpoints. Console roles therefore do not yet provide meaningful least privilege.
 - Connection editing/testing, audit history, session expiry, login throttling, proxy timeouts,
   request-size limits, and a production TLS mode are missing.
@@ -67,11 +67,11 @@ current implementation has several gaps that must be fixed before adding operati
 3. **Truth with provenance.** Every status includes the reporting node and sample time. Conflicting
    node views are displayed as disagreement, not silently merged.
 4. **Capability-driven compatibility.** Older nodes remain usable. The UI hides or disables features
-   not advertised by the connected meshdb version.
+   not advertised by the connected shardlite version.
 5. **Bounded resource use.** Polling, result rendering, exports, histories, and logs all have explicit
    concurrency and retention limits.
-6. **No hidden control plane.** The console may orchestrate documented meshdb operations, but it must
-   not mutate database files or invent failover state outside meshdb's own protocol.
+6. **No hidden control plane.** The console may orchestrate documented shardlite operations, but it must
+   not mutate database files or invent failover state outside shardlite's own protocol.
 
 ## Target information architecture
 
@@ -97,15 +97,15 @@ current implementation has several gaps that must be fixed before adding operati
 - **Schema** — tables, columns, indexes, triggers, definitions, shard coverage, and schema drift.
 - **Metrics** — curated rates and gauges first; raw counters second; node/shard filters and time range.
 - **Operations** — schema rollout, backup/snapshot, restore validation, checkpoint, and placement
-  operations only as meshdb gains explicit APIs for them.
-- **Access** — meshdb users and roles, with secret rotation and clear effective-permission warnings.
+  operations only as shardlite gains explicit APIs for them.
+- **Access** — shardlite users and roles, with secret rotation and clear effective-permission warnings.
 
 ## Topology view design direction
 
 Use a dense, dark infrastructure view similar to the supplied Alluvium Console reference: factual
 membership and configuration on the left, with an interactive 2.5D infrastructure map and selected
-node details on the right. Adapt its visual grammar to meshdb's actual model rather than introducing
-OLTP/OLAP or object-storage concepts that meshdb does not have.
+node details on the right. Adapt its visual grammar to shardlite's actual model rather than introducing
+OLTP/OLAP or object-storage concepts that shardlite does not have.
 
 > Initial implementation: the responsive layout, membership table, interactive map, selected-node
 > details, five-second polling, version/forwarding metadata, configured members, voter count, and
@@ -138,7 +138,7 @@ The left column should contain:
   current leader or term.
 - **Member table:** node ID, advertised HTTP address, liveness, role, version, last successful
   observation, and a `this node` marker for the reporting node.
-- **Effective configuration:** meshdb version, standalone/clustered mode, replication/quorum policy,
+- **Effective configuration:** shardlite version, standalone/clustered mode, replication/quorum policy,
   shard count, and relevant durability settings. Secrets are represented only as configured/not
   configured—never displayed.
 
@@ -199,7 +199,7 @@ The topology contracts proposed below must supply node ID, advertised endpoints,
 term, role, leader, voters, placement version, and assignments. The shard contract must supply
 local primary/replica role, epoch/LSN, lag, schema version, WAL bytes, and checkpoint condition.
 Every observation also needs reporter node ID and collection time. The first implementation should
-use fixture data to build the responsive view while those additive meshdb endpoints are developed.
+use fixture data to build the responsive view while those additive shardlite endpoints are developed.
 
 ## Target architecture
 
@@ -218,7 +218,7 @@ use fixture data to build the responsive view while those additive meshdb endpoi
     |
     | bounded concurrent HTTPS requests
     v
- meshdb seed/member HTTP APIs
+ shardlite seed/member HTTP APIs
     |-- data API: query, execute, tx, route
     `-- operator API: meta, health, topology, shards, metrics, operations
 ```
@@ -233,7 +233,7 @@ Move small durable state from JSON files into a local SQLite database with schem
 - audit events and operation records;
 - optional downsampled metric history with bounded retention.
 
-The local database is console state, not part of the managed meshdb cluster. It must remain usable
+The local database is console state, not part of the managed shardlite cluster. It must remain usable
 when every managed cluster is unavailable. Use WAL mode, atomic migrations, restrictive file
 permissions, and a documented backup/restore procedure.
 
@@ -248,11 +248,11 @@ queries/      streaming execution, cancellation, export, history metadata
 operations/   durable jobs, idempotency, approvals, progress
 audit/        append-only security and change events
 store/        local SQLite repositories and migrations
-meshdb/       typed client for supported meshdb API versions
+shardlite/       typed client for supported shardlite API versions
 ```
 
 Before fleet polling is introduced, migrate the console server to an async HTTP stack such as
-Axum/Reqwest. This is a console-only dependency decision and does not affect meshdb's tokio-free
+Axum/Reqwest. This is a console-only dependency decision and does not affect shardlite's tokio-free
 core. Long query streams, browser clients, collectors, and operation progress must use separate
 concurrency limits so one class cannot starve the others.
 
@@ -269,7 +269,7 @@ Keep React and the small Carbon-inspired design system. Add:
 Use CodeMirror 6 for the SQL workbench rather than implementing editor behavior in a textarea.
 Avoid a large charting package until the required charts cannot be expressed with a small component.
 
-## MeshDB API work required
+## ShardLite API work required
 
 The current `/v1` endpoints are sufficient for the prototype but not for a distributed management
 view. Add additive, versioned, typed responses. Do not make the console scrape logs or infer state
@@ -277,7 +277,7 @@ from unrelated counters.
 
 ### Foundation endpoints
 
-- `GET /v1/meta` — API version, meshdb build/version, node ID, cluster ID, advertised endpoints,
+- `GET /v1/meta` — API version, shardlite build/version, node ID, cluster ID, advertised endpoints,
   and capability names.
 - `GET /v1/health` — process readiness plus structured degraded reasons; cheap enough for frequent
   polling and available to a read-only role.
@@ -302,12 +302,12 @@ Long-running or destructive work should use a job contract:
 
 Candidate operation types are checkpoint, backup/snapshot, restore validation, schema rollout, and
 placement change. They are not part of the first v2 milestone. Each must first exist as a safe,
-tested meshdb core operation with explicit authorization and failure semantics.
+tested shardlite core operation with explicit authorization and failure semantics.
 
 ### Contract ownership
 
-Define shared JSON schemas or checked fixtures for meshdb and the console client. CI should test the
-current console against the oldest supported meshdb API fixture and current meshdb against the
+Define shared JSON schemas or checked fixtures for shardlite and the console client. CI should test the
+current console against the oldest supported shardlite API fixture and current shardlite against the
 previous console fixture. This is more valuable than relying on untyped `Record<string, unknown>`.
 
 ## Security and authorization model
@@ -320,13 +320,13 @@ roles:
 | Viewer | fleet/topology/schema/metrics and read-only queries |
 | Developer | Viewer plus data writes and transactions |
 | Operator | Viewer plus backup/checkpoint/placement operations; no user administration |
-| Admin | console configuration, grants, credentials, and meshdb user administration |
+| Admin | console configuration, grants, credentials, and shardlite user administration |
 
 The effective permission is the intersection of the console grant and the credential accepted by
-meshdb. The console must enforce policy before proxying, and meshdb must still enforce its own role.
+shardlite. The console must enforce policy before proxying, and shardlite must still enforce its own role.
 Do not use SQL keyword parsing as a security boundary. Read-only query enforcement belongs in
-meshdb using SQLite's prepared-statement read-only classification, or connections must use a
-genuinely read-only meshdb credential.
+shardlite using SQLite's prepared-statement read-only classification, or connections must use a
+genuinely read-only shardlite credential.
 
 Phase 0 security work:
 
@@ -368,7 +368,7 @@ Acceptance gate:
   the stored cluster credential is an admin.
 - A query stream cannot exhaust all control-plane workers or grow browser/server memory without
   bound.
-- The UI renders the current meshdb response fixtures without raw-object assumptions.
+- The UI renders the current shardlite response fixtures without raw-object assumptions.
 - Security events and every data-changing request have an actor, cluster, action, timestamp, and
   outcome in the audit log.
 
@@ -392,7 +392,7 @@ The v1.1 foundation is implemented in `console/`:
   bounded grid, truthful truncation messaging, and a separate streaming NDJSON download;
 - append-only audit storage, an admin activity view, CSP/security headers, and console `/healthz`
   and `/readyz` endpoints are present;
-- backend unit tests, meshdb HTTP integration tests, the production frontend build, and the
+- backend unit tests, shardlite HTTP integration tests, the production frontend build, and the
   end-to-end console smoke suite pass.
 
 The remaining Phase 0 hardening is intentionally tracked rather than implied complete: structured
@@ -404,7 +404,7 @@ are required before calling Phase 0 production-complete.
 
 Goal: make cluster, node, shard, and replica health first-class.
 
-- Add `/v1/meta`, `/v1/health`, typed topology, typed shard state, and expanded metrics to meshdb.
+- Add `/v1/meta`, `/v1/health`, typed topology, typed shard state, and expanded metrics to shardlite.
 - Change a connection profile from one URL to a cluster with multiple seeds and discovered members.
 - Build the bounded collector with per-cluster concurrency, jitter, backoff, and stale-sample rules.
 - Add Fleet Overview, Cluster Overview, Topology, and Shard Inventory screens.
@@ -425,7 +425,7 @@ Acceptance gate:
 
 The distributed read model is implemented:
 
-- MeshDB serves versioned `/v1/meta`, `/v1/health`, `/v1/topology`, and `/v1/shards` contracts plus
+- ShardLite serves versioned `/v1/meta`, `/v1/health`, `/v1/topology`, and `/v1/shards` contracts plus
   checkpoint metrics; health states name their local observation boundary rather than inventing
   follower-side peer liveness;
 - profiles support up to 32 manually configured HTTP seeds with legacy single-URL migration and an
@@ -444,7 +444,7 @@ The distributed read model is implemented:
   member, and renewed quorum health; HTTP contracts, backend tests, the production frontend build,
   and expanded end-to-end smoke suite pass.
 
-Remaining Phase 1 production work is explicit: automatic seed discovery requires MeshDB to advertise
+Remaining Phase 1 production work is explicit: automatic seed discovery requires ShardLite to advertise
 peer HTTP origins (native peer addresses cannot safely be guessed as HTTP), schema-drift collection
 needs a cheap bulk schema-version contract, repeated-bootstrap counters do not yet exist in the core,
 and the 25-cluster/100-node/10,000-shard load target plus Playwright/accessibility workflows still
@@ -459,7 +459,7 @@ Implemented:
 - CodeMirror SQLite editors with tabs, explicit modes, `Cmd/Ctrl+Enter`, cancellation, explain,
   browser-scoped saved SQL, and metadata-only execution history.
 - Typed positional parameters for null, safe integer, real, text, boolean, and explicit hex blobs;
-  the blob contract is additive at the MeshDB JSON edge and never guesses that an array is binary.
+  the blob contract is additive at the ShardLite JSON edge and never guesses that an array is binary.
 - Shard and route-by-key targeting, linearizable/stale/at-least-LSN reads, fan-out query, atomic
   single-shard transactions, and guarded all-shard schema rollouts.
 - Rollout preflight shows every starting schema version; result handling preserves every shard
@@ -495,12 +495,12 @@ accessibility; a dedicated one-million-row soak job (the converter is bounded an
 currently streams 60,000 rows); server-side multi-device saved-query synchronization; and a durable
 export-job API if product requirements demand an in-console cancel button instead of the browser
 download manager's cancellation. Fan-out parameters and a cross-shard snapshot are intentionally
-not offered because MeshDB's planner/protocol do not currently guarantee them.
+not offered because ShardLite's planner/protocol do not currently guarantee them.
 
 ### Phase 3 — controlled operations
 
-Goal: coordinate only operations MeshDB already exposes, entirely inside the standalone console.
-Phase 3 does not add or change a MeshDB/SQLite endpoint, protocol, database file, or WAL behavior.
+Goal: coordinate only operations ShardLite already exposes, entirely inside the standalone console.
+Phase 3 does not add or change a ShardLite/SQLite endpoint, protocol, database file, or WAL behavior.
 
 Implemented:
 
@@ -511,7 +511,7 @@ Implemented:
   states, timestamps, stages, actor, cluster, immutable SQL fingerprint, approval evidence, and exact
   per-shard outcomes.
 - Server-side preflight over the existing `/v1/info` and `/v1/schema/{shard}` endpoints. The worker
-  repeats preflight and refuses to call MeshDB if any approved version changed.
+  repeats preflight and refuses to call ShardLite if any approved version changed.
 - Idempotency scoped to actor, cluster, and key. A duplicate retry returns the original operation;
   reusing its key for different SQL or approval evidence is rejected.
 - Safe cancellation while queued or revalidating. Once `/v1/execute_all` has been sent, cancellation
@@ -527,14 +527,14 @@ Explicit non-goals under the no-server-change constraint:
 
 - backup/snapshot creation, restore, explicit checkpoint, placement/rebalance, automatic failover,
   or individual-shard DDL retry;
-- direct access from the console to MeshDB database/WAL files;
-- simulated controls for capabilities absent from the current MeshDB HTTP API.
+- direct access from the console to ShardLite database/WAL files;
+- simulated controls for capabilities absent from the current ShardLite HTTP API.
 
 Acceptance gate:
 
 - Refreshing or retrying with the same idempotency key cannot duplicate a submitted operation.
 - Restarting the console cannot replay an operation whose result is ambiguous.
-- A changed preflight prevents execution, and every MeshDB response remains attributable per shard.
+- A changed preflight prevents execution, and every ShardLite response remains attributable per shard.
 - Partial execution is never presented as global success.
 
 The 51-check end-to-end smoke suite covers preflight, durable submit, duplicate retry, completion,
@@ -544,7 +544,7 @@ idempotency conflict, cancellation, persistence, and restart interruption.
 Remaining Phase 3 production work is console-side only: scheduled failure injection for node loss,
 leader change, timeout, and process termination at each stage; browser automation for the Operations
 screen; journal schema migration/versioning; retention configuration and backup guidance; and an
-optional SSE status stream to replace two-second UI polling. None requires a MeshDB server change.
+optional SSE status stream to replace two-second UI polling. None requires a ShardLite server change.
 
 ### Phase 4 — organization and production scale
 
@@ -557,7 +557,7 @@ optional SSE status stream to replace two-second UI polling. None requires a Mes
 
 ## Testing strategy
 
-- **Contract tests:** versioned JSON fixtures for all meshdb APIs and capability combinations.
+- **Contract tests:** versioned JSON fixtures for all shardlite APIs and capability combinations.
 - **Backend tests:** policy matrix, persistence migrations, encryption/key rotation, SSRF validation,
   timeouts, rate limits, cancellation, and audit completeness.
 - **Frontend tests:** component tests for status states and Playwright workflows for every primary
@@ -586,7 +586,7 @@ a scheduled pipeline.
 
 ## Deliberate non-goals
 
-- The console will not create cross-shard transactions; meshdb does not provide that guarantee.
+- The console will not create cross-shard transactions; shardlite does not provide that guarantee.
 - It will not edit SQLite files, WAL files, placement manifests, or election state directly.
 - It will not automatically force failover or rebalance based on UI-side heuristics.
 - It will not become a general long-term metrics database.

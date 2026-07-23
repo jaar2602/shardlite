@@ -1,4 +1,4 @@
-# A three-node meshdb cluster, each node in its own container, on one Docker network.
+# A three-node shardlite cluster, each node in its own container, on one Docker network.
 #
 # The 12 shards are spread across the three nodes automatically (placement round-robins by
 # node id — 4 shards each). A client can connect to ANY node and run SQL against ANY shard:
@@ -8,10 +8,10 @@
 # Each node's --peers lists the OTHER two by their in-network address (node<N>:4600). One port
 # per node carries both client and peer traffic, by design. --http-insecure permits the
 # plaintext gateway (this is a local demo; put TLS / --users in front for anything real).
-name: meshdb-cluster
+name: shardlite-cluster
 
 x-node: &node
-  image: meshdb-demo:latest
+  image: shardlite-demo:latest
   restart: unless-stopped
   networks: [mesh]
 

@@ -1,9 +1,9 @@
 //! Rolling schema changes, and the guard that keeps the half-applied window honest.
 
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome, Statement};
-use meshdb::storage::schema::Agreement;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome, Statement};
+use shardlite::storage::schema::Agreement;
 use tempfile::TempDir;
 
 fn manager(shards: u32) -> (ShardManager, TempDir) {

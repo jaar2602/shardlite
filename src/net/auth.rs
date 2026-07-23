@@ -184,7 +184,7 @@ struct User {
     role: Role,
 }
 
-const USERS_HEADER: &str = "meshdb-users-v1";
+const USERS_HEADER: &str = "shardlite-users-v1";
 
 /// The users a server accepts, and — when opened from a file — the file it persists to.
 ///
@@ -349,7 +349,7 @@ impl AuthConfig {
         let mut lines = text.lines();
         if lines.next() != Some(USERS_HEADER) {
             return Err(Error::Manifest(format!(
-                "{} is not a meshdb users file (missing the `{USERS_HEADER}` header)",
+                "{} is not a shardlite users file (missing the `{USERS_HEADER}` header)",
                 path.display()
             )));
         }

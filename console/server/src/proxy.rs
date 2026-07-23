@@ -1,4 +1,4 @@
-//! Forwarding to a cluster's meshdb HTTP `/v1` edge (scoping decision 2: the console talks JSON,
+//! Forwarding to a cluster's shardlite HTTP `/v1` edge (scoping decision 2: the console talks JSON,
 //! never bincode, so it survives cluster version skew).
 //!
 //! The forward is **uniform and streaming**: whatever the browser asked of a connection, the
@@ -20,7 +20,7 @@ use crate::registry::Resolved;
 use crate::respond;
 
 fn bearer(resolved: &Resolved) -> Option<String> {
-    match (&resolved.meshdb_user, &resolved.meshdb_secret) {
+    match (&resolved.shardlite_user, &resolved.shardlite_secret) {
         (Some(u), Some(s)) => Some(format!("Bearer {}", B64.encode(format!("{u}:{s}")))),
         _ => None,
     }
@@ -123,7 +123,7 @@ fn forward_response(
 
     let upstream = match result {
         Ok(r) => r,
-        // meshdb answered with a non-2xx (a rejected statement, a 400, a 401): that is a real
+        // shardlite answered with a non-2xx (a rejected statement, a 400, a 401): that is a real
         // result and its body/status must reach the browser unchanged, not be masked as a proxy
         // error.
         Err(ureq::Error::Status(_, r)) => r,
@@ -228,7 +228,7 @@ impl<R: Read> ExportReader<R> {
                     row.clone()
                 } else if let Some(error) = value.get("error") {
                     vec![Value::String(format!(
-                        "meshdb error: {}",
+                        "shardlite error: {}",
                         csv_scalar(error)
                     ))]
                 } else {
@@ -387,7 +387,7 @@ pub fn post_json_result(resolved: &Resolved, suffix: &str, body: &Value) -> Resu
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
-/// Materialize one bounded MeshDB query for console-side catalog/diagnostic coordinators. The
+/// Materialize one bounded ShardLite query for console-side catalog/diagnostic coordinators. The
 /// public browser query path remains streaming; this helper is intentionally capped because its
 /// callers need the complete, small metadata result before they can reconcile it.
 pub fn query_rows(

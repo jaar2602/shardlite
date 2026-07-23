@@ -50,7 +50,7 @@ export default function Operations({ name }: { name: string }) {
   };
 
   return <Page>
-    <PageHeader eyebrow="Changes / durable journal" title="Operations" description="Track approved schema changes from review through a database-wide outcome. The console coordinates existing MeshDB APIs and never edits database files." actions={<Button variant="secondary" onClick={() => void load()}>Refresh now</Button>} />
+    <PageHeader eyebrow="Changes / durable journal" title="Operations" description="Track approved schema changes from review through a database-wide outcome. The console coordinates existing ShardLite APIs and never edits database files." actions={<Button variant="secondary" onClick={() => void load()}>Refresh now</Button>} />
     <div className="grid gap-px bg-carbon-border sm:grid-cols-3">
       <StatCard label="Recorded" value={records.length} />
       <StatCard label="Queued / running" value={active} tone={active ? "blue" : undefined} />
@@ -81,7 +81,7 @@ function OperationDetail({ operation, showInternals, onCancel }: { operation: ap
     <div className="space-y-4">
       {(operation.status === "partial" || operation.status === "interrupted") && <Banner tone="error">{operation.status === "partial" ? "The schema update was applied to only part of the database. Review the technical evidence and roll forward deliberately." : "The console restarted while this operation was in flight. It was not replayed. Verify the database schema before taking another action."}</Banner>}
       {operation.error && <Banner tone="error">{logicalError(operation.error)}</Banner>}
-      {operation.cancel_requested && operation.status === "running" && <Banner tone="info">Cancellation is requested and will be honored before the MeshDB call if revalidation has not completed.</Banner>}
+      {operation.cancel_requested && operation.status === "running" && <Banner tone="info">Cancellation is requested and will be honored before the ShardLite call if revalidation has not completed.</Banner>}
       <dl className="grid grid-cols-[9rem_1fr] gap-x-3 gap-y-2 text-xs">
         <dt className="text-carbon-text-3">Connection</dt><dd>{operation.connection}</dd>
         <dt className="text-carbon-text-3">Actor</dt><dd>{operation.actor}</dd>
@@ -93,7 +93,7 @@ function OperationDetail({ operation, showInternals, onCancel }: { operation: ap
       <div><div className="mb-2 text-xs font-semibold">Approved SQL</div><pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-carbon-border bg-carbon-field p-3 font-mono text-xs">{operation.sql}</pre></div>
       <div className="border border-carbon-border bg-carbon-layer2 p-3 text-xs"><span className="text-carbon-text-3">Database application</span><span className="ml-3 font-mono">{operation.outcomes.length ? `${succeeded}/${operation.outcomes.length} internal steps applied` : "waiting"}</span></div>
       {showInternals && <details className="border border-carbon-border"><summary className="cursor-pointer px-3 py-2 text-xs font-semibold">Storage internals</summary><div className="space-y-3 border-t border-carbon-border p-3"><div><div className="mb-2 text-xs font-semibold">Approved schema versions</div>{versions.map((group) => <p key={group.version} className="font-mono text-xs text-carbon-text-3">v{group.version}: units {compact(group.shards)}</p>)}</div>{operation.outcomes.length > 0 && <DataTable columns={["Unit", "Result", "Error"]} rows={operation.outcomes.map((outcome) => [outcome.shard, <Tag tone={outcome.ok ? "green" : "red"}>{outcome.ok ? "applied" : "rejected"}</Tag>, outcome.error ?? "—"])} />}</div></details>}
-      {operation.status === "running" && operation.stage === "executing_on_meshdb" && <Banner tone="info">MeshDB is applying the rollout. Cancellation is no longer safe because part of the database may already have changed.</Banner>}
+      {operation.status === "running" && operation.stage === "executing_on_shardlite" && <Banner tone="info">ShardLite is applying the rollout. Cancellation is no longer safe because part of the database may already have changed.</Banner>}
     </div>
   </Card>;
 }

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use meshdb::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
-use meshdb::replication::{AckTracker, Follower, FrameLog, FrameLogConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
+use shardlite::replication::{AckTracker, Follower, FrameLog, FrameLogConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -115,7 +115,7 @@ fn insert(i: i64) -> Statement {
 }
 
 fn rows_in(path: &std::path::Path) -> Vec<i64> {
-    let conn = meshdb::rusqlite::Connection::open(path).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(path).unwrap();
     let mut stmt = conn.prepare("SELECT id FROM t ORDER BY id").unwrap();
     let ids: Vec<i64> = stmt
         .query_map([], |r| r.get(0))
@@ -167,7 +167,7 @@ fn a_write_no_quorum_holds_is_not_acknowledged() {
          retries, and applying a committed write twice is worse than the stall: {msg}"
     );
     assert!(
-        matches!(err, meshdb::error::Error::NotReplicated { .. }),
+        matches!(err, shardlite::error::Error::NotReplicated { .. }),
         "the kind must survive so a caller can branch on it rather than parse text: {err:?}"
     );
     assert!(l.acks.stats().timed_out > 0, "the stall must be counted");
@@ -338,7 +338,7 @@ fn a_committed_transaction_survives_the_leaders_death_and_an_open_one_leaves_not
     drop(open); // best-effort rollback goes nowhere; the server is gone
 
     // The survivor: exactly the committed 25, and none of the uncommitted 11.
-    let conn = meshdb::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(r.follower().dir())).unwrap();
     let committed: i64 = conn
         .query_row(
             "SELECT count(*) FROM t WHERE v LIKE 'committed-%'",

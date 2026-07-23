@@ -6,15 +6,15 @@
 
 use std::sync::Arc;
 
-use meshdb::config::{CheckpointConfig, PragmaProfile};
-use meshdb::error::Error;
-use meshdb::replication::StreamTxn;
-use meshdb::replication::{FrameSink, MemorySink, NullSink};
-use meshdb::shard::writer_fleet::WriterFleet;
-use meshdb::shard::{ShardConfig, ShardId};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome, Statement};
-use meshdb::vfs;
+use shardlite::config::{CheckpointConfig, PragmaProfile};
+use shardlite::error::Error;
+use shardlite::replication::StreamTxn;
+use shardlite::replication::{FrameSink, MemorySink, NullSink};
+use shardlite::shard::writer_fleet::WriterFleet;
+use shardlite::shard::{ShardConfig, ShardId};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome, Statement};
+use shardlite::vfs;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -40,7 +40,7 @@ fn fleet(dir: &TempDir, cfg: ShardConfig, sink: Option<Arc<dyn FrameSink>>) -> W
         sink,
         None,
         None,
-        std::sync::Arc::new(meshdb::shard::mode::ShardModes::new()),
+        std::sync::Arc::new(shardlite::shard::mode::ShardModes::new()),
     )
     .unwrap()
 }
@@ -147,7 +147,7 @@ fn a_follower_is_reconstructed_from_what_the_sink_received() {
         "follower rebuilt from the sink is not byte-identical"
     );
 
-    let plain = meshdb::rusqlite::Connection::open(&follower).unwrap();
+    let plain = shardlite::rusqlite::Connection::open(&follower).unwrap();
     let n: i64 = plain
         .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -369,8 +369,8 @@ impl FrameSink for FlakySink {
         &self,
         _shard: ShardId,
         _epoch: u64,
-        txns: Vec<meshdb::replication::StreamTxn>,
-    ) -> meshdb::Result<()> {
+        txns: Vec<shardlite::replication::StreamTxn>,
+    ) -> shardlite::Result<()> {
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Unsupported("sink is down".into()));
         }
@@ -514,8 +514,8 @@ impl FrameSink for RecordingSink {
         &self,
         _shard: ShardId,
         _epoch: u64,
-        txns: Vec<meshdb::replication::StreamTxn>,
-    ) -> meshdb::Result<()> {
+        txns: Vec<shardlite::replication::StreamTxn>,
+    ) -> shardlite::Result<()> {
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Unsupported("sink is down".into()));
         }

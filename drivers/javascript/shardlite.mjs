@@ -1,6 +1,6 @@
-// meshdb HTTP driver — Node 18+ (uses built-in fetch), zero dependencies, streaming reads.
+// shardlite HTTP driver — Node 18+ (uses built-in fetch), zero dependencies, streaming reads.
 //
-//   import { Client } from "./meshdb.mjs";
+//   import { Client } from "./shardlite.mjs";
 //   const db = new Client("http://localhost:4680", { user: "app", secret: "s3cret" });
 //   for await (const row of db.query("SELECT id, v FROM t WHERE id > ?", { params: [5] }))
 //     console.log(row.id, row.v);
@@ -11,10 +11,10 @@
 // `Authorization: Bearer base64(user:secret)` — the programmatic scheme (no browser prompt).
 // Over a plaintext gateway the credential is exposed; use TLS on any untrusted network.
 
-export class MeshdbError extends Error {
+export class ShardliteError extends Error {
   constructor(status, message) {
     super(`HTTP ${status}: ${message}`);
-    this.name = "MeshdbError";
+    this.name = "ShardliteError";
     this.status = status;
   }
 }
@@ -42,7 +42,7 @@ export class Client {
       try {
         msg = JSON.parse(msg).error ?? msg;
       } catch {}
-      throw new MeshdbError(res.status, msg);
+      throw new ShardliteError(res.status, msg);
     }
     return res;
   }
@@ -74,7 +74,7 @@ export class Client {
           continue;
         }
         if (obj && !Array.isArray(obj) && obj.error) {
-          throw new MeshdbError(200, obj.error);
+          throw new ShardliteError(200, obj.error);
         }
         yield columns ? Object.fromEntries(columns.map((c, i) => [c, obj[i]])) : obj;
       }
@@ -170,7 +170,7 @@ class FrameReader {
   }
 }
 
-/// A persistent-connection client over meshdb's JSON-over-TCP protocol. Lower per-request
+/// A persistent-connection client over shardlite's JSON-over-TCP protocol. Lower per-request
 /// overhead than HTTP; one request at a time per connection (not shared across concurrent
 /// callers). query() streams. Auth is sent once at connect; the secret crosses the wire, so
 /// use a trusted network or a TLS tunnel.
@@ -189,7 +189,7 @@ export class TcpClient {
     const c = new TcpClient(socket);
     if (user != null && secret != null) {
       const r = await c._call({ op: "auth", name: user, secret });
-      if (!r.ok) throw new MeshdbError(401, "authentication failed");
+      if (!r.ok) throw new ShardliteError(401, "authentication failed");
     }
     return c;
   }
@@ -213,7 +213,7 @@ export class TcpClient {
   async _call(frame) {
     this._send(frame);
     const r = await this.reader.nextFrame();
-    if (r.error) throw new MeshdbError(r.status ?? 0, r.error);
+    if (r.error) throw new ShardliteError(r.status ?? 0, r.error);
     return r.result;
   }
 
@@ -225,7 +225,7 @@ export class TcpClient {
       if (f.columns) columns = f.columns;
       else if (f.row) yield columns ? Object.fromEntries(columns.map((c, i) => [c, f.row[i]])) : f.row;
       else if (f.end) return;
-      else if (f.error) throw new MeshdbError(f.status ?? 200, f.error);
+      else if (f.error) throw new ShardliteError(f.status ?? 200, f.error);
     }
   }
 

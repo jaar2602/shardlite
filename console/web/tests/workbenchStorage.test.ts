@@ -42,10 +42,10 @@ test("retains new browser-local SQL history and drops invalid entries", () => {
 
 test("removes only obsolete physical-placement settings", () => {
   const removed: string[] = [];
-  removeLegacyPlacementSettings({ removeItem: (key: string) => { removed.push(key); } }, "meshdb.workbench.alice.prod");
+  removeLegacyPlacementSettings({ removeItem: (key: string) => { removed.push(key); } }, "shardlite.workbench.alice.prod");
   assert.deepEqual(removed, [
-    "meshdb.workbench.alice.prod.routeTarget",
-    "meshdb.workbench.alice.prod.shard",
-    "meshdb.workbench.alice.prod.placement",
+    "shardlite.workbench.alice.prod.routeTarget",
+    "shardlite.workbench.alice.prod.shard",
+    "shardlite.workbench.alice.prod.placement",
   ]);
 });

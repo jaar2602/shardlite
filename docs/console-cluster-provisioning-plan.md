@@ -1,15 +1,15 @@
 # Console cluster provisioning — Kubernetes (enterprise) plan
 
 > **Status: future upgrade, not scheduled.** This is the design for letting the console *create and
-> manage meshdb clusters* (not just connect to existing ones). It is intended as a **licensed
+> manage shardlite clusters* (not just connect to existing ones). It is intended as a **licensed
 > enterprise capability**. See "Product tiering" below.
 
 ## Product tiering
 
 | Tier | How a cluster comes to exist | Where it runs |
 |---|---|---|
-| **Individual / self-host** | `deploy/stack/meshdb-stack up` — one CLI brings up a 3-node cluster + console on Docker volumes. | One host, Docker. Already shipped. |
-| **Enterprise (licensed)** | The console provisions clusters on demand: a **Clusters** UI creates a StatefulSet-backed meshdb cluster, manages its lifecycle, and auto-registers it as a connection. | Kubernetes. This document. |
+| **Individual / self-host** | `deploy/stack/shardlite-stack up` — one CLI brings up a 3-node cluster + console on Docker volumes. | One host, Docker. Already shipped. |
+| **Enterprise (licensed)** | The console provisions clusters on demand: a **Clusters** UI creates a StatefulSet-backed shardlite cluster, manages its lifecycle, and auto-registers it as a connection. | Kubernetes. This document. |
 
 The individual path stays the simple, unlicensed default. The Kubernetes provisioning below is the
 paid upgrade — it is where the operational value (one-click clusters, lifecycle, scaling) and the
@@ -20,15 +20,15 @@ this adds a capability rather than reworking the core.
 
 ## Blockers / dependencies (know these first)
 
-1. **meshdb has no StatefulSet story yet.** `serve` takes static `--node-id N` and
+1. **shardlite has no StatefulSet story yet.** `serve` takes static `--node-id N` and
    `--peers 1=host:4600,…`. In k8s, stable identity comes from a *headless Service*
-   (`meshdb-<id>-0.svc`, `-1`, …); node-id/peers must be **derived from the pod ordinal** by a small
+   (`shardlite-<id>-0.svc`, `-1`, …); node-id/peers must be **derived from the pod ordinal** by a small
    entrypoint shim in the image. That shim does not exist — it is slice 0.
-2. **Scale-out / rebalance is gated on unbuilt meshdb core.** Bumping a StatefulSet's replicas adds
-   pods, but meshdb places shards by node-id **at creation** and has **no live shard-move** (meshdb
+2. **Scale-out / rebalance is gated on unbuilt shardlite core.** Bumping a StatefulSet's replicas adds
+   pods, but shardlite places shards by node-id **at creation** and has **no live shard-move** (shardlite
    plan step 11, "not designed beyond the mechanism"). So a new pod holds **no shards and takes no
-   writes** until meshdb can move whole shards to it. Create/start/stop/destroy are deliverable now;
-   **true scaling is not** — build the k8s mechanism, label it honestly, and wait on meshdb for the
+   writes** until shardlite can move whole shards to it. Create/start/stop/destroy are deliverable now;
+   **true scaling is not** — build the k8s mechanism, label it honestly, and wait on shardlite for the
    data rebalance.
 3. **The console must run in-cluster with RBAC.** Creating StatefulSets needs a ServiceAccount + a
    namespace-scoped Role. Safer than the Docker-socket alternative (namespaced, not root-on-host),
@@ -45,8 +45,8 @@ this adds a capability rather than reworking the core.
 Console (Deployment, in-cluster SA + namespace Role)
    │  k8s REST via ureq+rustls  (token @ /var/run/secrets/.../token, CA, KUBERNETES_SERVICE_HOST)
    ▼
-per cluster:  Headless Service meshdb-<id>   (stable peer DNS)
-              StatefulSet   meshdb-<id>  replicas=N, volumeClaimTemplates (PVC per pod)
+per cluster:  Headless Service shardlite-<id>   (stable peer DNS)
+              StatefulSet   shardlite-<id>  replicas=N, volumeClaimTemplates (PVC per pod)
                  entrypoint shim: node-id = ordinal+1, peers = other ordinals' DNS, --shards S
    │
    └─ console polls pods Ready + /v1/health (leader elected) ──► auto-registers a connection
@@ -64,7 +64,7 @@ New console pieces:
   **typed confirm** (matches the console's delete-always-confirms rule). License check gates create.
 - **UI** — a **Clusters** section: a create wizard (name, node count, shard count — shard count
   locked with a "cannot change later" warning), lifecycle buttons, live status from k8s pod readiness
-  + meshdb health.
+  + shardlite health.
 - **Deploy artifacts** — SA + Role + RoleBinding + console Deployment/Service as a small **Helm
   chart**, parallel to `deploy/stack/` for Docker.
 
@@ -78,13 +78,13 @@ New console pieces:
 | **Stop** | scale replicas → 0 | keeps PVCs (data safe) |
 | **Start** | scale replicas → N | data intact from PVCs |
 | **Destroy** | delete StatefulSet + Service + PVCs, drop connection | typed confirm |
-| **Scale-out** | bump replicas (+ placement call) | **mechanism only** — no data moves until meshdb shard-move exists (blocker 2) |
+| **Scale-out** | bump replicas (+ placement call) | **mechanism only** — no data moves until shardlite shard-move exists (blocker 2) |
 
 ---
 
 ## Build order (each slice independently verifiable, on `kind`/minikube)
 
-- **0 — StatefulSet-ready meshdb image.** Entrypoint derives node-id/peers from pod ordinal +
+- **0 — StatefulSet-ready shardlite image.** Entrypoint derives node-id/peers from pod ordinal +
   headless DNS. *Done when:* a hand-written StatefulSet brings up a healthy N-node cluster,
   reachable in-cluster.
 - **1 — `k8s.rs` client.** In-cluster auth + minimal REST. *Done when:* it can create/get/delete a
@@ -95,13 +95,13 @@ New console pieces:
   destroy removes everything + the connection.
 - **4 — Clusters UI.** Wizard + lifecycle + status, end-to-end from the browser.
 - **5 — Console-on-k8s.** RBAC + Deployment + Helm chart; console provisions from inside the cluster.
-- **6 — Scale-out + rebalance *(blocked on meshdb step 11)*.** Ship only when meshdb can move shards;
+- **6 — Scale-out + rebalance *(blocked on shardlite step 11)*.** Ship only when shardlite can move shards;
   until then "add node" is exposed as standby/read replicas, explicitly labeled as *not* rebalancing
   existing shards.
 - **L — Licensing gate.** Enterprise-only: create/scale endpoints require a valid license;
   individual/Docker deployments never see the Clusters UI. (Design the license mechanism separately.)
 
-Slices 0–5 are fully deliverable; slice 6's rebalance is the one true dependency on meshdb core.
+Slices 0–5 are fully deliverable; slice 6's rebalance is the one true dependency on shardlite core.
 
 ---
 
@@ -111,5 +111,5 @@ Slices 0–5 are fully deliverable; slice 6's rebalance is the one true dependen
 - **Namespace-scoped RBAC** — create/delete on workloads in *one* target namespace, nothing
   cluster-wide.
 - **One StatefulSet per cluster; ordinal → node-id.**
-- **If live scaling becomes a hard requirement, meshdb shard-move (plan step 11) must be scheduled
+- **If live scaling becomes a hard requirement, shardlite shard-move (plan step 11) must be scheduled
   first** — the console cannot fake it.

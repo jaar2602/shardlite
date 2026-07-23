@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bring up the 3-node meshdb cluster and prove a client can run SQL against ANY node without
+# Bring up the 3-node shardlite cluster and prove a client can run SQL against ANY node without
 # knowing the data is sharded across all three. Every request below goes over the HTTP gateway
 # to a DIFFERENT node in rotation, yet the answers are consistent — the nodes route to each other.
 #

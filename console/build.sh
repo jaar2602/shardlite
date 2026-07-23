@@ -16,8 +16,8 @@ fi
 echo "==> building backend (embeds web/dist)"
 if [ "$PROFILE" = "--release" ]; then
   cargo build --manifest-path server/Cargo.toml --release
-  echo "==> built: server/target/release/meshdb-console"
+  echo "==> built: server/target/release/shardlite-console"
 else
   cargo build --manifest-path server/Cargo.toml
-  echo "==> built: server/target/debug/meshdb-console"
+  echo "==> built: server/target/debug/shardlite-console"
 fi

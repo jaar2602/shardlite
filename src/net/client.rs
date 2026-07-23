@@ -222,7 +222,7 @@ impl Client {
 
         match me.round_trip(Request::Hello {
             version: PROTOCOL_VERSION,
-            client: format!("meshdb-client/{}", env!("CARGO_PKG_VERSION")),
+            client: format!("shardlite-client/{}", env!("CARGO_PKG_VERSION")),
         })? {
             Response::Welcome {
                 shard_count, epoch, ..

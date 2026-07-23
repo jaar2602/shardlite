@@ -1,18 +1,18 @@
-# meshdb — full stack: a 3-node HA cluster plus the web console, all persisted on Docker volumes.
+# shardlite — full stack: a 3-node HA cluster plus the web console, all persisted on Docker volumes.
 #
 # Every service's state lives on a named volume, so `down` then `up` keeps your data: the cluster's
 # shards and Raft state, and the console's users, connections, and (sealed) AI settings. Only
-# `meshdb-stack destroy` removes the volumes.
+# `shardlite-stack destroy` removes the volumes.
 #
 # The console runs INSIDE this network and reaches the nodes by their service names on the internal
 # gateway port 8080 (node1:8080, …). The host sees the nodes on 8081-8083 and the console on 7100.
 #
-# Managed by ./meshdb-stack — run that, not `docker compose` directly (it generates the secrets in
+# Managed by ./shardlite-stack — run that, not `docker compose` directly (it generates the secrets in
 # .env that this file requires).
-name: meshdb
+name: shardlite
 
 x-node: &node
-  image: meshdb-node:latest
+  image: shardlite-node:latest
   restart: unless-stopped
   networks: [mesh]
   healthcheck:
@@ -54,20 +54,20 @@ services:
     ports: ["8083:8080"]
 
   console:
-    image: meshdb-console:latest
+    image: shardlite-console:latest
     build:
       context: ../../console
       dockerfile: Dockerfile
     restart: unless-stopped
     networks: [mesh]
     depends_on: [node1, node2, node3]
-    # MESHDB_CONSOLE_KEY MUST stay constant across restarts — it encrypts stored secrets at rest;
-    # a changed key makes them undecryptable. meshdb-stack pins it in .env. The admin is bootstrapped
+    # SHARDLITE_CONSOLE_KEY MUST stay constant across restarts — it encrypts stored secrets at rest;
+    # a changed key makes them undecryptable. shardlite-stack pins it in .env. The admin is bootstrapped
     # once, on the first start against an empty volume.
     environment:
-      MESHDB_CONSOLE_KEY: ${MESHDB_CONSOLE_KEY:?run ./meshdb-stack up (it generates .env)}
-      MESHDB_CONSOLE_ADMIN: ${MESHDB_CONSOLE_ADMIN:-admin}
-      MESHDB_CONSOLE_ADMIN_PASSWORD: ${MESHDB_CONSOLE_ADMIN_PASSWORD:?run ./meshdb-stack up (it generates .env)}
+      SHARDLITE_CONSOLE_KEY: ${SHARDLITE_CONSOLE_KEY:?run ./shardlite-stack up (it generates .env)}
+      SHARDLITE_CONSOLE_ADMIN: ${SHARDLITE_CONSOLE_ADMIN:-admin}
+      SHARDLITE_CONSOLE_ADMIN_PASSWORD: ${SHARDLITE_CONSOLE_ADMIN_PASSWORD:?run ./shardlite-stack up (it generates .env)}
     command: ["--listen", "0.0.0.0:7100", "--data", "/data"]
     volumes: [console-data:/data]
     ports: ["7100:7100"]

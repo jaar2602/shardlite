@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meshdb::net::{Client, NodeServices, RunResult, Server, ServerConfig};
-use meshdb::shard::{ShardConfig, ShardManager};
-use meshdb::storage::Value;
+use shardlite::net::{Client, NodeServices, RunResult, Server, ServerConfig};
+use shardlite::shard::{ShardConfig, ShardManager};
+use shardlite::storage::Value;
 use tempfile::TempDir;
 
 fn serve(shards: u32) -> (String, TempDir, Arc<Server>) {

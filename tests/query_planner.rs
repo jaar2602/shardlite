@@ -5,10 +5,10 @@
 //! the only way to catch a merge that is plausible but wrong — which is the whole failure
 //! mode this planner exists to avoid.
 
-use meshdb::query::{Combine, OutputCol, Plan, SetKind, SetTree, ShardKeys, plan, plan_with};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::{Executed, Outcome, QueryResult, Statement};
+use shardlite::query::{Combine, OutputCol, Plan, SetKind, SetTree, ShardKeys, plan, plan_with};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::{Executed, Outcome, QueryResult, Statement};
 use tempfile::TempDir;
 
 const ROWS: i64 = 400;

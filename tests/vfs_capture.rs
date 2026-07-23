@@ -17,8 +17,8 @@
 
 use std::path::Path;
 
-use meshdb::rusqlite::{Connection, OpenFlags};
-use meshdb::vfs::{self, WalCapture};
+use shardlite::rusqlite::{Connection, OpenFlags};
+use shardlite::vfs::{self, WalCapture};
 use tempfile::TempDir;
 
 fn open_captured(path: &Path) -> (Connection, std::sync::Arc<WalCapture>) {
@@ -140,7 +140,7 @@ fn a_follower_is_reconstructed_byte_identically() {
     for i in 1..=200 {
         conn.execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            meshdb::rusqlite::params![i, format!("value-{i}")],
+            shardlite::rusqlite::params![i, format!("value-{i}")],
         )
         .unwrap();
     }
@@ -193,7 +193,7 @@ fn capture_survives_checkpoints_and_wal_resets() {
             let id = round * 1000 + i;
             conn.execute(
                 "INSERT INTO t VALUES (?1, ?2)",
-                meshdb::rusqlite::params![id, format!("r{round}-{i}")],
+                shardlite::rusqlite::params![id, format!("r{round}-{i}")],
             )
             .unwrap();
         }
@@ -248,7 +248,7 @@ fn dropping_one_transaction_is_detected_as_divergence() {
     for i in 1..=100 {
         conn.execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            meshdb::rusqlite::params![i, format!("v{i}")],
+            shardlite::rusqlite::params![i, format!("v{i}")],
         )
         .unwrap();
     }
@@ -300,7 +300,7 @@ fn reconstruction_holds_under_page_reuse_and_churn() {
     for i in 1..=5_000 {
         conn.execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            meshdb::rusqlite::params![i, format!("{pad}-{i}")],
+            shardlite::rusqlite::params![i, format!("{pad}-{i}")],
         )
         .unwrap();
     }
@@ -312,7 +312,7 @@ fn reconstruction_holds_under_page_reuse_and_churn() {
     for i in 10_000..12_000 {
         conn.execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            meshdb::rusqlite::params![i, format!("{pad}-{i}")],
+            shardlite::rusqlite::params![i, format!("{pad}-{i}")],
         )
         .unwrap();
     }
@@ -426,7 +426,7 @@ fn capture_survives_concurrent_readers_and_truncate() {
     for i in 1..=300 {
         conn.execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            meshdb::rusqlite::params![i, format!("v{i}")],
+            shardlite::rusqlite::params![i, format!("v{i}")],
         )
         .unwrap();
         if i % 100 == 0 {

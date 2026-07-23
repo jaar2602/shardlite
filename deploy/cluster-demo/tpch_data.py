@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Generate a small, deterministic TPC-H-shaped dataset for the meshdb cluster demo.
+"""Generate a small, deterministic TPC-H-shaped dataset for the shardlite cluster demo.
 
 This is NOT official TPC-H (no dbgen, no scale factor) — it is the same table shapes and the same
 query shapes (Q1, Q6, plus a join and a grouped aggregate), scaled down to a few hundred rows so it
 loads over HTTP in seconds and the whole thing fits a demo.
 
-Design choices that matter for meshdb:
-  * Every table has a SINGLE-column primary key, which meshdb makes the shard key automatically — no
+Design choices that matter for shardlite:
+  * Every table has a SINGLE-column primary key, which shardlite makes the shard key automatically — no
     extra declaration, exactly like the users-table demo.
   * Money is INTEGER cents and discount is an INTEGER percent, with the discounted price
     precomputed. So every aggregate in Q1/Q6 is an integer sum, and a cross-shard merged answer is
     EXACTLY equal to a single-shard one — no floating-point drift to explain away.
 
 Output: SQL statements, one per line, CREATE TABLEs first then INSERTs, on stdout. The same stream
-loads into meshdb (over /v1/run) and into stock sqlite3 (the ground-truth check).
+loads into shardlite (over /v1/run) and into stock sqlite3 (the ground-truth check).
 """
 import random
 
@@ -62,7 +62,7 @@ emit(
     "l_shipdate TEXT) STRICT"
 )
 
-# meshdb routes an INSERT by its shard key, so every INSERT must LIST its columns — an unlisted
+# shardlite routes an INSERT by its shard key, so every INSERT must LIST its columns — an unlisted
 # `INSERT ... VALUES (...)` is refused because the key's position cannot be assumed. We spell the
 # columns out everywhere (which is good SQL hygiene regardless).
 

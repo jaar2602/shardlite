@@ -54,7 +54,7 @@ export default function Fleet() {
       </div>
       <section aria-labelledby="fleet-clusters">
         <div className="mb-3 flex items-center justify-between"><h2 id="fleet-clusters" className="font-mono text-xs uppercase tracking-wider text-carbon-text-2">Database records</h2><span className="text-xs text-carbon-text-3">Select a record to inspect it</span></div>
-        {clusters.length === 0 ? <EmptyState title="No databases connected" description="Add a MeshDB connection to begin collecting fleet health and topology evidence." action={<Button onClick={() => nav("/connections")}>Add a connection</Button>} /> : <div className="grid gap-2 lg:grid-cols-2 2xl:grid-cols-3">
+        {clusters.length === 0 ? <EmptyState title="No databases connected" description="Add a ShardLite connection to begin collecting fleet health and topology evidence." action={<Button onClick={() => nav("/connections")}>Add a connection</Button>} /> : <div className="grid gap-2 lg:grid-cols-2 2xl:grid-cols-3">
           {clusters.map((cluster) => <ClusterRecord key={cluster.name} cluster={cluster} onOpen={() => nav(`/c/${encodeURIComponent(cluster.name)}/overview`)} />)}
         </div>}
       </section>

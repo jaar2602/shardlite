@@ -2,8 +2,8 @@
 //!
 //! Same workload twice: default VFS, then the capture VFS. Reports throughput and the
 //! memory the capture accumulates.
-use meshdb::rusqlite::{Connection, OpenFlags, params};
-use meshdb::vfs;
+use shardlite::rusqlite::{Connection, OpenFlags, params};
+use shardlite::vfs;
 use std::time::Instant;
 
 const ROWS: usize = 20_000;

@@ -1,3 +1,3 @@
-module github.com/meshdb/driver-go
+module github.com/shardlite/driver-go
 
 go 1.21

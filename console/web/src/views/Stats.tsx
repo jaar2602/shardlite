@@ -57,7 +57,7 @@ export default function Stats({ name }: { name: string }) {
 
   return (
     <Page>
-      <PageHeader eyebrow="Telemetry / sampled locally" title="Metrics" description={`Showing ${samples.length} samples, approximately ${Math.max(1, Math.round((samples.length * 5) / 60))} minutes. History is collected by the console, not stored by MeshDB.`} actions={<Button variant="secondary" onClick={() => void load()}>Refresh now</Button>} />
+      <PageHeader eyebrow="Telemetry / sampled locally" title="Metrics" description={`Showing ${samples.length} samples, approximately ${Math.max(1, Math.round((samples.length * 5) / 60))} minutes. History is collected by the console, not stored by ShardLite.`} actions={<Button variant="secondary" onClick={() => void load()}>Refresh now</Button>} />
       {error && <Banner tone="error">Refresh failed; showing the last collected samples. {error}</Banner>}
       <div className="flex flex-wrap items-end justify-between gap-3"><div className="w-full max-w-sm"><TextInput label="Find a metric" placeholder="writer, raft, cache…" value={filter} onChange={(event) => setFilter(event.target.value)} /></div><span className="font-mono text-xs text-carbon-text-3">updates every 5s</span></div>
       <div className="space-y-7">

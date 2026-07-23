@@ -28,7 +28,7 @@ pub struct Db {
 }
 
 impl Db {
-    /// Open (or create) a meshdb data directory.
+    /// Open (or create) a shardlite data directory.
     ///
     /// `shard_count` is recorded in the manifest on creation and refused if it disagrees
     /// with existing data.

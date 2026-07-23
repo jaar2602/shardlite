@@ -1,31 +1,31 @@
-# meshdb full-stack deployment
+# shardlite full-stack deployment
 
 One command brings up the whole app on Docker — a **3-node HA cluster** and the **web console** —
 with every piece of state on a **Docker volume**, so it survives restarts.
 
 ```sh
 cd deploy/stack
-./meshdb-stack up
+./shardlite-stack up
 ```
 
-First run builds two images (the meshdb node and the console, frontend + backend), starts four
+First run builds two images (the shardlite node and the console, frontend + backend), starts four
 containers, waits for the console to come up, and registers the cluster as a console connection.
 When it finishes it prints the console URL and the generated admin credentials.
 
-Open **http://localhost:7100**, sign in as `admin` with the printed password, and the `meshdb`
+Open **http://localhost:7100**, sign in as `admin` with the printed password, and the `shardlite`
 connection is already there to browse, query, and point the AI assistant at.
 
 ## Commands
 
 | Command | Does |
 |---|---|
-| `./meshdb-stack up` | Build (first run) and start everything; register the connection. |
-| `./meshdb-stack down` | Stop the stack. **Keeps all data** on the volumes. |
-| `./meshdb-stack restart` | Restart the running services. |
-| `./meshdb-stack status` | Container and health status. |
-| `./meshdb-stack logs [svc]` | Follow logs — all services, or one (`node1`/`node2`/`node3`/`console`). |
-| `./meshdb-stack register` | Re-register the cluster connection (idempotent). |
-| `./meshdb-stack destroy` | Stop **and delete all volumes + secrets** (asks for confirmation). |
+| `./shardlite-stack up` | Build (first run) and start everything; register the connection. |
+| `./shardlite-stack down` | Stop the stack. **Keeps all data** on the volumes. |
+| `./shardlite-stack restart` | Restart the running services. |
+| `./shardlite-stack status` | Container and health status. |
+| `./shardlite-stack logs [svc]` | Follow logs — all services, or one (`node1`/`node2`/`node3`/`console`). |
+| `./shardlite-stack register` | Re-register the cluster connection (idempotent). |
+| `./shardlite-stack destroy` | Stop **and delete all volumes + secrets** (asks for confirmation). |
 
 ## What persists, and how
 
@@ -38,8 +38,8 @@ connection is already there to browse, query, and point the AI assistant at.
 
 ### Secrets (`.env`, generated on first `up`)
 
-`meshdb-stack` writes `MESHDB_CONSOLE_KEY` and `MESHDB_CONSOLE_ADMIN_PASSWORD` to `.env` (mode 600)
-once, then reuses them. **`MESHDB_CONSOLE_KEY` must stay constant** — it encrypts the console's
+`shardlite-stack` writes `SHARDLITE_CONSOLE_KEY` and `SHARDLITE_CONSOLE_ADMIN_PASSWORD` to `.env` (mode 600)
+once, then reuses them. **`SHARDLITE_CONSOLE_KEY` must stay constant** — it encrypts the console's
 stored secrets at rest, so a changed key makes saved connections and the AI key undecryptable. That
 is why the key is pinned in a file rather than regenerated each run. `.env` is git-ignored; keep it
 safe, and `destroy` deletes it.

@@ -373,7 +373,7 @@ impl Metrics {
             .and_then(|bytes| crate::store::write_atomic(path, &bytes))
         {
             Ok(()) => *last = Instant::now(),
-            Err(error) => eprintln!("meshdb-console: persisting observability state: {error}"),
+            Err(error) => eprintln!("shardlite-console: persisting observability state: {error}"),
         }
     }
 }
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn observations_and_metric_history_survive_restart() {
         let path = std::env::temp_dir().join(format!(
-            "meshdb-console-observability-{}.json",
+            "shardlite-console-observability-{}.json",
             rand::random::<u64>()
         ));
         let metrics = Metrics::open(&path).unwrap();
@@ -878,9 +878,9 @@ mod tests {
     fn shard_evidence_collapses_to_one_row_with_epoch_safe_lag() {
         let suffix = rand::random::<u64>();
         let registry_path =
-            std::env::temp_dir().join(format!("meshdb-console-registry-{suffix}.json"));
+            std::env::temp_dir().join(format!("shardlite-console-registry-{suffix}.json"));
         let metrics_path =
-            std::env::temp_dir().join(format!("meshdb-console-metrics-{suffix}.json"));
+            std::env::temp_dir().join(format!("shardlite-console-metrics-{suffix}.json"));
         let registry = Registry::open(
             &registry_path,
             crate::crypto::Sealer::from_passphrase("master"),

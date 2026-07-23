@@ -29,7 +29,7 @@ use libsqlite3_sys as ffi;
 
 use super::{S3Client, S3Pager};
 
-pub const VFS_NAME: &str = "meshdb-s3-rw";
+pub const VFS_NAME: &str = "shardlite-s3-rw";
 
 struct RwVfsState {
     base: *mut ffi::sqlite3_vfs,

@@ -1,9 +1,9 @@
 //! Streaming reads: an arbitrarily large result must not materialise in memory.
 
-use meshdb::shard::reader_fleet::StreamMsg;
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::shard::reader_fleet::StreamMsg;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -141,7 +141,7 @@ fn a_dropped_receiver_stops_the_reader_early() {
         .query(S0, Statement::new("SELECT count(*) FROM t"))
         .unwrap();
     match n {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
             assert_eq!(r.rows[0][0], Value::Integer(100_000));
         }
         other => panic!("expected rows, got {other:?}"),

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# End-to-end test of the `meshdb user` and `meshdb serve --users` CLI: offline
+# End-to-end test of the `shardlite user` and `shardlite serve --users` CLI: offline
 # provisioning, a running server, and runtime user creation that persists.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-BIN=target/debug/meshdb
+BIN=target/debug/shardlite
 [ -x "$BIN" ] || cargo build >/dev/null 2>&1
 WORK=$(mktemp -d)
 PORT=$(( (RANDOM % 2000) + 15000 ))

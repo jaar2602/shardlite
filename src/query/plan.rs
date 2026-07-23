@@ -302,7 +302,7 @@ impl std::fmt::Display for Unsupported {
 /// lowercased. A join on two tables' shard keys keeps every matching pair on one shard (they route
 /// to the same shard), so it is *co-located* and can be pushed to each shard and concatenated.
 ///
-/// This is a **trust assertion**, not something meshdb can verify: the app is responsible for
+/// This is a **trust assertion**, not something shardlite can verify: the app is responsible for
 /// having routed those columns consistently. Declaring co-partitioning for tables that are not
 /// actually co-located yields a join that silently misses cross-shard matches — the one place the
 /// planner trusts rather than proves.

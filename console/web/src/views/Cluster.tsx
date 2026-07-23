@@ -207,11 +207,11 @@ export default function Cluster({ name }: { name: string }) {
       <header className="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-carbon-border pb-3">
         <div>
           <div className="mb-3 text-xs uppercase tracking-[0.14em] text-carbon-text-3">
-            meshdb console · database topology
+            shardlite console · database topology
           </div>
           <h1 className="text-2xl font-semibold tracking-tight text-carbon-text">One database, every node</h1>
           <p className="mt-2 max-w-4xl text-sm text-carbon-text-3">
-            A live map of the nodes serving this MeshDB database. Select a node to inspect its health,
+            A live map of the nodes serving this ShardLite database. Select a node to inspect its health,
             role, workload, and share of data responsibility.
           </p>
         </div>
@@ -238,7 +238,7 @@ export default function Cluster({ name }: { name: string }) {
       {legacyTopology && (
         <div className="mb-5">
           <Banner tone="info">
-            This MeshDB version does not report member liveness yet. Nodes discovered from data placement are
+            This ShardLite version does not report member liveness yet. Nodes discovered from data placement are
             shown as unknown rather than assumed healthy.
           </Banner>
         </div>
@@ -369,7 +369,7 @@ export default function Cluster({ name }: { name: string }) {
                     <span className="h-2.5 w-2.5 bg-[#4589ff]" /> Data distribution
                   </div>
                   <DetailRow label="data responsibility" value={`${selected.dataShare}%`} />
-                  <DetailRow label="replication" value="managed by MeshDB" />
+                  <DetailRow label="replication" value="managed by ShardLite" />
 
                   <div className="my-3 border-t border-carbon-border" />
                   <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">Node workload</div>

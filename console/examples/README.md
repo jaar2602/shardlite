@@ -1,6 +1,6 @@
 # Console SQL test kit
 
-Use [`workbench-test.sql`](./workbench-test.sql) against a disposable MeshDB cluster. It is a
+Use [`workbench-test.sql`](./workbench-test.sql) against a disposable ShardLite cluster. It is a
 guided collection of statements, not a script to paste and execute as one batch.
 
 Recommended order:
@@ -9,7 +9,7 @@ Recommended order:
    review and apply it in the results pane.
 2. Run each account insert with its account ID in the contextual **Data key** field.
 3. Select both write statements, choose **Selection**, and click **Run** to test an atomic transaction.
-4. Run aggregates, grouped reads, sorting, distinct, and union normally; MeshDB queries the database.
+4. Run aggregates, grouped reads, sorting, distinct, and union normally; ShardLite queries the database.
 5. Open **Options** only for targeted reads, freshness, explain, export, or diagnostics.
 6. Use the expected-failure sections to verify constraint and transaction behavior.
 7. Run large export, drift, partial-rollout, and stale-approval sections only when wanted.
@@ -22,14 +22,14 @@ deliberately. They are marked optional and should not be used against production
 
 [`generate_workbench_data.py`](./generate_workbench_data.py) creates reproducible, synthetic
 `INSERT` and `UPDATE` statements using fixed word lists and Python's standard pseudo-random number
-generator. It does not use AI, access the network, connect to MeshDB, or execute SQL.
+generator. It does not use AI, access the network, connect to ShardLite, or execute SQL.
 
 ```bash
 python3 console/examples/generate_workbench_data.py \
   --accounts 100 \
   --events-per-account 2 \
   --updates 40 \
-  --seed 42 > /tmp/meshdb-test-data.sql
+  --seed 42 > /tmp/shardlite-test-data.sql
 ```
 
 Run the schema statements from `workbench-test.sql` first. The generated output labels every SQL

@@ -1,7 +1,7 @@
-// Run against a live gateway: MESHDB_PORT=NNNN cargo run --example demo
-fn main() -> Result<(), meshdb_driver::Error> {
-    let port = std::env::var("MESHDB_PORT").unwrap_or_else(|_| "4680".into());
-    let db = meshdb_driver::Client::new(&format!("http://127.0.0.1:{port}"));
+// Run against a live gateway: SHARDLITE_PORT=NNNN cargo run --example demo
+fn main() -> Result<(), shardlite_driver::Error> {
+    let port = std::env::var("SHARDLITE_PORT").unwrap_or_else(|_| "4680".into());
+    let db = shardlite_driver::Client::new(&format!("http://127.0.0.1:{port}"));
 
     println!("info: {}", db.info()?);
 

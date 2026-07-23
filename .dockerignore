@@ -1,4 +1,4 @@
-# Keep the Docker build context small — the meshdb binary needs only the crate sources.
+# Keep the Docker build context small — the shardlite binary needs only the crate sources.
 /target
 /console
 /drivers

@@ -26,7 +26,7 @@ export default function Login() {
     <div className="h-full grid place-items-center bg-carbon-bg">
       <form onSubmit={submit} className="w-80 bg-carbon-layer border border-carbon-border p-6 space-y-4">
         <div>
-          <div className="text-carbon-text text-lg font-semibold">meshdb console</div>
+          <div className="text-carbon-text text-lg font-semibold">shardlite console</div>
           <div className="text-carbon-text-3 text-xs">Sign in to manage your clusters</div>
         </div>
         {error && <Banner tone="error">{error}</Banner>}

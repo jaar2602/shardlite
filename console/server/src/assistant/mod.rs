@@ -238,10 +238,10 @@ fn truncate(s: &str) -> String {
     }
 }
 
-/// The system prompt: meshdb's model plus how the assistant should behave. Grounding + guardrail
+/// The system prompt: shardlite's model plus how the assistant should behave. Grounding + guardrail
 /// intent, versioned with the build.
 pub fn system_prompt() -> String {
-    "You are the meshdb console assistant. meshdb is a high-availability, sharded, multi-write \
+    "You are the shardlite console assistant. shardlite is a high-availability, sharded, multi-write \
      SQLite server: data is split across a fixed number of shards spread over cluster nodes; a \
      client runs plain SQL against any node and never names a shard. Cross-shard transactions are \
      unavailable; reads fan out and merge. Answer questions about the cluster and its data.\n\n\

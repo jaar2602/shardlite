@@ -113,7 +113,7 @@ impl ReaderFleet {
             };
             let rx = rx.clone();
             let handle = std::thread::Builder::new()
-                .name(format!("meshdb-reader-{i}"))
+                .name(format!("shardlite-reader-{i}"))
                 .spawn(move || reader_loop(rx, ctx))
                 .expect("spawning a reader thread");
             threads.push(handle);

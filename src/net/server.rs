@@ -301,7 +301,7 @@ impl Server {
             let counters = Arc::clone(&self.counters);
             let idle = self.cfg.idle_timeout;
             std::thread::Builder::new()
-                .name("meshdb-conn".into())
+                .name("shardlite-conn".into())
                 .spawn(move || {
                     let peer = stream
                         .peer_addr()

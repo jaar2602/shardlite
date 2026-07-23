@@ -22,8 +22,8 @@ export default function Connections() {
     name: "",
     url: "",
     additional_seeds: "",
-    meshdb_user: "",
-    meshdb_secret: "",
+    shardlite_user: "",
+    shardlite_secret: "",
     enabled: true,
     timeout_ms: 60000,
     allow_insecure_http: false,
@@ -58,8 +58,8 @@ export default function Connections() {
         name: form.name,
         url: form.url,
         seeds: [form.url, ...form.additional_seeds.split(/\s+/)].filter(Boolean),
-        meshdb_user: form.meshdb_user || undefined,
-        meshdb_secret: form.meshdb_secret || undefined,
+        shardlite_user: form.shardlite_user || undefined,
+        shardlite_secret: form.shardlite_secret || undefined,
         replace: editing !== null,
         enabled: form.enabled,
         timeout_ms: form.timeout_ms,
@@ -93,8 +93,8 @@ export default function Connections() {
       name: connection.name,
       url: connection.url,
       additional_seeds: connection.seeds.slice(1).join("\n"),
-      meshdb_user: connection.meshdb_user ?? "",
-      meshdb_secret: "",
+      shardlite_user: connection.shardlite_user ?? "",
+      shardlite_secret: "",
       enabled: connection.enabled,
       timeout_ms: connection.timeout_ms,
       allow_insecure_http: connection.allow_insecure_http,
@@ -176,7 +176,7 @@ export default function Connections() {
 
   return (
     <Page>
-      <PageHeader eyebrow="Databases / connection profiles" title="Connections" description="Connect once to a MeshDB database. The console automatically uses a healthy endpoint for queries, changes, and monitoring." actions={isAdmin && <Button onClick={adding ? cancelEdit : startAdd}>{adding ? "Close form" : "Add database"}</Button>} />
+      <PageHeader eyebrow="Databases / connection profiles" title="Connections" description="Connect once to a ShardLite database. The console automatically uses a healthy endpoint for queries, changes, and monitoring." actions={isAdmin && <Button onClick={adding ? cancelEdit : startAdd}>{adding ? "Close form" : "Add database"}</Button>} />
 
       {error && <div className="mb-4"><Banner tone="error">{error}</Banner></div>}
 
@@ -211,16 +211,16 @@ export default function Connections() {
               <span className="mt-1 block text-xs text-carbon-text-3">Any healthy endpoint provides access to the whole database.</span>
             </label>
             <TextInput
-              label="meshdb user (optional)"
-              value={form.meshdb_user}
-              onChange={(e) => setForm({ ...form, meshdb_user: e.target.value })}
+              label="shardlite user (optional)"
+              value={form.shardlite_user}
+              onChange={(e) => setForm({ ...form, shardlite_user: e.target.value })}
               placeholder="app"
             />
             <TextInput
-              label={editing ? "New meshdb secret (blank keeps current)" : "meshdb secret (optional, stored encrypted)"}
+              label={editing ? "New shardlite secret (blank keeps current)" : "shardlite secret (optional, stored encrypted)"}
               type="password"
-              value={form.meshdb_secret}
-              onChange={(e) => setForm({ ...form, meshdb_secret: e.target.value })}
+              value={form.shardlite_secret}
+              onChange={(e) => setForm({ ...form, shardlite_secret: e.target.value })}
             />
             <TextInput
               label="Request timeout (milliseconds)"
@@ -286,7 +286,7 @@ export default function Connections() {
               label="S3 bucket"
               value={form.s3_bucket}
               onChange={(e) => setForm({ ...form, s3_bucket: e.target.value })}
-              placeholder="meshdb-backups"
+              placeholder="shardlite-backups"
             />
             <TextInput
               label="S3 region"
@@ -330,7 +330,7 @@ export default function Connections() {
           <Button disabled={verifyingNode || !nodeEndpoint.trim()} onClick={() => void verifyNode()}>{verifyingNode ? "Verifying…" : "Verify node"}</Button>
           <Button variant="ghost" onClick={() => { setVerifyFor(null); setNodeVerification(null); }}>Close</Button>
         </div>
-        <p className="mt-2 text-xs text-carbon-text-3">This check is read-only. Join the node through your existing MeshDB deployment process, then return here to confirm membership and health.</p>
+        <p className="mt-2 text-xs text-carbon-text-3">This check is read-only. Join the node through your existing ShardLite deployment process, then return here to confirm membership and health.</p>
         {nodeVerification && <div className="mt-4 border-t border-carbon-border pt-4">
           <div className="flex flex-wrap items-center gap-2"><Tag tone={nodeVerification.status === "ready" ? "green" : nodeVerification.status === "stabilizing" ? "yellow" : "red"}>{nodeVerification.status.replace("_", " ")}</Tag><span className="font-mono text-xs text-carbon-text-3">{nodeVerification.latency_ms} ms · node {nodeVerification.node ?? "unknown"} · version {nodeVerification.version ?? "unknown"}</span></div>
           <dl className="mt-3 grid grid-cols-2 gap-px bg-carbon-border text-xs md:grid-cols-4">
@@ -346,7 +346,7 @@ export default function Connections() {
 
       {list === null ? (
         <Spinner label="Loading connections…" />
-      ) : list.length === 0 ? <EmptyState title="No connections yet" description={isAdmin ? "Add the first MeshDB endpoint to begin observing the fleet." : "An administrator needs to add a MeshDB connection."} action={isAdmin && <Button onClick={startAdd}>Add connection</Button>} /> : <div className="grid gap-2 lg:grid-cols-2 2xl:grid-cols-3">
+      ) : list.length === 0 ? <EmptyState title="No connections yet" description={isAdmin ? "Add the first ShardLite endpoint to begin observing the fleet." : "An administrator needs to add a ShardLite connection."} action={isAdmin && <Button onClick={startAdd}>Add connection</Button>} /> : <div className="grid gap-2 lg:grid-cols-2 2xl:grid-cols-3">
         {list.map((connection) => <ConnectionRecord
           key={connection.name}
           connection={connection}
@@ -378,7 +378,7 @@ function ConnectionRecord({ connection, isAdmin, testing, testResult, onOpen, on
   return <article className={`border border-carbon-border border-l-4 bg-carbon-layer ${connection.enabled ? "border-l-carbon-green" : "border-l-carbon-text-3"}`}>
     <div className="p-3">
       <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-lg font-semibold">{connection.name}</h2><p className="mt-1 truncate font-mono text-xs text-carbon-text-3" title={connection.seeds.join("\n")}>{connection.url}</p></div><Tag tone={connection.enabled ? "green" : "gray"}>{connection.enabled ? "enabled" : "disabled"}</Tag></div>
-      <dl className="mt-3 grid grid-cols-3 gap-2 border-y border-carbon-border py-2.5 text-xs"><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Endpoints</dt><dd className="mt-1 font-mono">{connection.seeds.length}</dd></div><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Identity</dt><dd className="mt-1 truncate font-mono">{connection.meshdb_user ?? "none"}</dd></div><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Timeout</dt><dd className="mt-1 font-mono">{Math.round(connection.timeout_ms / 1000)}s</dd></div></dl>
+      <dl className="mt-3 grid grid-cols-3 gap-2 border-y border-carbon-border py-2.5 text-xs"><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Endpoints</dt><dd className="mt-1 font-mono">{connection.seeds.length}</dd></div><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Identity</dt><dd className="mt-1 truncate font-mono">{connection.shardlite_user ?? "none"}</dd></div><div><dt className="font-mono text-[9px] uppercase tracking-wider text-carbon-text-3">Timeout</dt><dd className="mt-1 font-mono">{Math.round(connection.timeout_ms / 1000)}s</dd></div></dl>
       {testResult && <p className={`mt-3 text-xs ${testResult.ok ? "text-carbon-green" : "text-carbon-red"}`}>{testResult.ok ? "Connected" : "Connection failed"} · {testResult.message}</p>}
     </div>
     <div className="flex flex-wrap items-center gap-1 border-t border-carbon-border p-2">

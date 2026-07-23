@@ -33,7 +33,7 @@ pub type NodeId = u64;
 /// A logical clock. Monotonic, and a higher one always wins.
 pub type Term = u64;
 
-const HEADER: &str = "meshdb-term-v1";
+const HEADER: &str = "shardlite-term-v1";
 const FILE: &str = "term";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

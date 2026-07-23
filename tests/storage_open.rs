@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use meshdb::config::{PragmaProfile, Role, Synchronous};
-use meshdb::error::Error;
-use meshdb::storage::{open_reader_existing, open_writer, pragma};
+use shardlite::config::{PragmaProfile, Role, Synchronous};
+use shardlite::error::Error;
+use shardlite::storage::{open_reader_existing, open_writer, pragma};
 use tempfile::TempDir;
 
 fn db_path(dir: &TempDir) -> PathBuf {
@@ -132,9 +132,9 @@ fn reader_alone_cannot_open_a_fresh_database() {
     let dir = TempDir::new().unwrap();
     let path = db_path(&dir);
 
-    let flags = meshdb::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let flags = shardlite::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
     assert!(
-        meshdb::rusqlite::Connection::open_with_flags(&path, flags).is_err(),
+        shardlite::rusqlite::Connection::open_with_flags(&path, flags).is_err(),
         "a read-only open of a nonexistent database must fail"
     );
 }
@@ -166,7 +166,7 @@ fn opening_while_another_connection_holds_the_write_lock_succeeds() {
 
     // A holds the write lock on a database that is NOT yet in WAL mode, which is exactly
     // the state a second opener has to convert.
-    let holder = meshdb::rusqlite::Connection::open(&path).unwrap();
+    let holder = shardlite::rusqlite::Connection::open(&path).unwrap();
     holder.execute_batch("CREATE TABLE t(x);").unwrap();
     holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
@@ -256,7 +256,7 @@ fn wal_conversion_contention_is_counted_and_logged() {
     // Retrying the conversion makes contention invisible unless something records it. A
     // silent retry turns "your shards are being opened by too many writers" or "your
     // storage is slow" into no signal at all.
-    use meshdb::storage::wal_conversion_stats;
+    use shardlite::storage::wal_conversion_stats;
 
     let before = wal_conversion_stats();
 
@@ -264,7 +264,7 @@ fn wal_conversion_contention_is_counted_and_logged() {
     let path = db_path(&dir);
 
     // Force the contention deterministically: hold the write lock on a non-WAL database.
-    let holder = meshdb::rusqlite::Connection::open(&path).unwrap();
+    let holder = shardlite::rusqlite::Connection::open(&path).unwrap();
     holder.execute_batch("CREATE TABLE t(x);").unwrap();
     holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
 

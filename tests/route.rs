@@ -8,10 +8,10 @@
 
 use std::collections::HashSet;
 
-use meshdb::query::route::primary_key_of;
-use meshdb::query::{Route, ShardKeys, route_statement};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager, shard_of};
-use meshdb::storage::exec::Statement;
+use shardlite::query::route::primary_key_of;
+use shardlite::query::{Route, ShardKeys, route_statement};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager, shard_of};
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 const SHARDS: u32 = 64;
@@ -307,7 +307,7 @@ fn routed_writes_survive_a_round_trip_through_the_store() {
 
     // Every inserted row is visible via a fan-out — none were routed into the void.
     let total = m.query_all_shards("SELECT count(*) FROM users").unwrap();
-    assert_eq!(total.rows, vec![vec![meshdb::storage::Value::Integer(n)]]);
+    assert_eq!(total.rows, vec![vec![shardlite::storage::Value::Integer(n)]]);
 
     // And a point lookup finds its row on the one shard the insert chose.
     let s = text_shard("user-7");
@@ -315,10 +315,10 @@ fn routed_writes_survive_a_round_trip_through_the_store() {
         .query(ShardId(s), "SELECT name FROM users WHERE id = 'user-7'")
         .unwrap();
     match hit {
-        meshdb::storage::exec::Outcome::Ok(meshdb::storage::exec::Executed::Rows(r)) => {
+        shardlite::storage::exec::Outcome::Ok(shardlite::storage::exec::Executed::Rows(r)) => {
             assert_eq!(
                 r.rows,
-                vec![vec![meshdb::storage::Value::Text("n7".into())]]
+                vec![vec![shardlite::storage::Value::Text("n7".into())]]
             );
         }
         other => panic!("point lookup did not return the row: {other:?}"),

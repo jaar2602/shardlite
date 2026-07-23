@@ -1,4 +1,4 @@
-//! The console HTTP API and the policy boundary in front of stored meshdb credentials.
+//! The console HTTP API and the policy boundary in front of stored shardlite credentials.
 //!
 //! Authentication, CSRF, body limits, console permissions, and the proxy route/method matrix are
 //! enforced here before a request can reach a managed cluster.
@@ -163,7 +163,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
         return respond::respond_json(
             request,
             200,
-            &json!({ "ok": true, "service": "meshdb-console" }),
+            &json!({ "ok": true, "service": "shardlite-console" }),
         );
     }
 
@@ -348,7 +348,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 crate::proxy::ExportFormat::Ndjson => "ndjson",
                 crate::proxy::ExportFormat::Csv => "csv",
             };
-            let filename = format!("meshdb-{name}-query.{extension}");
+            let filename = format!("shardlite-{name}-query.{extension}");
             crate::proxy::forward_download(
                 request, &resolved, "query", payload, &filename, format, max_rows,
             )?;
@@ -897,13 +897,13 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                     "name and at least one database endpoint are required",
                 );
             }
-            let meshdb_user = v
-                .get("meshdb_user")
+            let shardlite_user = v
+                .get("shardlite_user")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            let meshdb_secret = v
-                .get("meshdb_secret")
+            let shardlite_secret = v
+                .get("shardlite_secret")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
@@ -945,8 +945,8 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             let result = state.registry.put_config_seeds(
                 name,
                 seeds,
-                meshdb_user,
-                meshdb_secret,
+                shardlite_user,
+                shardlite_secret,
                 replace,
                 enabled,
                 timeout_ms,
@@ -1277,7 +1277,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                     state,
                     &session,
                     Permission::Operate,
-                    "meshdb.s3.apply",
+                    "shardlite.s3.apply",
                     name,
                 );
             }
@@ -1332,7 +1332,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             }
             state.audit.record(
                 Some(&session.user),
-                "meshdb.s3.apply",
+                "shardlite.s3.apply",
                 name,
                 if failures.is_empty() { "ok" } else { "failed" },
             );
@@ -1345,7 +1345,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
         }
 
         // Declare a table's shard key on every node — shard-key metadata is per-node, so it must
-        // reach all seeds or routing disagrees between nodes (the meshdb endpoint guards each node
+        // reach all seeds or routing disagrees between nodes (the shardlite endpoint guards each node
         // against declaring on a table that already holds rows there).
         ("POST", ["connections", name, "shardkey"]) => {
             if !session.role.permits(Permission::Operate) {
@@ -1354,7 +1354,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                     state,
                     &session,
                     Permission::Operate,
-                    "meshdb.shardkey.declare",
+                    "shardlite.shardkey.declare",
                     name,
                 );
             }
@@ -1382,7 +1382,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             }
             state.audit.record(
                 Some(&session.user),
-                "meshdb.shardkey.declare",
+                "shardlite.shardkey.declare",
                 name,
                 if failures.is_empty() { "ok" } else { "failed" },
             );
@@ -1398,7 +1398,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             let Some(permission) = proxy_permission(&method, rest) else {
                 return respond::error(request, 404, "no such endpoint or method");
             };
-            let action = format!("meshdb.{}.{}", rest[0], method.to_ascii_lowercase());
+            let action = format!("shardlite.{}.{}", rest[0], method.to_ascii_lowercase());
             if !session.role.permits(permission) {
                 return require(request, state, &session, permission, &action, name);
             }
@@ -1457,7 +1457,7 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("POST", ["query" | "query_all" | "route"]) => Some(Permission::Query),
         // /v1/run auto-routes and can write, so it needs write permission.
         ("POST", ["execute" | "tx" | "run"]) => Some(Permission::Write),
-        // S3 archival config/snapshot/flush are operator actions (meshdb also requires Admin).
+        // S3 archival config/snapshot/flush are operator actions (shardlite also requires Admin).
         ("POST", ["s3", "config" | "snapshot" | "flush"]) => Some(Permission::Operate),
         // Shard maintenance (vacuum/checkpoint) and S3 recovery are operator actions.
         ("POST", ["shards", _, "vacuum" | "checkpoint" | "recover-from-s3"]) => {
@@ -1527,7 +1527,7 @@ fn parse_tiles(v: &Value) -> Vec<crate::reports::Tile> {
         .unwrap_or_default()
 }
 
-/// Executes the assistant's tools: meshdb tools go through the same proxy the UI uses (so meshdb-side
+/// Executes the assistant's tools: shardlite tools go through the same proxy the UI uses (so shardlite-side
 /// authorization still applies), and report/dashboard tools hit the console's own stores as the
 /// signed-in user.
 struct AssistantExecutor {
@@ -1603,7 +1603,7 @@ impl AssistantExecutor {
 
 impl crate::assistant::ToolExecutor for AssistantExecutor {
     fn execute(&self, name: &str, args: &Value) -> Result<Value, String> {
-        // meshdb tools → proxy.
+        // shardlite tools → proxy.
         if let Some(suffix) = crate::assistant::read_tool_endpoint(name) {
             return crate::proxy::fetch_json_result(&self.resolved, suffix).map(|(value, _)| value);
         }

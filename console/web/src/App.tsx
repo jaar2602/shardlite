@@ -24,7 +24,7 @@ const WORKSPACE_LINKS: { path: string; label: string; short: string; permission:
   { path: "assistant", label: "Assistant", short: "🤖", permission: "observe" },
   { path: "stats", label: "Stats", short: "⌁", permission: "observe" },
   { path: "settings", label: "Settings", short: "⚙", permission: "observe" },
-  { path: "users", label: "meshdb users", short: "◎", permission: "admin" },
+  { path: "users", label: "shardlite users", short: "◎", permission: "admin" },
 ];
 
 function SideNav({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
@@ -38,7 +38,7 @@ function SideNav({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => 
   return (
     <nav aria-label="Console navigation" className={`flex shrink-0 flex-col border-r border-carbon-border bg-carbon-layer transition-[width] duration-150 ${collapsed ? "w-14" : "w-56"}`}>
       <div className={`flex h-16 shrink-0 items-center border-b border-carbon-border ${collapsed ? "justify-center" : "px-4"}`}>
-        {!collapsed && <div className="min-w-0 flex-1"><div className="font-semibold text-carbon-text">meshdb</div><div className="text-xs text-carbon-text-3">console</div></div>}
+        {!collapsed && <div className="min-w-0 flex-1"><div className="font-semibold text-carbon-text">shardlite</div><div className="text-xs text-carbon-text-3">console</div></div>}
         <button
           aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
           aria-expanded={!collapsed}
@@ -110,7 +110,7 @@ function WorkspaceRoute() {
 export default function App() {
   const { me, loading } = useAuth();
   const [navigationCollapsed, setNavigationCollapsed] = useState(() => {
-    try { return localStorage.getItem("meshdb.console.navigation.collapsed") === "true"; } catch { return false; }
+    try { return localStorage.getItem("shardlite.console.navigation.collapsed") === "true"; } catch { return false; }
   });
 
   if (loading) {
@@ -126,7 +126,7 @@ export default function App() {
     <div className="h-full flex">
       <SideNav collapsed={navigationCollapsed} onToggle={() => setNavigationCollapsed((current) => {
         const next = !current;
-        try { localStorage.setItem("meshdb.console.navigation.collapsed", String(next)); } catch { /* browser storage can be unavailable */ }
+        try { localStorage.setItem("shardlite.console.navigation.collapsed", String(next)); } catch { /* browser storage can be unavailable */ }
         return next;
       })} />
       <main className="min-w-0 flex-1 overflow-auto">

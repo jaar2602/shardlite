@@ -1,16 +1,16 @@
 [package]
-name = "meshdb-console"
+name = "shardlite-console"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone web console for managing and observing meshdb clusters"
+description = "Standalone web console for managing and observing shardlite clusters"
 publish = false
 
 [[bin]]
-name = "meshdb-console"
+name = "shardlite-console"
 path = "src/main.rs"
 
 [dependencies]
-# HTTP server — same one the meshdb gateway uses; sync, thread-per-connection.
+# HTTP server — same one the shardlite gateway uses; sync, thread-per-connection.
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

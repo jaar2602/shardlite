@@ -3,7 +3,7 @@
 exclude = ["drivers", "console"]
 
 [package]
-name = "meshdb"
+name = "shardlite"
 version = "0.1.0"
 edition = "2024"
 

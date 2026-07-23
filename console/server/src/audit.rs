@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn events_are_durable_bounded_and_newest_first() {
         let path = std::env::temp_dir().join(format!(
-            "meshdb-console-audit-{}.jsonl",
+            "shardlite-console-audit-{}.jsonl",
             rand::random::<u64>()
         ));
         let audit = Audit::open(&path).unwrap();

@@ -1,4 +1,4 @@
-//! The on-disk manifest describing a meshdb data directory.
+//! The on-disk manifest describing a shardlite data directory.
 //!
 //! Its job is to make **immutable choices enforceable**. `shard_count` cannot change after
 //! data exists — changing it re-routes every key, which is indistinguishable from losing
@@ -9,7 +9,7 @@
 //! diagnosable without tooling, and needing no serialization dependency.
 //!
 //! ```text
-//! meshdb-manifest 1
+//! shardlite-manifest 1
 //! shard_count=64
 //! sqlite_version=3.53.2
 //! created_unix=1784500000
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-pub const FILE_NAME: &str = "meshdb.manifest";
+pub const FILE_NAME: &str = "shardlite.manifest";
 
 /// Bumped only when the layout of the data directory changes incompatibly.
 pub const FORMAT_VERSION: u32 = 1;
@@ -55,7 +55,7 @@ impl Manifest {
 
             if found.format_version != FORMAT_VERSION {
                 return Err(Error::Manifest(format!(
-                    "{} was written by meshdb format version {}, but this build speaks \
+                    "{} was written by shardlite format version {}, but this build speaks \
                      version {}. Refusing to open.",
                     path.display(),
                     found.format_version,
@@ -107,12 +107,12 @@ impl Manifest {
             .ok_or_else(|| Error::Manifest(format!("{} is empty", path.display())))?;
 
         let format_version = header
-            .strip_prefix("meshdb-manifest ")
+            .strip_prefix("shardlite-manifest ")
             .and_then(|v| v.trim().parse::<u32>().ok())
             .ok_or_else(|| {
                 Error::Manifest(format!(
-                    "{} does not start with a `meshdb-manifest <version>` header; \
-                     is this a meshdb data directory?",
+                    "{} does not start with a `shardlite-manifest <version>` header; \
+                     is this a shardlite data directory?",
                     path.display()
                 ))
             })?;
@@ -150,7 +150,7 @@ impl Manifest {
 
     fn write(&self, path: &Path) -> Result<()> {
         let body = format!(
-            "meshdb-manifest {}\n\
+            "shardlite-manifest {}\n\
              # Written at creation. shard_count is immutable — see src/shard/manifest.rs\n\
              shard_count={}\n\
              sqlite_version={}\n\
@@ -206,7 +206,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(
             Manifest::path(dir.path()),
-            "meshdb-manifest 999\nshard_count=64\nsqlite_version=3.53.2\ncreated_unix=1\n",
+            "shardlite-manifest 999\nshard_count=64\nsqlite_version=3.53.2\ncreated_unix=1\n",
         )
         .unwrap();
         let err = Manifest::open_or_create(dir.path(), 64).unwrap_err();
@@ -219,7 +219,7 @@ mod tests {
         std::fs::write(Manifest::path(dir.path()), "hello\n").unwrap();
         let err = Manifest::open_or_create(dir.path(), 64).unwrap_err();
         assert!(
-            err.to_string().contains("meshdb data directory"),
+            err.to_string().contains("shardlite data directory"),
             "should say what is wrong: {err}"
         );
     }
@@ -229,7 +229,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         Manifest::open_or_create(dir.path(), 16).unwrap();
         let text = std::fs::read_to_string(Manifest::path(dir.path())).unwrap();
-        assert!(text.starts_with("meshdb-manifest 1\n"));
+        assert!(text.starts_with("shardlite-manifest 1\n"));
         assert!(text.contains("shard_count=16"));
     }
 }

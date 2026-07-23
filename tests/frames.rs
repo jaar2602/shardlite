@@ -1,13 +1,13 @@
 //! The WAL frame inspector, against real shard WALs.
 
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::exec::Statement;
-use meshdb::vfs::inspect_wal;
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::exec::Statement;
+use shardlite::vfs::inspect_wal;
 use tempfile::TempDir;
 
 fn wal_bytes(dir: &std::path::Path, shard: u32) -> Vec<u8> {
     let db = dir.join(format!("shard_{shard}.db"));
-    let wal = meshdb::storage::checkpoint::wal_path_for(&db);
+    let wal = shardlite::storage::checkpoint::wal_path_for(&db);
     std::fs::read(&wal).unwrap()
 }
 

@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"os"
 
-	meshdb "github.com/meshdb/driver-go"
+	shardlite "github.com/shardlite/driver-go"
 )
 
 func main() {
-	port := os.Getenv("MESHDB_PORT")
+	port := os.Getenv("SHARDLITE_PORT")
 	if port == "" {
 		port = "4680"
 	}
-	db := meshdb.New("http://127.0.0.1:" + port)
+	db := shardlite.New("http://127.0.0.1:" + port)
 	db.ExecuteAll("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT) STRICT")
-	db.Tx([]meshdb.Statement{
+	db.Tx([]shardlite.Statement{
 		{SQL: "INSERT INTO t VALUES (?, ?)", Params: []any{1, "alice"}},
 		{SQL: "INSERT INTO t VALUES (?, ?)", Params: []any{2, "bob"}},
 	}, 0)
@@ -28,8 +28,8 @@ func main() {
 	info, _ := db.Info()
 	fmt.Println("info:", info)
 
-	if tcpPort := os.Getenv("MESHDB_TCP_PORT"); tcpPort != "" {
-		tc, err := meshdb.DialTCP("127.0.0.1:"+tcpPort, "", "")
+	if tcpPort := os.Getenv("SHARDLITE_TCP_PORT"); tcpPort != "" {
+		tc, err := shardlite.DialTCP("127.0.0.1:"+tcpPort, "", "")
 		if err != nil {
 			fmt.Println("tcp dial error:", err)
 			return

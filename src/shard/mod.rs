@@ -195,7 +195,7 @@ fn load_shard_keys(dir: &Path) -> crate::query::ShardKeys {
 
 /// Write shard keys atomically (temp file then rename), so a crash cannot leave a torn file.
 fn persist_shard_keys(dir: &Path, keys: &crate::query::ShardKeys) -> crate::Result<()> {
-    let mut out = String::from("# meshdb co-partitioning: <table> <shard-key column>\n");
+    let mut out = String::from("# shardlite co-partitioning: <table> <shard-key column>\n");
     let mut entries: Vec<_> = keys.iter().collect();
     entries.sort();
     for (table, column) in entries {
@@ -955,7 +955,7 @@ impl ShardManager {
     /// Declare a table's shard-key column — the column its rows are routed by. Two tables declared
     /// on their shard keys may be joined in a cross-shard read, because a matching pair
     /// (`a.key = b.key`) then routes to the same shard. This is the app **asserting** how it routes
-    /// those tables; meshdb trusts it, since it cannot verify placement. Persisted to
+    /// those tables; shardlite trusts it, since it cannot verify placement. Persisted to
     /// `shard_keys.txt` in the data directory.
     pub fn declare_shard_key(&self, table: &str, column: &str) -> crate::Result<()> {
         let mut keys = self.shard_keys.write().unwrap();

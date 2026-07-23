@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for the meshdb CLI.
+# End-to-end smoke test for the shardlite CLI.
 #
 #   ./scripts/smoke.sh
 #
@@ -10,7 +10,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=target/debug/meshdb
+BIN=target/debug/shardlite
 DB_DIR=$(mktemp -d)
 DB="$DB_DIR/data"
 trap 'rm -rf "$DB_DIR"' EXIT
@@ -62,7 +62,7 @@ echo
 echo "shard count must be chosen explicitly"
 assert_fails "new directory without --shards is refused" "--shards N is required" "$BIN" "$DB" -c "SELECT 1"
 create "$DB" 1
-assert_contains "created with --shards 1" "shard_count=1" cat "$DB/meshdb.manifest"
+assert_contains "created with --shards 1" "shard_count=1" cat "$DB/shardlite.manifest"
 assert_fails "--shards on an existing directory that disagrees" "cannot change that" \
     "$BIN" "$DB" --shards 4 -c "SELECT 1"
 assert_contains "opening an existing directory needs no --shards" "1" "$BIN" "$DB" -c "SELECT 1"
@@ -158,7 +158,7 @@ echo
 echo "manifest guards the immutable shard count"
 SH_DIR=$(mktemp -d); trap 'rm -rf "$DB_DIR" "$SH_DIR"' EXIT
 "$BIN" "$SH_DIR/multi" --shards 8 -c "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT" >/dev/null 2>&1
-assert_contains "manifest records shard count" "shard_count=8" cat "$SH_DIR/multi/meshdb.manifest"
+assert_contains "manifest records shard count" "shard_count=8" cat "$SH_DIR/multi/shardlite.manifest"
 assert_fails "reopening with a different count is refused" "cannot change that" \
     "$BIN" "$SH_DIR/multi" --shards 4 -c "SELECT 1"
 assert_contains "reopening with the same count works" "1" "$BIN" "$SH_DIR/multi" --shards 8 -c "SELECT 1"

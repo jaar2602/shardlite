@@ -1,8 +1,8 @@
-// Package meshdb is an HTTP driver for the meshdb gateway. Standard library only, streaming
+// Package shardlite is an HTTP driver for the shardlite gateway. Standard library only, streaming
 // reads.
 //
-//	db := meshdb.New("http://localhost:4680", meshdb.WithAuth("app", "s3cret"))
-//	rows, _ := db.Query("SELECT id, v FROM t WHERE id > ?", meshdb.Params(5))
+//	db := shardlite.New("http://localhost:4680", shardlite.WithAuth("app", "s3cret"))
+//	rows, _ := db.Query("SELECT id, v FROM t WHERE id > ?", shardlite.Params(5))
 //	defer rows.Close()
 //	for rows.Next() {
 //	    r := rows.Row()
@@ -13,7 +13,7 @@
 // length limit), so a million-row result costs the driver almost nothing. Auth is sent as
 // Authorization: Bearer base64(user:secret) — the programmatic scheme, no browser prompt.
 // Over a plaintext gateway the credential is exposed; use TLS on any untrusted network.
-package meshdb
+package shardlite
 
 import (
 	"bufio"
@@ -306,12 +306,12 @@ import (
 	"sync"
 )
 
-// TCPClient is a persistent-connection client over meshdb's JSON-over-TCP protocol. Lower
+// TCPClient is a persistent-connection client over shardlite's JSON-over-TCP protocol. Lower
 // per-request overhead than HTTP. One request at a time per connection; guard with the mutex
 // if shared. Query streams. Auth is sent once at connect; the secret crosses the wire, so use
 // a trusted network or a TLS tunnel.
 //
-//	db, _ := meshdb.DialTCP("127.0.0.1:4620", "app", "s3cret")
+//	db, _ := shardlite.DialTCP("127.0.0.1:4620", "app", "s3cret")
 //	rows, _ := db.Query("SELECT id, v FROM t")
 //	for rows.Next() { fmt.Println(rows.Row()) }
 type TCPClient struct {

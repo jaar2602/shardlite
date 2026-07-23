@@ -36,7 +36,7 @@ export default function SqlEditor({ name }: { name: string }) {
   const { me } = useAuth();
   const mayWrite = api.permits(me?.role, "write");
   const c = api.conn(name);
-  const storageKey = `meshdb.workbench.${me?.user ?? "unknown"}.${name}`;
+  const storageKey = `shardlite.workbench.${me?.user ?? "unknown"}.${name}`;
   const draftKey = storageKey + ".draft";
   const savedKey = storageKey + ".saved";
   const historyKey = storageKey + ".history";
@@ -129,7 +129,7 @@ export default function SqlEditor({ name }: { name: string }) {
     try {
       return (await c.route(routeKey)).shard;
     } catch {
-      throw new Error("MeshDB could not locate the data for this key. Check the value and try again.");
+      throw new Error("ShardLite could not locate the data for this key. Check the value and try again.");
     }
   };
 
@@ -439,7 +439,7 @@ export default function SqlEditor({ name }: { name: string }) {
 
   useEffect(() => {
     void loadTables();
-    // Reload the table reference when the selected MeshDB connection changes.
+    // Reload the table reference when the selected ShardLite connection changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name]);
 
@@ -562,7 +562,7 @@ export default function SqlEditor({ name }: { name: string }) {
             aria-label="Data key"
             className="min-w-40 max-w-64 flex-1 border-b border-carbon-text-3 bg-carbon-field px-3 py-2 text-sm outline-none focus:border-carbon-blue"
             placeholder="Data key · tenant, customer, account…"
-            title="An application value MeshDB uses to find the data. This is not a storage location."
+            title="An application value ShardLite uses to find the data. This is not a storage location."
             value={routeKey}
             onChange={(event) => setRouteKey(event.target.value)}
           />}
@@ -824,7 +824,7 @@ function AdvancedOptions({
   const routed = reads ? targetReads || analysis.statements.some((statement) => statement.parameterCount > 0) : analysis.plan?.kind === "write" || analysis.plan?.kind === "transaction";
   return <div className="flex max-h-48 shrink-0 flex-wrap items-end gap-3 overflow-auto border-b border-carbon-border bg-carbon-layer px-4 py-3">
     {reads && <label className="flex items-center gap-2 pb-2 text-sm"><input type="checkbox" checked={targetReads} onChange={(event) => onTargetReads(event.target.checked)} />Target one data key</label>}
-    {routed && <span className="pb-2 text-xs text-carbon-text-3">MeshDB uses the data key to locate the data automatically.</span>}
+    {routed && <span className="pb-2 text-xs text-carbon-text-3">ShardLite uses the data key to locate the data automatically.</span>}
     {reads && routed && <div className="w-44"><Select label="Read freshness" value={consistency} onChange={(event) => onConsistency(event.target.value as typeof consistency)}><option value="linearizable">Current data</option><option value="at_least_lsn">At least an LSN</option><option value="stale">Allow older data</option></Select></div>}
     {reads && routed && consistency === "at_least_lsn" && <div className="w-32"><TextInput label="Minimum LSN" type="number" min={0} value={atLeastLsn} onChange={(event) => onLsn(Number(event.target.value))} /></div>}
     {reads && analysis.statements.length === 1 && routed && <>
@@ -833,7 +833,7 @@ function AdvancedOptions({
       <div className="w-36"><Select label="Rows" value={exportLimit} onChange={(event) => onExportLimit(event.target.value)}><option value="10000">10,000</option><option value="100000">100,000</option><option value="1000000">1,000,000</option><option value="">No limit</option></Select></div>
       <Button variant="ghost" onClick={onExport}>Download</Button>
     </>}
-    {!routed && <span className="pb-2 text-xs text-carbon-text-3">MeshDB will run reads across the database and handle placement automatically.</span>}
+    {!routed && <span className="pb-2 text-xs text-carbon-text-3">ShardLite will run reads across the database and handle placement automatically.</span>}
   </div>;
 }
 

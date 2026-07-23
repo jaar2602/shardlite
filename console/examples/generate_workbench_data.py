@@ -2,7 +2,7 @@
 """Generate reproducible synthetic INSERT and UPDATE SQL for the console test schema.
 
 The generator uses Python's standard pseudo-random number generator and fixed word lists. It does
-not use AI, make network requests, connect to MeshDB, or execute the generated SQL.
+not use AI, make network requests, connect to ShardLite, or execute the generated SQL.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def generate(args: argparse.Namespace) -> None:
     accounts: list[Account] = []
     event_id = rng.randrange(1_000_000_000, 8_000_000_000)
 
-    print("-- Synthetic MeshDB console data")
+    print("-- Synthetic ShardLite console data")
     print(f"-- seed={args.seed} accounts={args.accounts} events_per_account={args.events_per_account} updates={args.updates}")
     print("-- Generated locally from fixed word lists and Python's pseudo-random generator; no AI is used.")
     print("-- Run the schema section of workbench-test.sql first.")

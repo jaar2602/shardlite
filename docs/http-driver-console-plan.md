@@ -15,7 +15,7 @@ independent. They share one dependency:
 - A **web console runs in a browser**, and browsers speak HTTP/JSON, not bincode.
 
 So a single HTTP + JSON gateway is the enabler for both other pieces. Build it once and every
-language with an HTTP client becomes a meshdb client, and the console has an API to consume.
+language with an HTTP client becomes a shardlite client, and the console has an API to consume.
 
 ```
               ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
@@ -160,7 +160,7 @@ faithfully rather than flattening everything to 500:
 - Integration tests over real HTTP: query/execute/tx round trips, the status-code mapping,
   auth required + role refusals, TLS-required-in-http-mode refusal, and `/v1/tx` durability.
 - Revert-verify the security guards (drop the TLS requirement → the refusal test fails).
-- CLI smoke assertions for `meshdb serve --http :8080`.
+- CLI smoke assertions for `shardlite serve --http :8080`.
 
 ---
 
@@ -197,18 +197,18 @@ on the process that holds the data (a DDoS/attack-surface concern). A standalone
 removes CORS entirely — the browser talks only to the console's own backend, same origin.
 
 The console is best understood not as a dashboard for one cluster but as a **database client
-for many meshdb connections** — think DBeaver / pgAdmin / TablePlus, for meshdb:
+for many shardlite connections** — think DBeaver / pgAdmin / TablePlus, for shardlite:
 
 ```
-browser ──HTTP (same origin)──► meshdb-console (standalone process)
+browser ──HTTP (same origin)──► shardlite-console (standalone process)
                                   • serves the frontend (its own backend)
                                   • its OWN login (console username/password)
-                                  • holds meshdb credentials server-side, never in the browser
-                                  • manages MANY saved meshdb connections
+                                  • holds shardlite credentials server-side, never in the browser
+                                  • manages MANY saved shardlite connections
                                   • authenticates + rate-limits the operator before touching a cluster
                                         │ HTTP/JSON (Phase 1 gateway) or native driver
                                         ▼
-                                  one or more meshdb clusters (data processes, untouched)
+                                  one or more shardlite clusters (data processes, untouched)
 ```
 
 Why this shape wins:
@@ -218,10 +218,10 @@ Why this shape wins:
 - **No CORS** — browser → console backend is same-origin; console backend → cluster is
   server-to-server.
 - **Credentials stay server-side** in the console, not shipped to a browser tab.
-- **Multi-connection** — one console manages many meshdb clusters/nodes, with its own account
+- **Multi-connection** — one console manages many shardlite clusters/nodes, with its own account
   system separate from any cluster's users.
 - **Concurrency fully decoupled** — a separate process can be sync or async on its own terms
-  with zero bearing on meshdb's core; a UI backend facing bursty browsers is exactly where
+  with zero bearing on shardlite's core; a UI backend facing bursty browsers is exactly where
   async is least controversial.
 
 ### Console features
@@ -230,7 +230,7 @@ v1 (management):
 
 | Screen | Data source | Purpose |
 |---|---|---|
-| **Connections** | console's own store | saved meshdb clusters; console login gates access |
+| **Connections** | console's own store | saved shardlite clusters; console login gates access |
 | **Cluster topology** | `GET /v1/cluster` | node/term/role, leader, placement map |
 | **Node health** | `GET /v1/stats` per node | connection + auth + writer/reader counters |
 | **Shards** | placement + `GET /v1/schema` | per-shard owner, schema version; version-skew flag |
@@ -248,9 +248,9 @@ Later (the console is where new operator features accrue, off the data path):
 
 Its own small backend (language open — could reuse the Phase 2 JS/TS driver on Node, or a
 Rust backend using `net::Client`) plus a frontend SPA. Kept in a separate directory or repo
-so it never entangles the meshdb crate's build. The console's account system (console
-login) is distinct from meshdb's user roles: logging into the console authorizes *using the
-console*; the meshdb credentials it stores authorize *acting on a cluster*.
+so it never entangles the shardlite crate's build. The console's account system (console
+login) is distinct from shardlite's user roles: logging into the console authorizes *using the
+console*; the shardlite credentials it stores authorize *acting on a cluster*.
 
 ## Effort and risk, honestly
 
@@ -260,7 +260,7 @@ console*; the meshdb credentials it stores authorize *acting on a cluster*.
 | 2. Drivers (per language) | ~1–2 days each | Low (thin HTTP wrappers) | none (outside the crate) |
 | 3. Web console | ~1–2 weeks | Medium (frontend surface area; mostly its own concern) | none (static assets) |
 
-The whole plan preserves the two decisions that define meshdb: **tokio-free core** and
+The whole plan preserves the two decisions that define shardlite: **tokio-free core** and
 **footprint under the floor profile**. HTTP, drivers, and the console are all *edges* on top
 of an unchanged core — the same way TLS and auth were added without disturbing storage or
 replication.
@@ -270,10 +270,10 @@ replication.
 1. **Sync vs async HTTP** — **sync now** (`tiny_http`), async as a future drop-in feature
    (`http-async`) behind the `handle()` boundary, triggered by a real need for thousands of
    concurrent connections. Not before.
-2. **Where drivers and the console live** — **outside the meshdb crate** (separate directory
+2. **Where drivers and the console live** — **outside the shardlite crate** (separate directory
    or repos), so the core build stays lean and the console's concurrency model is fully
    decoupled.
 3. **Console hosting** — **standalone process**, its own backend + frontend, its own login,
-   managing many meshdb connections. Not served by the DB binary.
+   managing many shardlite connections. Not served by the DB binary.
 4. **Live updates** — start with polling; a server-sent-events counter stream is a later
    nicety, and lives in the console tier (or the gateway) where it belongs, not in the core.

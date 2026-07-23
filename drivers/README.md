@@ -1,15 +1,15 @@
-# meshdb drivers
+# shardlite drivers
 
-Clients for meshdb in Python, JavaScript, Go, and Rust.
+Clients for shardlite in Python, JavaScript, Go, and Rust.
 
 ## Two transports, and which is available where
 
-meshdb speaks three protocols, two of them cross-language:
+shardlite speaks three protocols, two of them cross-language:
 
-- **HTTP/JSON** (`meshdb serve --http ADDR`) — the stable, stateless cross-language edge. Any
-  language with an HTTP client works, against any meshdb version that serves `/v1`. Best for
+- **HTTP/JSON** (`shardlite serve --http ADDR`) — the stable, stateless cross-language edge. Any
+  language with an HTTP client works, against any shardlite version that serves `/v1`. Best for
   request/response and for going through proxies.
-- **JSON over TCP** (`meshdb serve --json-tcp ADDR`) — a persistent-connection edge with lower
+- **JSON over TCP** (`shardlite serve --json-tcp ADDR`) — a persistent-connection edge with lower
   per-request overhead than HTTP: one socket, authenticated once, many requests. Frames are
   `[4-byte big-endian length][JSON]`; the payloads are the same JSON shapes as HTTP, so it is
   just as stable and cross-language. Use it for long-lived clients issuing many small calls.
@@ -20,7 +20,7 @@ meshdb speaks three protocols, two of them cross-language:
 
 | Language | HTTP/JSON | JSON/TCP | Native TCP (bincode) |
 |---|---|---|---|
-| **Rust** | yes (default) | — | yes — `--features native` (re-exports `meshdb::net::Client`) |
+| **Rust** | yes (default) | — | yes — `--features native` (re-exports `shardlite::net::Client`) |
 | Python / JS / Go | yes | yes (`TcpClient`) | no — bincode is Rust-only, see above |
 
 **Why JSON/TCP and not native bincode for Python/JS/Go?** The stable contract across languages
@@ -67,16 +67,16 @@ that has applied at least N).
 
 ## Per language
 
-- **Python** (`python/meshdb.py`) — stdlib only. HTTP `Client` (`query()` is a generator) and
+- **Python** (`python/shardlite.py`) — stdlib only. HTTP `Client` (`query()` is a generator) and
   persistent `TcpClient` (`connect(host, port, ...)`, streaming `query()`). `python3 example.py`
-- **JavaScript** (`javascript/meshdb.mjs`) — Node 18+. HTTP `Client` (built-in `fetch`,
+- **JavaScript** (`javascript/shardlite.mjs`) — Node 18+. HTTP `Client` (built-in `fetch`,
   async-generator `query()`) and `TcpClient` (built-in `net`, `await TcpClient.connect(...)`,
   async-generator `query()`). `node example.mjs`
-- **Go** (`go/meshdb.go`) — stdlib only. HTTP `Client` (`Query` → streaming `*Rows`) and
+- **Go** (`go/shardlite.go`) — stdlib only. HTTP `Client` (`Query` → streaming `*Rows`) and
   `TCPClient` (`DialTCP(addr, user, secret)`, `Query` → streaming `*TCPRows`). `go run ./example`
 - **Rust** (`rust/`) — HTTP by default (`ureq` + `serde_json`), streaming iterator. Native
-  bincode-over-TCP with `--features native`, which re-exports `meshdb::net::Client` under
-  `meshdb_driver::native` — the fastest path, and full-featured (transactions, consistency,
+  bincode-over-TCP with `--features native`, which re-exports `shardlite::net::Client` under
+  `shardlite_driver::native` — the fastest path, and full-featured (transactions, consistency,
   cluster verbs). (Rust reaches TCP through the native client, not JSON/TCP.)
 
 Verified by `scripts/driver_test.sh`, which runs each present driver against a live gateway over

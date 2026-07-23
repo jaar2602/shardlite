@@ -1,9 +1,9 @@
-"""Run against a live gateway: MESHDB_PORT=NNNN python3 example.py"""
+"""Run against a live gateway: SHARDLITE_PORT=NNNN python3 example.py"""
 import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
-from meshdb import Client
+from shardlite import Client
 
-db = Client(f"http://127.0.0.1:{os.environ.get('MESHDB_PORT', '4680')}")
+db = Client(f"http://127.0.0.1:{os.environ.get('SHARDLITE_PORT', '4680')}")
 db.execute_all("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT) STRICT")
 db.tx([("INSERT INTO t VALUES (?, ?)", [1, "alice"]),
        ("INSERT INTO t VALUES (?, ?)", [2, "bob"])])

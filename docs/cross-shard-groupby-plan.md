@@ -273,16 +273,16 @@ revert-verified.
 
 ## Tier 3 — the architectural line — **co-located `JOIN` (pushdown) + general `JOIN` (central) done**
 
-**`JOIN`** is not a planner decision — meshdb never moves data between shards, so a join fans out
+**`JOIN`** is not a planner decision — shardlite never moves data between shards, so a join fans out
 cleanly only when matching rows are **co-located**. That is now supported via an explicit
 **co-partitioning declaration**: `ShardManager::declare_shard_key(table, column)` (persisted to
-`shard_keys.txt`, also the `meshdb shardkey` CLI) records each table's shard-key column. A join on
+`shard_keys.txt`, also the `shardlite shardkey` CLI) records each table's shard-key column. A join on
 two tables' shard keys — `A.ka = B.kb` — is then allowed: matching rows route to the same shard, so
 each shard joins its local rows and the results concatenate, and WHERE / GROUP BY / aggregates
 compose on top exactly as for a single table (`check_join` in the planner; the join rides along in
 the shard SQL). INNER / LEFT / RIGHT / FULL are all safe (unmatched rows stay on their shard).
 
-This is the one place the planner **trusts rather than proves**: meshdb cannot verify the app
+This is the one place the planner **trusts rather than proves**: shardlite cannot verify the app
 actually co-located the data, so a false declaration yields a join that silently misses cross-shard
 matches (revert-verified: a non-co-located join returns empty). Documented loudly at every entry
 point.
@@ -291,7 +291,7 @@ A join that is *not* co-located no longer refuses either — it falls through to
 (the same primitive as derived tables): each side is materialised globally and the join runs on the
 coordinator's in-memory SQLite. This is the "central hash-join of both fully-materialised sides"
 noted below — correct, expensive, and cap-gated at `cfg.max_grouped_rows` per source. It is the
-right default for the low-cardinality dimension joins meshdb targets; a genuine data shuffle for
+right default for the low-cardinality dimension joins shardlite targets; a genuine data shuffle for
 large-on-large joins remains deliberately out of scope.
 
 ## Correctly permanent (not gaps)

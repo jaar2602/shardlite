@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use meshdb::error::Error;
-use meshdb::net::{Client, Server, ServerConfig, ShardOutcome};
-use meshdb::shard::{ShardConfig, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
+use shardlite::error::Error;
+use shardlite::net::{Client, Server, ServerConfig, ShardOutcome};
+use shardlite::shard::{ShardConfig, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
 use tempfile::TempDir;
 
 /// Start a server on an ephemeral port and return its address plus a shutdown handle.
@@ -247,7 +247,7 @@ fn the_connection_cap_sheds_load_and_counts_it() {
 fn a_version_mismatch_says_so_plainly() {
     // A mismatched peer should be told exactly that, rather than failing later as a
     // confusing decode error.
-    use meshdb::net::protocol::{Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{Request, Response, read_message, write_message};
     use std::net::TcpStream;
 
     let (addr, _dir, _s) = serve(1, ServerConfig::default());
@@ -277,7 +277,7 @@ fn a_version_mismatch_says_so_plainly() {
 fn subscribing_without_capture_says_why() {
     // Capture defaults to off, so a follower must be told that rather than receiving an
     // empty stream that looks like "nothing has happened yet".
-    use meshdb::net::protocol::{Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{Request, Response, read_message, write_message};
     use std::net::TcpStream;
 
     let (addr, _dir, _s) = serve(1, ServerConfig::default());
@@ -288,7 +288,7 @@ fn subscribing_without_capture_says_why() {
     write_message(
         &mut w,
         &Request::Hello {
-            version: meshdb::net::protocol::PROTOCOL_VERSION,
+            version: shardlite::net::protocol::PROTOCOL_VERSION,
             client: "sub".into(),
         },
     )

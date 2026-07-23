@@ -1,6 +1,6 @@
-# meshdb console
+# shardlite console
 
-A standalone web app for managing and observing meshdb clusters — the console's own login and
+A standalone web app for managing and observing shardlite clusters — the console's own login and
 state, managing many clusters the way a database client manages many connections. It is
 deliberately **not** part of the database binary: keeping it out of the 150 MB / 0.33 CPU
 database avoids adding a browser-facing surface and request load there, and a standalone backend
@@ -15,14 +15,14 @@ an operator-ready distributed database console is in `../docs/console-v2-plan.md
 console/
   server/   Rust backend: console login (multi-user), connection registry (secrets encrypted
             at rest), a streaming proxy to each cluster's HTTP /v1 edge, a stats sampler, and it
-            serves the embedded SPA. Its own crate, outside the meshdb workspace.
+            serves the embedded SPA. Its own crate, outside the shardlite workspace.
   web/      React + TypeScript + Tailwind SPA (IBM Carbon look, mocked with Tailwind — not the
             heavy @carbon/react library). Built and embedded into the server binary.
 ```
 
 The backend reaches clusters over the stable HTTP `/v1` edge (not the native bincode client), so
-the console is decoupled from the exact meshdb build it points at. Every feature is composition
-over endpoints meshdb already exposes. The database does not retain a *history* of stats for
+the console is decoupled from the exact shardlite build it points at. Every feature is composition
+over endpoints shardlite already exposes. The database does not retain a *history* of stats for
 charts, so the backend supplies a bounded collector and persists its recent window locally for
 restart continuity.
 
@@ -49,27 +49,27 @@ that is the embed step telling you to build the frontend.
 ## Run
 
 ```sh
-export MESHDB_CONSOLE_KEY="a-strong-master-passphrase"   # required: encrypts stored secrets
-export MESHDB_CONSOLE_ADMIN=admin                        # optional: bootstrap the first admin
-export MESHDB_CONSOLE_ADMIN_PASSWORD=change-me           #           (only used when no admin exists)
+export SHARDLITE_CONSOLE_KEY="a-strong-master-passphrase"   # required: encrypts stored secrets
+export SHARDLITE_CONSOLE_ADMIN=admin                        # optional: bootstrap the first admin
+export SHARDLITE_CONSOLE_ADMIN_PASSWORD=change-me           #           (only used when no admin exists)
 
-server/target/release/meshdb-console --listen 127.0.0.1:7100 --data ./console-data
+server/target/release/shardlite-console --listen 127.0.0.1:7100 --data ./console-data
 ```
 
 Then open <http://127.0.0.1:7100>, sign in, add a connection (a cluster's `--http` address plus a
-meshdb user/secret), and use it.
+shardlite user/secret), and use it.
 
-- `MESHDB_CONSOLE_KEY` is **required** and checked at startup — a console that could not decrypt
+- `SHARDLITE_CONSOLE_KEY` is **required** and checked at startup — a console that could not decrypt
   its stored secrets fails loudly now, not when a connection is first opened. The connections file
   stores only authenticated ciphertext; new secrets use an Argon2id-derived key, while old records
   remain readable for migration.
-- Rotate that key offline with the current key in `MESHDB_CONSOLE_KEY`, the replacement in
-  `MESHDB_CONSOLE_NEW_KEY`, and `meshdb-console --data ./console-data --rotate-key`. The registry
+- Rotate that key offline with the current key in `SHARDLITE_CONSOLE_KEY`, the replacement in
+  `SHARDLITE_CONSOLE_NEW_KEY`, and `shardlite-console --data ./console-data --rotate-key`. The registry
   is rewritten only after every existing secret decrypts successfully; restart with the new key.
-- `MESHDB_CONSOLE_SESSION_IDLE_SECS` (default `1800`) and
-  `MESHDB_CONSOLE_SESSION_ABSOLUTE_SECS` (default `43200`) control session lifetime. Sessions are
+- `SHARDLITE_CONSOLE_SESSION_IDLE_SECS` (default `1800`) and
+  `SHARDLITE_CONSOLE_SESSION_ABSOLUTE_SECS` (default `43200`) control session lifetime. Sessions are
   in-memory, so a restart signs everyone out.
-- Set `MESHDB_CONSOLE_SECURE_COOKIE=true` when the browser reaches the console over HTTPS. Put the
+- Set `SHARDLITE_CONSOLE_SECURE_COOKIE=true` when the browser reaches the console over HTTPS. Put the
   console behind TLS on any untrusted network.
 - `--workers` defaults to 8. `--query-streams` defaults to half the worker count and is always
   clamped below it, reserving capacity for login, health, cancellation, and other control requests.
@@ -85,10 +85,10 @@ Console roles are enforced before a stored cluster credential is used:
 | Viewer | Cluster/schema/metrics views and read-only queries |
 | Developer | Viewer access plus execute and transaction actions |
 | Operator | Viewer access plus operational diagnostics such as frame reports |
-| Admin | Connection, console-user, meshdb-user, and audit administration |
+| Admin | Connection, console-user, shardlite-user, and audit administration |
 
 The effective permission is still the intersection of the console role and the credential accepted
-by meshdb. Keep meshdb credentials least-privileged as a second enforcement layer.
+by shardlite. Keep shardlite credentials least-privileged as a second enforcement layer.
 
 Phase 0 also adds CSRF protection, login throttling, a 1 MiB request limit, bounded query streams,
 outbound timeouts with redirects disabled, strict route/method permissions, security headers,
@@ -104,7 +104,7 @@ worker pool with a four-request per-cluster cap, bounded queue and response size
 timeout, jitter, exponential failure backoff, and a 15-second stale-evidence threshold. A successful
 endpoint is preferred for interactive proxy traffic without changing the saved profile.
 
-MeshDB exposes versioned read-only contracts at `/v1/meta`, `/v1/health`, `/v1/topology`, and
+ShardLite exposes versioned read-only contracts at `/v1/meta`, `/v1/health`, `/v1/topology`, and
 `/v1/shards`; `/v1/stats` includes checkpoint counters. The collector remains compatible with older
 nodes by deriving conservative health and shard views from `/v1/info` and `/v1/cluster` and labels
 that evidence as derived.
@@ -123,7 +123,7 @@ persisted, keeping the local state file bounded.
 
 The SQL workbench uses one CodeMirror editor for every statement type. **Run** can target the
 statement at the cursor, the current selection, or the complete document. The console maps reads,
-writes, atomic write groups, and schema changes onto MeshDB's existing APIs; normal reads span the
+writes, atomic write groups, and schema changes onto ShardLite's existing APIs; normal reads span the
 database and writes ask only for an application data key. Consistency, explain plans, and streamed
 export stay behind **Options**; the console never asks a normal user to select physical placement.
 
@@ -143,17 +143,17 @@ health, and distribution stability; joining still happens through the existing d
 
 ## Controlled operations
 
-Schema rollout submission is coordinated entirely by the console over MeshDB's existing
+Schema rollout submission is coordinated entirely by the console over ShardLite's existing
 `/v1/info`, `/v1/schema/{shard}`, and `/v1/execute_all` APIs. Approved operations are written
 atomically to `console-data/operations.json`, then processed by one background worker. The worker
 revalidates every schema version before execution, preserves each shard outcome, and records
 submit/cancel/completion audit events without SQL text.
 
 Idempotency prevents a browser retry from duplicating work. Queued or preflight-stage work can be
-cancelled; after the request reaches MeshDB it cannot be cancelled safely. A console restart resumes
+cancelled; after the request reaches ShardLite it cannot be cancelled safely. A console restart resumes
 queued work but marks previously running work `interrupted` rather than replaying potentially
 applied DDL. The Operations tab exposes these states and the required manual roll-forward evidence.
-This coordinator never reads or changes MeshDB database/WAL files and does not offer backup,
+This coordinator never reads or changes ShardLite database/WAL files and does not offer backup,
 restore, checkpoint, placement, rebalance, failover, or individual-shard retry controls.
 
 ## Frontend development
@@ -166,9 +166,9 @@ For a guided set of SQL covering every workbench and controlled-operation path, 
 
 ## Verify
 
-`../scripts/console_smoke.sh` builds everything, starts a meshdb gateway and the console, and
+`../scripts/console_smoke.sh` builds everything, starts a shardlite gateway and the console, and
 drives the whole API end to end. Its 51 checks cover login, CSRF, role boundaries,
 encrypted-at-rest secrets, connection testing, a 60,000-row streaming query, bounded CSV/NDJSON
 downloads, key routing, at-least-LSN, typed blobs, fan-out reads, transactions, all-shard rollout,
-durable operation preflight/submission/idempotency/completion/persistence, meshdb users, audit
+durable operation preflight/submission/idempotency/completion/persistence, shardlite users, audit
 events, health, and the embedded SPA.

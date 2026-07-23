@@ -72,7 +72,7 @@ impl S3Sink {
         let (tx, rx) = channel::<Job>();
         let failed = Arc::new(Mutex::new(None));
         let worker = std::thread::Builder::new()
-            .name("meshdb-s3sink".into())
+            .name("shardlite-s3sink".into())
             .spawn({
                 let client = Arc::clone(&client);
                 let failed = Arc::clone(&failed);

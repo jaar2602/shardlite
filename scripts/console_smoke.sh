@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# End-to-end check of the meshdb console: builds it, starts a meshdb HTTP gateway and the console,
+# End-to-end check of the shardlite console: builds it, starts a shardlite HTTP gateway and the console,
 # and drives the whole API — login, multi-user roles, encrypted-at-rest secrets, the streaming
 # proxy over a large result, and the embedded SPA. Skips the build if the binaries already exist.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MESHDB=target/debug/meshdb
-CONSOLE=console/server/target/debug/meshdb-console
+SHARDLITE=target/debug/shardlite
+CONSOLE=console/server/target/debug/shardlite-console
 PASS=0 FAIL=0
 check() { # check "name" "expected substring" "actual"
   if echo "$3" | grep -qF "$2"; then echo "  ok   $1"; PASS=$((PASS+1));
@@ -15,7 +15,7 @@ check() { # check "name" "expected substring" "actual"
 }
 
 # --- build the exact feature set and embedded SPA under test (incremental when unchanged) ---
-cargo build --features http --bin meshdb >/dev/null 2>&1 || { echo "meshdb HTTP build failed"; exit 1; }
+cargo build --features http --bin shardlite >/dev/null 2>&1 || { echo "shardlite HTTP build failed"; exit 1; }
 echo "building console (frontend + backend)…"
 ( cd console && ./build.sh ) >/dev/null 2>&1 || { echo "console build failed — run console/build.sh"; exit 1; }
 
@@ -24,36 +24,36 @@ MDB="" CON=""
 cleanup() { [ -n "$MDB" ] && kill "$MDB" 2>/dev/null; [ -n "$CON" ] && kill "$CON" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 
-# --- a meshdb cluster with an admin user and 60k rows ---
-"$MESHDB" user add app app-secret --role admin --users "$U" >/dev/null
-"$MESHDB" "$W/data" --shards 1 -c "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT" >/dev/null
-"$MESHDB" "$W/data" -c "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<60000) INSERT INTO t SELECT x,'v'||x FROM s" >/dev/null
-"$MESHDB" serve "$W/data" --listen "127.0.0.1:$((P+1))" --http "127.0.0.1:$P" --http-insecure --users "$U" >"$W/meshdb.log" 2>&1 &
+# --- a shardlite cluster with an admin user and 60k rows ---
+"$SHARDLITE" user add app app-secret --role admin --users "$U" >/dev/null
+"$SHARDLITE" "$W/data" --shards 1 -c "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT" >/dev/null
+"$SHARDLITE" "$W/data" -c "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<60000) INSERT INTO t SELECT x,'v'||x FROM s" >/dev/null
+"$SHARDLITE" serve "$W/data" --listen "127.0.0.1:$((P+1))" --http "127.0.0.1:$P" --http-insecure --users "$U" >"$W/shardlite.log" 2>&1 &
 MDB=$!
 
 for _ in $(seq 1 40); do
   curl -fsS -u app:app-secret "http://127.0.0.1:$P/v1/info" >/dev/null 2>&1 && break
   if ! kill -0 "$MDB" 2>/dev/null; then
-    echo "meshdb fixture exited during startup:"
-    sed -n '1,120p' "$W/meshdb.log"
+    echo "shardlite fixture exited during startup:"
+    sed -n '1,120p' "$W/shardlite.log"
     exit 1
   fi
   sleep 0.1
 done
 if ! curl -fsS -u app:app-secret "http://127.0.0.1:$P/v1/info" >/dev/null 2>&1; then
-  echo "meshdb fixture did not become ready:"
-  sed -n '1,120p' "$W/meshdb.log"
+  echo "shardlite fixture did not become ready:"
+  sed -n '1,120p' "$W/shardlite.log"
   exit 1
 fi
 
 # --- the console ---
-export MESHDB_CONSOLE_KEY="master-passphrase"
-export MESHDB_CONSOLE_ADMIN="root" MESHDB_CONSOLE_ADMIN_PASSWORD="rootpw"
+export SHARDLITE_CONSOLE_KEY="master-passphrase"
+export SHARDLITE_CONSOLE_ADMIN="root" SHARDLITE_CONSOLE_ADMIN_PASSWORD="rootpw"
 "$CONSOLE" --listen "127.0.0.1:$CP" --data "$W/cdata" >/dev/null 2>&1 &
 CON=$!
 sleep 1
 
-check "embedded SPA served"        "meshdb console" "$(curl -s http://127.0.0.1:$CP/)"
+check "embedded SPA served"        "shardlite console" "$(curl -s http://127.0.0.1:$CP/)"
 check "SPA fallback for route"     "200"            "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$CP/c/local/query)"
 check "login rejects wrong pw"     "401"            "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CP/api/login -d '{"username":"root","password":"no"}')"
 LOGIN=$(curl -s -c "$J" -X POST http://127.0.0.1:$CP/api/login -d '{"username":"root","password":"rootpw"}')
@@ -63,8 +63,8 @@ check "console health"             '"ok":true'      "$(curl -s http://127.0.0.1:
 check "mutation requires CSRF"     "403"             "$(curl -s -b "$J" -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CP/api/connections -d '{"name":"blocked","url":"http://host:1"}')"
 
 curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections \
-  -d "{\"name\":\"local\",\"url\":\"http://127.0.0.1:$P\",\"meshdb_user\":\"app\",\"meshdb_secret\":\"app-secret\",\"allow_insecure_http\":true}" >/dev/null
-check "connection list hides secret" '"meshdb_user":"app"' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections)"
+  -d "{\"name\":\"local\",\"url\":\"http://127.0.0.1:$P\",\"shardlite_user\":\"app\",\"shardlite_secret\":\"app-secret\",\"allow_insecure_http\":true}" >/dev/null
+check "connection list hides secret" '"shardlite_user":"app"' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections)"
 check "secret encrypted at rest"   "secret-absent"  "$(grep -q app-secret "$W/cdata/connections.json" && echo LEAK || echo secret-absent)"
 check "connection test"            '"ok":true'      "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections/local/test)"
 check "profile migrates to seeds"  '"seeds":["http://127.0.0.1:' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections)"
@@ -106,7 +106,7 @@ check "rich schema table metadata"    '"id"'           "$(curl -s -b "$J" -H "X-
 check "fan-out query"                '"columns"'      "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections/local/query_all -d '{"sql":"SELECT COUNT(*) FROM t"}')"
 
 check "proxy tx atomic"            '"rows_affected":2' "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections/local/tx -d '{"shard":0,"statements":[{"sql":"INSERT INTO t VALUES (100001,'\''a'\'')"},{"sql":"INSERT INTO t VALUES (100002,'\''b'\'')"}]}')"
-check "MeshDB all-shard primitive" '"ok":true'        "$(curl -s -u app:app-secret -X POST http://127.0.0.1:$P/v1/execute_all -d '{"sql":"ALTER TABLE t ADD COLUMN phase2 INTEGER"}')"
+check "ShardLite all-shard primitive" '"ok":true'        "$(curl -s -u app:app-secret -X POST http://127.0.0.1:$P/v1/execute_all -d '{"sql":"ALTER TABLE t ADD COLUMN phase2 INTEGER"}')"
 check "direct console rollout blocked" "404"           "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CP/api/connections/local/execute_all -d '{"sql":"CREATE TABLE bypass(x)"}')"
 
 ROLL_SQL='CREATE INDEX phase3_t_v ON t(v)'
@@ -148,9 +148,9 @@ for _ in $(seq 1 40); do
 done
 check "changed preflight blocks rollout" '"status":"failed"' "$STALE_RESULT"
 check "stale approval explains refusal"  "schema changed after approval" "$STALE_RESULT"
-check "stale rollout never reached MeshDB" '[0]' "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections/local/query -d '{"sql":"SELECT COUNT(*) FROM sqlite_schema WHERE name = '\''phase3_stale_guard'\''"}')"
+check "stale rollout never reached ShardLite" '[0]' "$(curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/connections/local/query -d '{"sql":"SELECT COUNT(*) FROM sqlite_schema WHERE name = '\''phase3_stale_guard'\''"}')"
 check "proxy frames report"        '"wal":true'     "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections/local/frames/0)"
-check "proxy meshdb users"         '"app"'          "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections/local/users)"
+check "proxy shardlite users"         '"app"'          "$(curl -s -b "$J" http://127.0.0.1:$CP/api/connections/local/users)"
 
 # Multi-user roles: a viewer may observe and query, but cannot write or administer.
 curl -s -b "$J" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:$CP/api/console-users -d '{"username":"viewer","password":"vp","role":"viewer"}' >/dev/null
@@ -161,7 +161,7 @@ check "viewer can query"            "200"            "$(curl -s -b "$JV" -H "X-C
 check "viewer blocked from operations" "403"          "$(curl -s -b "$JV" -o /dev/null -w '%{http_code}' http://127.0.0.1:$CP/api/operations)"
 check "viewer blocked from writes" "403"            "$(curl -s -b "$JV" -H "X-CSRF-Token: $VCSRF" -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CP/api/connections/local/execute -d '{"sql":"CREATE TABLE denied(x)"}')"
 check "user blocked from admin op" "403"            "$(curl -s -b "$JV" -H "X-CSRF-Token: $VCSRF" -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CP/api/connections -d '{"name":"x","url":"http://h:1"}')"
-check "audit records write"         '"meshdb.tx.post"' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/audit)"
+check "audit records write"         '"shardlite.tx.post"' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/audit)"
 check "audit records operation lifecycle" '"operation.schema_rollout.complete"' "$(curl -s -b "$J" http://127.0.0.1:$CP/api/audit)"
 check "unauthenticated blocked"    "401"            "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$CP/api/connections/local/info)"
 

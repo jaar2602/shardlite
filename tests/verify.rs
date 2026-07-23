@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use meshdb::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
-use meshdb::replication::{Follower, FrameLog, FrameLogConfig};
-use meshdb::shard::{ShardConfig, ShardId, ShardManager};
-use meshdb::storage::Value;
-use meshdb::storage::exec::Statement;
-use meshdb::storage::verify::{hash_file, hex};
+use shardlite::net::{Client, NodeServices, Replica, ReplicaConfig, Server, ServerConfig};
+use shardlite::replication::{Follower, FrameLog, FrameLogConfig};
+use shardlite::shard::{ShardConfig, ShardId, ShardManager};
+use shardlite::storage::Value;
+use shardlite::storage::exec::Statement;
+use shardlite::storage::verify::{hash_file, hex};
 use tempfile::TempDir;
 
 const S0: ShardId = ShardId(0);
@@ -199,7 +199,7 @@ fn a_follower_that_missed_frames_is_detected() {
     );
 
     // And the follower still looks perfectly healthy to SQLite, which is the point.
-    let conn = meshdb::rusqlite::Connection::open(S0.path(p.replica.follower().dir())).unwrap();
+    let conn = shardlite::rusqlite::Connection::open(S0.path(p.replica.follower().dir())).unwrap();
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
