@@ -58,6 +58,43 @@ human confirm — and **every delete confirms**, destructive ones with a typed c
   the SAME `crate::proxy` call the manual UI uses — so `proxy_permission` and the meshdb-side
   `Requirement` check both still run.
 
+## The AI harness (the agent runtime the assistant owns and maintains)
+
+The assistant is not a one-shot LLM call; it runs on a small, self-contained **agent harness**
+(`console/server/src/assistant/`) that the console owns, versions, and tests. Making the harness a
+first-class component — rather than scattering prompt strings and HTTP calls through the UI — is what
+keeps the assistant safe, debuggable, and maintainable as models and tools change. Its parts:
+
+- **Turn engine (the agent loop).** A bounded loop — assemble context → call the provider → parse tool
+  calls → dispatch → feed results → repeat — capped by `max_tool_calls`, a token budget, and a
+  wall-clock timeout so a turn can never run away. It is a small explicit state machine:
+  `Thinking → ToolCall(read → run | mutating → propose) → AwaitConfirm → Resume → Answer`.
+- **Tool registry.** Tools are declared once as data — `Tool { name, json_schema, permission,
+  mutating, destructive, handler }`. The harness derives the model's tool list from
+  `registry ∩ the user's role`, dispatches by name, validates arguments against the schema, and
+  enforces the confirm/delete rules **from the flags** in one place — the model cannot opt out of them.
+- **Session store.** Conversations are persisted server-side (`store/assistant/<session>.json`, dir
+  `0700`): the message history, every tool call + result, the pending proposed-action, token usage,
+  and the model + prompt/tool **versions** the turn ran under. So sessions are resumable across
+  reloads, the confirm state survives between HTTP requests, and the whole transcript is auditable and
+  reproducible. Context-window pressure is handled by summarising old turns, not silently truncating.
+- **Provider client.** One OpenAI-compatible client (streaming SSE parse, retry/backoff, timeout,
+  typed error mapping) behind an interface, so provider/model is pure config and a bad gateway
+  degrades to a clear error rather than a hang.
+- **Guardrail layer.** Permission parity, confirm gating, typed-delete, treating tool output as data
+  (injection defence), and secret redaction are enforced *by the harness around* the model, never
+  delegated to the prompt.
+- **Prompt & schema versioning.** The system prompt and tool schemas are versioned artifacts; each
+  session records the version it used, so an upgrade is deliberate and old sessions stay interpretable.
+- **Observability & evaluation.** Every turn emits a trace (tokens, latency, tools chosen, cost,
+  outcome). A **golden-conversation eval suite** (recorded scenarios → expected tool selection and
+  guardrail behaviour, run against a mock provider) is CI-checked, so a prompt or tool change that
+  regresses tool-choice or weakens a confirm is caught before it ships. This eval harness is how the
+  assistant is *maintained* over time — the same "verify, don't assume" bar as the rest of the system.
+
+Everything below (tools, resources, confirm flow, config) plugs into this harness; the harness is the
+single place that turns a model's suggestion into a policy-checked, audited action.
+
 ## Tools (mapped to the management surface, grouped by the console `Permission` that gates them)
 
 | Permission | Tools (→ endpoint / resource) | Auto-run? |
@@ -186,8 +223,11 @@ model — no vendor lock-in. A self-hosted endpoint also keeps cluster data on-p
 
 0. **AI settings** — sealed `base_url`/`model`/`api_key`, admin UI, a "test" round-trip. (registry +
    api + a small settings form.)
-1. **Read-only assistant** — observe + `run_query` + `run_report` tools, streaming answers, tool-call
-   transparency. Highest value, lowest risk: NL Q&A + SQL grounded in live state, *zero* mutation.
+1. **The harness + read-only assistant** — build the agent runtime itself (turn engine, tool registry,
+   session store, provider client, guardrail layer, versioning, traces) with only the observe +
+   `run_query` + `run_report` tools registered, plus the **golden-conversation eval suite** in CI.
+   Highest value, lowest risk: NL Q&A + SQL grounded in live state, *zero* mutation — and every later
+   slice is just registering more tools on the same, already-tested harness.
 2. **Reports & dashboards resources** — the server-side `reports`/`dashboards` registries + REST API +
    their own UI (gallery + canvas). A prerequisite for authoring; useful on its own, no AI required.
 3. **CRUD with confirm** — `create/update_table` (via the rollout op) and report/dashboard authoring
