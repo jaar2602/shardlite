@@ -1,0 +1,6 @@
+# Keep the console build context small. The image rebuilds node_modules and dist from source,
+# and never needs the local Rust/target artifacts.
+web/node_modules
+web/dist
+server/target
+**/*.log

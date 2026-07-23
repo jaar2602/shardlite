@@ -1,0 +1,88 @@
+# meshdb — full stack: a 3-node HA cluster plus the web console, all persisted on Docker volumes.
+#
+# Every service's state lives on a named volume, so `down` then `up` keeps your data: the cluster's
+# shards and Raft state, and the console's users, connections, and (sealed) AI settings. Only
+# `meshdb-stack destroy` removes the volumes.
+#
+# The console runs INSIDE this network and reaches the nodes by their service names on the internal
+# gateway port 8080 (node1:8080, …). The host sees the nodes on 8081-8083 and the console on 7100.
+#
+# Managed by ./meshdb-stack — run that, not `docker compose` directly (it generates the secrets in
+# .env that this file requires).
+name: meshdb
+
+x-node: &node
+  image: meshdb-node:latest
+  restart: unless-stopped
+  networks: [mesh]
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/health"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 20s
+
+services:
+  # Only node1 declares the build; node2/node3 reuse the same image tag. (If all three declared
+  # `build:` for one tag, compose races to write it and two fail with "already exists".)
+  node1:
+    <<: *node
+    build:
+      context: ../..
+      dockerfile: deploy/cluster-demo/Dockerfile
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 1 --peers 2=node2:4600,3=node3:4600
+    volumes: [node1-data:/data]
+    ports: ["8081:8080"]
+  node2:
+    <<: *node
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 2 --peers 1=node1:4600,3=node3:4600
+    volumes: [node2-data:/data]
+    ports: ["8082:8080"]
+  node3:
+    <<: *node
+    command: >
+      serve /data --shards 12
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --node-id 3 --peers 1=node1:4600,2=node2:4600
+    volumes: [node3-data:/data]
+    ports: ["8083:8080"]
+
+  console:
+    image: meshdb-console:latest
+    build:
+      context: ../../console
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [mesh]
+    depends_on: [node1, node2, node3]
+    # MESHDB_CONSOLE_KEY MUST stay constant across restarts — it encrypts stored secrets at rest;
+    # a changed key makes them undecryptable. meshdb-stack pins it in .env. The admin is bootstrapped
+    # once, on the first start against an empty volume.
+    environment:
+      MESHDB_CONSOLE_KEY: ${MESHDB_CONSOLE_KEY:?run ./meshdb-stack up (it generates .env)}
+      MESHDB_CONSOLE_ADMIN: ${MESHDB_CONSOLE_ADMIN:-admin}
+      MESHDB_CONSOLE_ADMIN_PASSWORD: ${MESHDB_CONSOLE_ADMIN_PASSWORD:?run ./meshdb-stack up (it generates .env)}
+    command: ["--listen", "0.0.0.0:7100", "--data", "/data"]
+    volumes: [console-data:/data]
+    ports: ["7100:7100"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7100/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  node1-data: {}
+  node2-data: {}
+  node3-data: {}
+  console-data: {}
+
+networks:
+  mesh: {}
