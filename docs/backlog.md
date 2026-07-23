@@ -2,6 +2,16 @@
 
 Deferred work, with enough context to pick up cold.
 
+## Console cluster provisioning — Kubernetes (enterprise, licensed)
+
+**Future upgrade, not scheduled.** Let the console *create and manage* meshdb clusters (StatefulSet +
+headless Service + per-pod PVC), not just connect to existing ones — a **licensed enterprise**
+capability. Individual/self-host users stay on the Docker path (`deploy/stack/meshdb-stack`). Full
+design, blockers, and slice plan in [console-cluster-provisioning-plan.md](console-cluster-provisioning-plan.md).
+
+**Hard dependency:** full-lifecycle *scaling* needs live shard-move (meshdb plan step 11), which is
+unbuilt — create/start/stop/destroy are deliverable without it, rebalance is not.
+
 ## Owner-aware S3 archive (correct stale-local-file recovery)
 
 **Why deferred:** automatic recovery of a *reclaimed* shard whose local file exists but is behind
