@@ -985,6 +985,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
 fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
     match (method, rest) {
         ("GET", ["info" | "meta" | "health" | "cluster" | "topology" | "shards" | "stats"])
+        | ("GET", ["replication"])
         | ("GET", ["schema", _]) => Some(Permission::Observe),
         ("POST", ["query" | "query_all" | "route"]) => Some(Permission::Query),
         // /v1/run auto-routes and can write, so it needs write permission.

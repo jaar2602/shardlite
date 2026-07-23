@@ -176,6 +176,9 @@ impl HttpGateway {
             (Method::Get, "/v1/shards") => {
                 self.route(&req, role, Requirement::Read, || self.shards_json())
             }
+            (Method::Get, "/v1/replication") => {
+                self.route(&req, role, Requirement::Read, || self.replication_json())
+            }
             (Method::Post, "/v1/query") => {
                 // Streaming: handled specially, it takes ownership of the request to stream.
                 return self.handle_query(req, role);
@@ -204,6 +207,7 @@ impl HttpGateway {
             (Method::Get, "/v1/cluster") => {
                 self.route(&req, role, Requirement::Read, || self.cluster_json())
             }
+            (Method::Get, "/v1/schema/agreement") => self.schema_agreement_route(role),
             (Method::Get, p) if p.starts_with("/v1/schema/") => {
                 self.schema_route(role, p.trim_start_matches("/v1/schema/"))
             }
@@ -684,6 +688,37 @@ impl HttpGateway {
         Ok(serde_json::json!({ "shard": shard, "schema_version": version }))
     }
 
+    /// Cluster-wide schema agreement across the shards this node leads: `agreed` at one version, or
+    /// `disagreed` with the lagging/leading shard named, so an operator sees a part-applied schema
+    /// change (which makes cross-shard reads refuse) without scanning every shard by hand.
+    fn schema_agreement_route(
+        &self,
+        role: Option<Role>,
+    ) -> std::result::Result<serde_json::Value, HttpError> {
+        self.check(role, Requirement::Read)?;
+        use crate::storage::schema::Agreement;
+        let value = match self
+            .shards
+            .schema_agreement()
+            .map_err(|e| error_to_http(&e))?
+        {
+            Agreement::Agreed(v) => serde_json::json!({ "status": "agreed", "version": v }),
+            Agreement::Disagreed {
+                lowest,
+                highest,
+                behind,
+                ahead,
+            } => serde_json::json!({
+                "status": "disagreed",
+                "lowest": lowest,
+                "highest": highest,
+                "behind": behind.0,
+                "ahead": ahead.0,
+            }),
+        };
+        Ok(value)
+    }
+
     fn frames_route(
         &self,
         role: Option<Role>,
@@ -700,14 +735,77 @@ impl HttpGateway {
         Ok(frames_json(&report))
     }
 
+    /// Replication position and durability: per shard, how far the primary has written vs. how far
+    /// that is quorum-durable (the ack view `/v1/shards` doesn't carry), plus what a follower has
+    /// applied. `replicated` is false on a placement-only node (no ack tracker, no follower), where
+    /// only primary LSNs are meaningful.
+    fn replication_json(&self) -> serde_json::Value {
+        let cluster = self.services.cluster.as_ref();
+        let placement = cluster.map(|c| c.placement());
+        let node = cluster.map(|c| c.id());
+        let acks = self.services.acks.as_ref();
+        let follower = self.services.follower.as_ref();
+
+        let mut shards = Vec::with_capacity(self.shards.shard_count() as usize);
+        for id in 0..self.shards.shard_count() {
+            let shard = crate::shard::ShardId(id);
+            let owner = placement
+                .as_ref()
+                .and_then(|p| p.assignments.get(&shard).copied());
+            let primary = cluster.is_none() || owner == node;
+            if primary {
+                let primary_lsn = self.shards.last_lsn(shard);
+                let quorum_lsn = acks.map(|a| a.quorum_lsn(shard));
+                shards.push(serde_json::json!({
+                    "id": id,
+                    "role": "primary",
+                    "primary_lsn": primary_lsn,
+                    "quorum_lsn": quorum_lsn,
+                    // How far the primary is ahead of what quorum has durably acked.
+                    "lag": quorum_lsn.map(|q| primary_lsn.saturating_sub(q)),
+                }));
+            } else if let Some(f) = follower {
+                let pos = f.position(shard);
+                shards.push(serde_json::json!({
+                    "id": id,
+                    "role": "replica",
+                    "epoch": pos.epoch,
+                    "applied_lsn": pos.applied_lsn,
+                }));
+            }
+        }
+
+        let ack_stats = acks.map(|a| {
+            let s = a.stats();
+            serde_json::json!({
+                "confirmed": s.confirmed,
+                "timed_out": s.timed_out,
+                "waited_us": s.waited_us,
+            })
+        });
+        serde_json::json!({
+            "api_version": 1,
+            "observed_at_ms": unix_millis(),
+            "node": node,
+            "replicated": acks.is_some() || follower.is_some(),
+            "acks": ack_stats,
+            "shards": shards,
+        })
+    }
+
     fn stats_json(&self) -> serde_json::Value {
         let w = self.shards.writer_stats();
         let r = self.shards.reader_stats();
         let checkpoint = self.shards.checkpoint_stats();
+        // Process-wide WAL-mode conversion contention — the signal for "are shard opens fighting?".
+        // Shown by the CLI `.stats` but previously not over HTTP.
+        let wc = crate::storage::wal_conversion_stats();
         serde_json::json!({
             "writer": {
                 "batches": w.batches, "requests": w.requests, "max_batch": w.max_batch,
-                "open_now": w.open_now, "threads": w.threads,
+                "mean_batch": w.mean_batch(),
+                "open_now": w.open_now, "shard_opens": w.shard_opens,
+                "shard_evictions": w.shard_evictions, "threads": w.threads,
             },
             "reader": {
                 "queries": r.queries, "rejected_busy": r.rejected_busy,
@@ -725,6 +823,12 @@ impl HttpGateway {
                 "stalls": checkpoint.stalls,
                 "failures": checkpoint.failures,
                 "wal_bytes": checkpoint.wal_bytes,
+            },
+            "wal_conversion": {
+                "retries": wc.retries,
+                "contended_opens": wc.contended_opens,
+                "failed_opens": wc.failed_opens,
+                "max_wait_ms": wc.max_wait_ms,
             },
         })
     }

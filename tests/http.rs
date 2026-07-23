@@ -453,6 +453,61 @@ fn stats_schema_route_and_execute_all_endpoints() {
 }
 
 #[test]
+fn phase_a_observability_endpoints() {
+    let g = gateway(None, false);
+    // The version-bumping DDL path (same as the execute_all test), so schema agreement is at v1.
+    ureq::post(&format!("{}/v1/execute_all", g.base))
+        .send_string(
+            &serde_json::json!({"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"})
+                .to_string(),
+        )
+        .unwrap();
+
+    // A1 — /v1/stats now carries the WAL-conversion contention block and the writer open/eviction
+    // counters the CLI `.stats` shows.
+    let stats: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/stats", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(stats["wal_conversion"]["retries"].is_number());
+    assert!(stats["wal_conversion"]["max_wait_ms"].is_number());
+    assert!(stats["writer"]["shard_opens"].is_number());
+    assert!(stats["writer"]["mean_batch"].is_number());
+
+    // A2 — /v1/schema/agreement: one table applied to every shard agrees at version 1.
+    let agree: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/schema/agreement", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(agree["status"], "agreed");
+    assert_eq!(agree["version"].as_i64().unwrap(), 1);
+
+    // A3 — /v1/replication: standalone has no ack tracker/follower, so replicated:false and every
+    // shard is a primary reporting its LSN.
+    let repl: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/replication", g.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(repl["replicated"], false);
+    let shards = repl["shards"].as_array().unwrap();
+    assert!(!shards.is_empty());
+    assert!(shards.iter().all(|s| s["role"] == "primary"));
+    assert!(shards[0]["primary_lsn"].is_number());
+}
+
+#[test]
 fn frames_endpoint_decodes_the_wal() {
     let g = gateway(None, false);
     ddl(&g, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT");
