@@ -139,6 +139,52 @@ fn parse_epoch_lsn(key: &str) -> Option<(u64, u64)> {
     Some((e.parse().ok()?, l.parse().ok()?))
 }
 
+/// Materialise `shard`'s **complete current image** from S3 — the latest snapshot with the archived
+/// change-log replayed on top — as db bytes, plus `(epoch, snapshot_lsn, pages_replayed)`. This is
+/// the reconstruct-to-local recovery path (see [`crate::shard::ShardManager::recover_shard_from_s3`]):
+/// unlike [`open_from_s3`], which serves live from S3 over an overlay, this returns a self-contained
+/// database the node then installs and serves locally, so there is never a second live view of the
+/// shard.
+pub fn recover_bytes(
+    client: &S3Client,
+    prefix: &str,
+    shard: ShardId,
+) -> crate::Result<(Vec<u8>, u64, u64, usize)> {
+    let key = latest_snapshot(client, prefix, shard)?.ok_or_else(|| {
+        crate::Error::Protocol(format!("no S3 snapshot archived for shard {}", shard.0))
+    })?;
+    let (epoch, snap_lsn) = parse_epoch_lsn(&key)
+        .ok_or_else(|| crate::Error::Protocol(format!("unparseable snapshot key: {key}")))?;
+    let mut db = client.get(&key).map_err(to_err)?;
+    let overlay = build_overlay(client, prefix, shard, epoch, snap_lsn)?;
+    let pages = match &overlay {
+        Some(o) => {
+            apply_overlay(&mut db, o);
+            o.pages.len()
+        }
+        None => 0,
+    };
+    Ok((db, epoch, snap_lsn, pages))
+}
+
+/// Splice a change-log [`PageOverlay`] into `db` in place: overwrite each replayed page at its
+/// offset (growing the buffer for pages past the snapshot's size), then trim to the post-replay
+/// database size. The result is a byte-exact current image.
+fn apply_overlay(db: &mut Vec<u8>, o: &PageOverlay) {
+    let ps = o.page_size as usize;
+    if (o.db_size as usize) > db.len() {
+        db.resize(o.db_size as usize, 0);
+    }
+    for (&page_no, data) in &o.pages {
+        let off = (page_no as usize - 1) * ps;
+        if off + data.len() > db.len() {
+            db.resize(off + data.len(), 0);
+        }
+        db[off..off + data.len()].copy_from_slice(data);
+    }
+    db.truncate(o.db_size as usize);
+}
+
 fn to_err(e: super::S3Error) -> crate::Error {
     crate::Error::Protocol(format!("s3: {e}"))
 }

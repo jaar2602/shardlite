@@ -474,6 +474,13 @@ export function conn(name: string) {
         `${b}/shards/${shard}/checkpoint`,
         {},
       ),
+    // Rebuild a shard's local file from its S3 snapshot + change-log (failover recovery).
+    recoverShardFromS3: (shard: number) =>
+      req<{ ok: boolean; recovered_from: { epoch: number; snapshot_lsn: number }; change_log_pages: number }>(
+        "POST",
+        `${b}/shards/${shard}/recover-from-s3`,
+        {},
+      ),
     // Declares the shard key on every node (per-node metadata).
     shardkey: (table: string, column: string) =>
       req<{ applied: string[]; failures: string[] }>("POST", `${b}/shardkey`, { table, column }),

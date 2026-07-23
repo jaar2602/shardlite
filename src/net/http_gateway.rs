@@ -852,6 +852,45 @@ impl HttpGateway {
         }
     }
 
+    /// `POST /v1/shards/{n}/recover-from-s3` (Admin) — rebuild a shard's local file from its S3
+    /// snapshot + change-log and serve it locally. The failover recovery path for a node that owns a
+    /// shard whose data lives only in S3 (its previous owner is gone). Reconstruct-to-local, so it
+    /// never serves the shard from two places.
+    fn recover_shard_op(
+        &self,
+        shard: crate::shard::ShardId,
+        n: u32,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = (shard, n);
+            Err(HttpError::new(
+                501,
+                "this server was built without the s3 feature",
+            ))
+        }
+        #[cfg(feature = "s3")]
+        {
+            let (client, prefix) = self
+                .services
+                .s3
+                .recovery()
+                .ok_or_else(|| HttpError::new(409, "no S3 sink is configured on this node"))?;
+            let (epoch, snap_lsn, pages) = self
+                .shards
+                .recover_shard_from_s3(shard, &client, &prefix)
+                .map_err(|e| error_to_http(&e))?;
+            Ok((
+                200,
+                serde_json::json!({
+                    "ok": true, "shard": n, "op": "recover-from-s3",
+                    "recovered_from": { "epoch": epoch, "snapshot_lsn": snap_lsn },
+                    "change_log_pages": pages,
+                }),
+            ))
+        }
+    }
+
     /// `POST /v1/cluster/prefer` (Admin) — `{shards: [n...], prefer: bool}`. Ask this node to host
     /// (or stop hosting) those shards — a desired-placement hint the coordinator honours when this
     /// node is eligible. To move shard X onto node B, call this on B. Falls back to balance if the
@@ -1006,6 +1045,7 @@ impl HttpGateway {
                         }),
                     ))
                 }
+                "recover-from-s3" => self.recover_shard_op(shard, n),
                 _ => Err(HttpError::new(404, "no such shard operation")),
             }
         })();

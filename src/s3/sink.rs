@@ -89,6 +89,16 @@ impl S3Sink {
         }
     }
 
+    /// The S3 client and key prefix, so the recovery path can read this shard's archived
+    /// snapshot + change-log back.
+    pub fn client(&self) -> Arc<S3Client> {
+        Arc::clone(&self.client)
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Health plus per-shard archival progress, for the S3 status endpoint.
     pub fn status(&self) -> S3SinkStatus {
         let last_error = self.failed.lock().unwrap().clone();

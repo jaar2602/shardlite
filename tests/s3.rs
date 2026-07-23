@@ -977,3 +977,110 @@ fn s3_archival_is_configurable_at_runtime_over_http() {
     assert_eq!(off["configured"], false);
     assert_eq!(get("/v1/s3/status")["configured"], false);
 }
+
+// --- Phase B4: reconstruct-to-local shard recovery from S3 ---
+
+#[test]
+fn a_node_recovers_a_shard_from_s3_snapshot_plus_change_log() {
+    use meshdb::shard::{ShardConfig, ShardManager};
+    use meshdb::storage::exec::{Executed, Outcome, Statement};
+
+    let endpoint = spawn_full_s3();
+    let client = Arc::new(S3Client::new(S3Config {
+        endpoint,
+        bucket: "b".into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "s".into(),
+    }));
+
+    // Node A archives shard 0: 100 rows, a snapshot, then 50 MORE rows (change-log after the snap).
+    let dir_a = tempfile::tempdir().unwrap();
+    let sink = Arc::new(S3Sink::new(Arc::clone(&client), "rec"));
+    let a = ShardManager::open_with_sink(
+        dir_a.path(),
+        ShardConfig {
+            shard_count: 2,
+            capture: true,
+            ..ShardConfig::floor()
+        },
+        Some(Arc::clone(&sink) as Arc<dyn meshdb::replication::FrameSink>),
+    )
+    .unwrap();
+    a.execute_all_shards(Statement::new(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+    ))
+    .unwrap();
+    a.execute_one(
+        ShardId(0),
+        Statement::new(
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<100) \
+             INSERT INTO t SELECT x FROM s",
+        ),
+    )
+    .unwrap();
+
+    // Snapshot shard 0 to S3 at its current position.
+    let snap = dir_a.path().join("snap0.db");
+    let (epoch, lsn) = a.snapshot(ShardId(0), &snap).unwrap();
+    sink.put_snapshot(ShardId(0), epoch, lsn, &std::fs::read(&snap).unwrap())
+        .unwrap();
+
+    // 50 more rows AFTER the snapshot — these exist only in the archived change-log.
+    a.execute_one(
+        ShardId(0),
+        Statement::new(
+            "WITH RECURSIVE s(x) AS (SELECT 101 UNION ALL SELECT x+1 FROM s WHERE x<150) \
+             INSERT INTO t SELECT x FROM s",
+        ),
+    )
+    .unwrap();
+    sink.flush().unwrap();
+
+    // Node B is fresh — it has never seen shard 0's data. It recovers it from S3.
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = ShardManager::open_with_sink(
+        dir_b.path(),
+        ShardConfig {
+            shard_count: 2,
+            capture: true,
+            ..ShardConfig::floor()
+        },
+        None,
+    )
+    .unwrap();
+    let (rec_epoch, rec_lsn, pages) = b.recover_shard_from_s3(ShardId(0), &client, "rec").unwrap();
+    assert_eq!(rec_epoch, epoch);
+    assert_eq!(rec_lsn, lsn);
+    assert!(pages > 0, "the change-log delta should have been replayed");
+
+    // B now serves shard 0 locally with the COMPLETE current state: snapshot (100) + change-log (50).
+    let out = b
+        .query(ShardId(0), Statement::new("SELECT count(*) FROM t"))
+        .unwrap();
+    let count = match out {
+        Outcome::Ok(Executed::Rows(qr)) => match qr.rows[0][0] {
+            meshdb::storage::Value::Integer(n) => n,
+            ref v => panic!("expected an integer count, got {v:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(
+        count, 150,
+        "recovery must include both the snapshot and the change-log rows"
+    );
+
+    // And a post-snapshot row (id 150) is really there — proof the change-log was applied.
+    let out = b
+        .query(
+            ShardId(0),
+            Statement::new("SELECT id FROM t WHERE id = 150"),
+        )
+        .unwrap();
+    match out {
+        Outcome::Ok(Executed::Rows(qr)) => {
+            assert_eq!(qr.rows.len(), 1, "row 150 (post-snapshot) missing")
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

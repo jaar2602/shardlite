@@ -563,6 +563,44 @@ impl ShardManager {
         self.writers.checkpoint(shard)
     }
 
+    /// Recover `shard`'s data from S3 into this node's **local** file, then serve it normally — the
+    /// failover path for a node that owns a shard it has no (or stale) local data for. It rebuilds
+    /// the complete current image from S3 (latest snapshot + replayed change-log) in memory, then
+    /// installs it with the same discipline as a snapshot install: write a temp file, close every
+    /// cached connection, and swap it in under the shard's apply guard (which bumps the generation
+    /// so no reader keeps the old inode) while removing any stale WAL. Returns `(epoch,
+    /// snapshot_lsn, change_log_pages)`. Reconstruct-to-local — never a second live view of the
+    /// shard, so it cannot diverge from a surviving owner.
+    #[cfg(feature = "s3")]
+    pub fn recover_shard_from_s3(
+        &self,
+        shard: ShardId,
+        client: &crate::s3::S3Client,
+        prefix: &str,
+    ) -> crate::Result<(u64, u64, usize)> {
+        let (db, epoch, snap_lsn, pages) =
+            crate::s3::failover::recover_bytes(client, prefix, shard)?;
+
+        let dest = shard.path(&self.dir);
+        let tmp = dest.with_extension("db.s3recover");
+        std::fs::write(&tmp, &db)
+            .map_err(|e| crate::Error::Protocol(format!("writing recovered shard: {e}")))?;
+
+        // Close every cached connection first — a handle kept across the rename holds the deleted
+        // inode and would serve the pre-recovery database forever — then swap under the apply guard.
+        let closed = self.writers.quiesce(shard)? + self.readers.quiesce(shard)?;
+        self.modes.access(shard).apply(|| -> crate::Result<()> {
+            std::fs::rename(&tmp, &dest)
+                .map_err(|e| crate::Error::Protocol(format!("installing recovered shard: {e}")))?;
+            let _ = std::fs::remove_file(crate::storage::checkpoint::wal_path_for(&dest));
+            Ok(())
+        })?;
+        self.modes.record_handover(closed);
+
+        tracing::info!(%shard, epoch, snap_lsn, pages, "recovered shard from S3");
+        Ok((epoch, snap_lsn, pages))
+    }
+
     /// Freeze `shard`'s main file, returning `(epoch, lsn, path)`. Pair with
     /// [`Self::end_snapshot`].
     pub fn begin_snapshot(&self, shard: ShardId) -> crate::Result<(u64, u64, PathBuf)> {

@@ -59,6 +59,15 @@ impl S3Runtime {
             .map(|a| a.summary.clone())
     }
 
+    /// The S3 client and prefix for the recovery path, if a sink is attached.
+    pub fn recovery(&self) -> Option<(Arc<super::S3Client>, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| (a.sink.client(), a.sink.prefix().to_string()))
+    }
+
     /// The live sink, for on-demand snapshot/flush.
     pub fn sink(&self) -> Option<Arc<S3Sink>> {
         self.inner
