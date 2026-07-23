@@ -508,6 +508,74 @@ fn phase_a_observability_endpoints() {
 }
 
 #[test]
+fn phase_c_shard_operations() {
+    let g = gateway(None, false);
+    ddl(&g, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT");
+    g.manager
+        .execute_one(
+            ShardId(0),
+            Statement::new("INSERT INTO t VALUES (1),(2),(3)"),
+        )
+        .unwrap();
+
+    // C1 — vacuum one shard.
+    let vac: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{}/v1/shards/0/vacuum", g.base))
+            .send_string("")
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(vac["ok"], true);
+    assert_eq!(vac["op"], "vacuum");
+
+    // C2 — force a checkpoint; reports (busy, log_pages, checkpointed).
+    let ckpt: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{}/v1/shards/0/checkpoint", g.base))
+            .send_string("")
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(ckpt["checkpointed"].is_number());
+    assert!(ckpt["busy"].is_number());
+
+    // C3 — declare a shard key on an EMPTY table: accepted.
+    ddl(
+        &g,
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, region TEXT) STRICT",
+    );
+    let sk: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{}/v1/shardkey", g.base))
+            .send_string(&serde_json::json!({"table":"k","column":"region"}).to_string())
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sk["ok"], true);
+    assert_eq!(
+        g.manager.shard_key("k").as_deref(),
+        Some("region"),
+        "the shard key should now be declared"
+    );
+
+    // C3 guard — declaring a key on a POPULATED table is refused with 409.
+    g.manager
+        .execute_one(ShardId(0), Statement::new("INSERT INTO t (id) VALUES (99)"))
+        .unwrap();
+    let err = ureq::post(&format!("{}/v1/shardkey", g.base))
+        .send_string(&serde_json::json!({"table":"t","column":"id"}).to_string())
+        .unwrap_err();
+    match err {
+        ureq::Error::Status(409, _) => {}
+        other => panic!("expected a 409 on a populated table, got {other:?}"),
+    }
+}
+
+#[test]
 fn frames_endpoint_decodes_the_wal() {
     let g = gateway(None, false);
     ddl(&g, "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT");

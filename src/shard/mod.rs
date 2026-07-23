@@ -557,6 +557,12 @@ impl ShardManager {
         self.writers.vacuum(shard)
     }
 
+    /// Force a WAL checkpoint on `shard` now, returning `(busy, log_pages, checkpointed)`.
+    /// Checkpointing is otherwise automatic; this is an operator's manual trigger.
+    pub fn checkpoint(&self, shard: ShardId) -> crate::Result<(i64, i64, i64)> {
+        self.writers.checkpoint(shard)
+    }
+
     /// Freeze `shard`'s main file, returning `(epoch, lsn, path)`. Pair with
     /// [`Self::end_snapshot`].
     pub fn begin_snapshot(&self, shard: ShardId) -> crate::Result<(u64, u64, PathBuf)> {

@@ -86,6 +86,11 @@ enum Job {
         shard: ShardId,
         reply: SyncSender<Result<()>>,
     },
+    /// Force a WAL checkpoint now, reporting `(busy, log_pages, checkpointed)`.
+    Checkpoint {
+        shard: ShardId,
+        reply: SyncSender<Result<(i64, i64, i64)>>,
+    },
     Shutdown,
 }
 
@@ -402,6 +407,18 @@ impl WriterFleet {
         reply_rx.recv().map_err(|_| Error::WriterGone)?
     }
 
+    /// Force a WAL checkpoint on `shard` now, returning `(busy, log_pages, checkpointed)`.
+    pub fn checkpoint(&self, shard: ShardId) -> Result<(i64, i64, i64)> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .send(Job::Checkpoint {
+                shard,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::WriterGone)?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
     /// Freeze `shard`'s main file and report `(epoch, lsn, path)`.
     ///
     /// The file at `path` will not change until [`Self::end_snapshot`]. Callers must pair
@@ -554,6 +571,10 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
                 continue;
             }
+            Job::Checkpoint { shard, reply } => {
+                let _ = reply.send(checkpoint_shard(&mut open, &ctx, shard));
+                continue;
+            }
             Job::Schema { shard, ddl, reply } => {
                 let _ = reply.send(schema_op(&mut open, &ctx, shard, ddl.as_ref()));
                 continue;
@@ -588,6 +609,9 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 }
                 Ok(Job::Vacuum { shard, reply }) => {
                     let _ = reply.send(vacuum_shard(&mut open, &ctx, shard));
+                }
+                Ok(Job::Checkpoint { shard, reply }) => {
+                    let _ = reply.send(checkpoint_shard(&mut open, &ctx, shard));
                 }
                 Ok(Job::Schema { shard, ddl, reply }) => {
                     let _ = reply.send(schema_op(&mut open, &ctx, shard, ddl.as_ref()));
@@ -768,6 +792,31 @@ fn begin_snapshot(
 }
 
 /// Rebuild a shard. Must not run inside a transaction, hence its own job.
+/// Force a WAL checkpoint (TRUNCATE) on `shard` now, returning SQLite's `(busy, log_pages,
+/// checkpointed)`. `busy = 1` means a long-running reader held the checkpoint back — not an error.
+fn checkpoint_shard(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    shard: ShardId,
+) -> Result<(i64, i64, i64)> {
+    let entry = ensure_shard(open, ctx, shard)?;
+    if entry.snapshot_hold {
+        return Err(Error::Unsupported(format!(
+            "{shard} is frozen for a snapshot; checkpointing is suspended for the duration"
+        )));
+    }
+    entry
+        .conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(crate::Error::Sqlite)
+}
+
 fn vacuum_shard(open: &mut Lru<OpenShard>, ctx: &ThreadCtx, shard: ShardId) -> Result<()> {
     let entry = ensure_shard(open, ctx, shard)?;
     if entry.snapshot_hold {

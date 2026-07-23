@@ -1005,6 +1005,56 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             )
         }
 
+        // Declare a table's shard key on every node — shard-key metadata is per-node, so it must
+        // reach all seeds or routing disagrees between nodes (the meshdb endpoint guards each node
+        // against declaring on a table that already holds rows there).
+        ("POST", ["connections", name, "shardkey"]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::Operate,
+                    "meshdb.shardkey.declare",
+                    name,
+                );
+            }
+            let body = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let seeds = match state.registry.resolve_seeds(name) {
+                Ok(seeds) => seeds,
+                Err(RegistryError::NotFound) => {
+                    return respond::error(request, 404, "no such connection")
+                }
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
+                }
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let mut applied = Vec::new();
+            let mut failures = Vec::new();
+            for resolved in &seeds {
+                match crate::proxy::post_json_result(resolved, "shardkey", &body) {
+                    Ok(_) => applied.push(resolved.url.clone()),
+                    Err(e) => failures.push(format!("{}: {e}", resolved.url)),
+                }
+            }
+            state.audit.record(
+                Some(&session.user),
+                "meshdb.shardkey.declare",
+                name,
+                if failures.is_empty() { "ok" } else { "failed" },
+            );
+            let status = if failures.is_empty() { 200 } else { 502 };
+            respond::respond_json(
+                request,
+                status,
+                &serde_json::json!({ "applied": applied, "failures": failures }),
+            )
+        }
+
         (_, ["connections", name, rest @ ..]) if !rest.is_empty() => {
             let Some(permission) = proxy_permission(&method, rest) else {
                 return respond::error(request, 404, "no such endpoint or method");
@@ -1070,6 +1120,8 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("POST", ["execute" | "tx" | "run"]) => Some(Permission::Write),
         // S3 archival config/snapshot/flush are operator actions (meshdb also requires Admin).
         ("POST", ["s3", "config" | "snapshot" | "flush"]) => Some(Permission::Operate),
+        // Shard maintenance (vacuum/checkpoint) is an operator action.
+        ("POST", ["shards", _, "vacuum" | "checkpoint"]) => Some(Permission::Operate),
         ("GET", ["frames", _]) => Some(Permission::Operate),
         ("GET" | "POST", ["users"]) | ("DELETE", ["users", _]) => Some(Permission::ManageMeshUsers),
         _ => None,

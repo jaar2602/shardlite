@@ -213,6 +213,13 @@ impl HttpGateway {
             (Method::Post, "/v1/s3/flush") => {
                 return self.handle_s3_flush(req, role);
             }
+            (Method::Post, "/v1/shardkey") => {
+                return self.handle_shardkey(req, role);
+            }
+            (Method::Post, p) if p.starts_with("/v1/shards/") => {
+                let suffix = p.trim_start_matches("/v1/shards/").to_string();
+                return self.handle_shard_op(req, role, suffix);
+            }
             (Method::Get, "/v1/stats") => {
                 self.route(&req, role, Requirement::Read, || self.stats_json())
             }
@@ -830,6 +837,106 @@ impl HttpGateway {
         }
     }
 
+    /// `POST /v1/shards/{n}/vacuum` and `.../checkpoint` (Admin) — operator maintenance on one
+    /// shard this node owns: rebuild to reclaim free pages, or force a WAL checkpoint now.
+    fn handle_shard_op(&self, req: Request, role: Option<Role>, suffix: String) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let mut parts = suffix.splitn(2, '/');
+            let n: u32 = parts
+                .next()
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| HttpError::new(400, "shard must be a number"))?;
+            let op = parts.next().unwrap_or("");
+            let shard = crate::shard::ShardId(n);
+            match op {
+                "vacuum" => {
+                    self.shards.vacuum(shard).map_err(|e| error_to_http(&e))?;
+                    Ok((
+                        200,
+                        serde_json::json!({"ok": true, "shard": n, "op": "vacuum"}),
+                    ))
+                }
+                "checkpoint" => {
+                    let (busy, log_pages, checkpointed) = self
+                        .shards
+                        .checkpoint(shard)
+                        .map_err(|e| error_to_http(&e))?;
+                    Ok((
+                        200,
+                        serde_json::json!({
+                            "ok": busy == 0, "shard": n, "op": "checkpoint",
+                            "busy": busy, "log_pages": log_pages, "checkpointed": checkpointed,
+                        }),
+                    ))
+                }
+                _ => Err(HttpError::new(404, "no such shard operation")),
+            }
+        })();
+        respond_json(req, out);
+    }
+
+    /// `POST /v1/shardkey` (Admin) — declare a table's shard key (a column other than its primary
+    /// key). Node-local; the console applies it to every seed for cluster-wide agreement. Refuses if
+    /// the table already holds rows on this node — declaring a key then would misplace them.
+    fn handle_shardkey(&self, mut req: Request, role: Option<Role>) {
+        let out = self.shardkey_inner(&mut req, role);
+        respond_json(req, out);
+    }
+
+    fn shardkey_inner(
+        &self,
+        req: &mut Request,
+        role: Option<Role>,
+    ) -> std::result::Result<(u16, serde_json::Value), HttpError> {
+        self.check(role, Requirement::Admin)?;
+        let body = read_body(req)?;
+        #[derive(serde::Deserialize)]
+        struct Body {
+            table: String,
+            column: String,
+        }
+        let b: Body = serde_json::from_slice(&body)
+            .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+        if !is_simple_ident(&b.table) || !is_simple_ident(&b.column) {
+            return Err(HttpError::new(
+                400,
+                "table and column must be simple identifiers (letters, digits, underscore)",
+            ));
+        }
+        // Empty-table guard. A missing table (not yet created) counts as empty — declaring a key
+        // ahead of creation is the intended flow.
+        if let Ok(qr) = self
+            .shards
+            .query_all_shards(&format!("SELECT count(*) FROM \"{}\"", b.table))
+        {
+            let rows: i64 = qr
+                .rows
+                .iter()
+                .filter_map(|r| r.first())
+                .filter_map(|v| match v {
+                    Value::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                .sum();
+            if rows > 0 {
+                return Err(HttpError::new(
+                    409,
+                    "this table already holds rows; declaring a shard key now would misplace \
+                     them. Declare it before inserting data.",
+                ));
+            }
+        }
+        self.shards
+            .declare_shard_key(&b.table, &b.column)
+            .map_err(|e| error_to_http(&e))?;
+        Ok((
+            200,
+            serde_json::json!({"ok": true, "table": b.table, "column": b.column}),
+        ))
+    }
+
     fn handle_route(&self, mut req: Request, role: Option<Role>) {
         let out = self.check(role, Requirement::Read).and_then(|()| {
             let body = read_body(&mut req)?;
@@ -1375,6 +1482,14 @@ fn auth_challenge(message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 
 fn content_type(ct: &str) -> Header {
     Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()).unwrap()
+}
+
+/// A safe SQL identifier for interpolation into the shard-key row-count probe: letters, digits, and
+/// underscore, not starting with a digit. Anything else is rejected rather than quoted-and-hoped.
+fn is_simple_ident(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn read_body(req: &mut Request) -> std::result::Result<Vec<u8>, HttpError> {
