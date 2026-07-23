@@ -225,6 +225,9 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/step-down") => {
                 return self.handle_step_down(req, role);
             }
+            (Method::Post, "/v1/cluster/prefer") => {
+                return self.handle_prefer(req, role);
+            }
             (Method::Post, "/v1/shardkey") => {
                 return self.handle_shardkey(req, role);
             }
@@ -847,6 +850,44 @@ impl HttpGateway {
             sink.flush().map_err(|e| error_to_http(&e))?;
             Ok((200, serde_json::json!({ "ok": true })))
         }
+    }
+
+    /// `POST /v1/cluster/prefer` (Admin) — `{shards: [n...], prefer: bool}`. Ask this node to host
+    /// (or stop hosting) those shards — a desired-placement hint the coordinator honours when this
+    /// node is eligible. To move shard X onto node B, call this on B. Falls back to balance if the
+    /// hint can't be met, so it never creates a second owner. 409 on a standalone node.
+    fn handle_prefer(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let body = read_body(&mut req)?;
+            #[derive(serde::Deserialize)]
+            struct Body {
+                shards: Vec<u32>,
+                #[serde(default = "default_true")]
+                prefer: bool,
+            }
+            fn default_true() -> bool {
+                true
+            }
+            let b: Body = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            match self.services.cluster.as_ref() {
+                Some(cluster) => {
+                    let shards: Vec<crate::shard::ShardId> =
+                        b.shards.iter().map(|&s| crate::shard::ShardId(s)).collect();
+                    cluster.set_preferred(&shards, b.prefer);
+                    Ok((
+                        200,
+                        serde_json::json!({"ok": true, "node": cluster.id(), "shards": b.shards, "prefer": b.prefer}),
+                    ))
+                }
+                None => Err(HttpError::new(
+                    409,
+                    "this is a standalone node, not a cluster member; it already holds every shard",
+                )),
+            }
+        })();
+        respond_json(req, out);
     }
 
     /// `POST /v1/cluster/step-down` (Admin) — if this node is the leader, it voluntarily gives up

@@ -938,6 +938,43 @@ fn cordoning_a_node_drains_its_shards_but_keeps_it_voting() {
 }
 
 #[test]
+fn a_preferred_shard_moves_to_the_node_that_wants_it() {
+    // A desired-placement hint: an operator asks a specific node to host a specific shard, and the
+    // coordinator honours it on the next round — the safe way to move one hot shard (cordon can
+    // only move a whole node's worth). Still one owner throughout.
+    let nodes = cluster(3);
+    let leader = await_leader(&nodes, Duration::from_secs(5)).expect("no leader");
+    let _ = await_spread(&nodes, Duration::from_secs(5)).expect("no spread");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let owner0 = leader.cluster.placement().owner(ShardId(0));
+    let taker = nodes
+        .iter()
+        .find(|n| Some(n.id) != owner0)
+        .cloned()
+        .expect("a node that does not already own shard 0");
+    taker.cluster.set_preferred(&[ShardId(0)], true);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut moved = false;
+    while Instant::now() < deadline && !moved {
+        moved = leader.cluster.placement().owner(ShardId(0)) == Some(taker.id);
+        if !moved {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(
+        moved,
+        "shard 0 never moved to the node that preferred it: {:?}",
+        leader.cluster.placement()
+    );
+
+    for n in &nodes {
+        n.stop();
+    }
+}
+
+#[test]
 fn a_leader_can_step_down_and_a_peer_takes_over() {
     // Voluntary step-down hands the coordinator role to a peer while the old leader stays in the
     // cluster (unlike drain, which removes it). Safe: it only backs off from re-campaigning, so the

@@ -141,6 +141,12 @@ pub struct ClusterNode {
     /// Members that reported themselves cordoned in the last heartbeat round; excluded from
     /// shard assignment (see [`Self::plan`]) but not from quorum.
     cordoned_members: Mutex<std::collections::BTreeSet<NodeId>>,
+    /// Shards an operator has asked THIS node to host (a desired-placement hint). Advertised to
+    /// the leader in each heartbeat; the coordinator honours it when this node is eligible.
+    preferred: Mutex<std::collections::BTreeSet<crate::shard::ShardId>>,
+    /// The leader's collected view of every member's preferred shards, gathered from the last
+    /// heartbeat round: shard → the node that wants it. Fed into [`Placement::with_preferences`].
+    preferences: Mutex<std::collections::BTreeMap<crate::shard::ShardId, NodeId>>,
 }
 
 impl ClusterNode {
@@ -174,7 +180,33 @@ impl ClusterNode {
             stop: AtomicBool::new(false),
             cordoned: AtomicBool::new(false),
             cordoned_members: Mutex::new(std::collections::BTreeSet::new()),
+            preferred: Mutex::new(std::collections::BTreeSet::new()),
+            preferences: Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Ask (or stop asking) for this node to host `shards` — an operator's desired-placement hint,
+    /// honoured by the coordinator when this node is eligible (live and not cordoned). Purely a
+    /// bias on the single authoritative map: a hint the leader cannot satisfy (this node down or
+    /// cordoned) simply falls back to balance, so it can never create a second owner.
+    pub fn set_preferred(&self, shards: &[crate::shard::ShardId], prefer: bool) {
+        let mut set = self.preferred.lock().expect("preferred mutex");
+        for &s in shards {
+            if prefer {
+                set.insert(s);
+            } else {
+                set.remove(&s);
+            }
+        }
+    }
+
+    pub fn preferred_shards(&self) -> Vec<crate::shard::ShardId> {
+        self.preferred
+            .lock()
+            .expect("preferred mutex")
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Cordon (`true`) or un-cordon (`false`) this node: while cordoned it keeps voting but is
@@ -439,7 +471,11 @@ impl ClusterNode {
             eligible
         };
 
-        Placement::balanced(self.shards.len() as u32, &members, term)
+        // Honour operator desired-placement hints: a shard whose preferred host is eligible goes
+        // there, the rest stay balanced. `with_preferences` ignores a hint for an ineligible node,
+        // so a hint can never leave a shard unowned or doubly owned.
+        let preferences = self.preferences.lock().expect("preferences mutex").clone();
+        Placement::with_preferences(self.shards.len() as u32, &members, &preferences, term)
     }
 
     pub fn stop(&self) {
@@ -552,6 +588,16 @@ impl ClusterNode {
 
         let mut answered = std::collections::BTreeSet::new();
         let mut cordoned = std::collections::BTreeSet::new();
+        // shard → node that wants it. Peers iterate in ascending id order, and we only take the
+        // first claimant, so a shard preferred by two nodes deterministically goes to the lower id.
+        let mut preferences: std::collections::BTreeMap<crate::shard::ShardId, NodeId> =
+            std::collections::BTreeMap::new();
+        // This node's own preferences count too (it is not among its peers).
+        if !self.is_cordoned() {
+            for s in self.preferred_shards() {
+                preferences.entry(s).or_insert(self.id);
+            }
+        }
         for (&peer, addr) in &self.peers {
             self.counters
                 .heartbeats_sent
@@ -563,6 +609,10 @@ impl ClusterNode {
             }
             if reply.cordoned {
                 cordoned.insert(peer);
+            } else {
+                for &s in &reply.prefers {
+                    preferences.entry(crate::shard::ShardId(s)).or_insert(peer);
+                }
             }
 
             let action = {
@@ -577,6 +627,7 @@ impl ClusterNode {
         }
         *self.live.lock().expect("live mutex") = answered;
         *self.cordoned_members.lock().expect("cordoned mutex") = cordoned;
+        *self.preferences.lock().expect("preferences mutex") = preferences;
         Ok(())
     }
 
@@ -684,8 +735,9 @@ impl ClusterNode {
             let reply = e.on_heartbeat(hb, Instant::now())?;
             (reply, was_leader && !e.is_leader())
         };
-        // Tell the coordinator whether we are cordoned, so it drains our shards away.
+        // Tell the coordinator whether we are cordoned (drain us) and which shards we would host.
         reply.cordoned = self.is_cordoned();
+        reply.prefers = self.preferred_shards().iter().map(|s| s.0).collect();
         if deposed {
             let durability = self.durability.durability();
             self.perform(

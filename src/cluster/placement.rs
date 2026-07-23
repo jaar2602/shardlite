@@ -75,6 +75,41 @@ impl Placement {
         Self { term, assignments }
     }
 
+    /// Like [`Self::balanced`], but a shard whose operator-preferred host is currently eligible is
+    /// placed there; every other shard is round-robined over `members`. A preference naming a node
+    /// that is not eligible (down, or cordoned — the caller passes only eligible members) is
+    /// ignored, so that shard falls back to balance rather than to nobody. This is a hint layered
+    /// over the same single authoritative map — it never produces two owners for a shard.
+    pub fn with_preferences(
+        shard_count: u32,
+        members: &[NodeId],
+        preferences: &BTreeMap<ShardId, NodeId>,
+        term: Term,
+    ) -> Self {
+        let mut members: Vec<NodeId> = members.to_vec();
+        members.sort_unstable();
+        members.dedup();
+
+        let mut assignments = BTreeMap::new();
+        if members.is_empty() {
+            return Self { term, assignments };
+        }
+        let mut rr = 0usize;
+        for s in 0..shard_count {
+            let shard = ShardId(s);
+            let owner = match preferences.get(&shard) {
+                Some(pref) if members.contains(pref) => *pref,
+                _ => {
+                    let owner = members[rr % members.len()];
+                    rr += 1;
+                    owner
+                }
+            };
+            assignments.insert(shard, owner);
+        }
+        Self { term, assignments }
+    }
+
     /// Shards assigned to `node`.
     pub fn shards_for(&self, node: NodeId) -> Vec<ShardId> {
         self.assignments
@@ -121,6 +156,30 @@ mod tests {
         let p = Placement::balanced(8, &[1, 2, 3], 1);
         assert_eq!(p.leaders(), vec![1, 2, 3]);
         assert_eq!(p.assignments.len(), 8);
+    }
+
+    #[test]
+    fn a_preference_places_a_shard_and_the_rest_stay_balanced() {
+        // Shard 3 pinned to node 3; every shard still has exactly one owner, the pin is honoured,
+        // and the others spread over all members.
+        let prefs = BTreeMap::from([(ShardId(3), 3)]);
+        let p = Placement::with_preferences(6, &[1, 2, 3], &prefs, 1);
+        assert_eq!(
+            p.owner(ShardId(3)),
+            Some(3),
+            "the preference was not honoured"
+        );
+        assert_eq!(p.assignments.len(), 6);
+        assert_eq!(p.leaders(), vec![1, 2, 3], "the rest should still spread");
+
+        // A preference for an INELIGIBLE node (5 is not a member) is ignored — the shard falls back
+        // to balance rather than being assigned to a node that is not there.
+        let prefs = BTreeMap::from([(ShardId(0), 5)]);
+        let p = Placement::with_preferences(6, &[1, 2, 3], &prefs, 1);
+        assert!(
+            p.owner(ShardId(0)).is_some_and(|o| [1, 2, 3].contains(&o)),
+            "an ineligible preference should fall back to a real member"
+        );
     }
 
     #[test]

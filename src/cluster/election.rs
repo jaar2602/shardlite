@@ -127,6 +127,11 @@ pub struct HeartbeatReply {
     /// itself has no view of node-level operator state). Defaults false for older peers.
     #[serde(default)]
     pub cordoned: bool,
+    /// Shards this node is the operator-preferred host for. The coordinator honours these in
+    /// placement when the replier is eligible (see `Placement::with_preferences`). Empty by
+    /// default; set alongside `cordoned` in `handle_heartbeat`.
+    #[serde(default)]
+    pub prefers: Vec<u32>,
 }
 
 /// What the caller must do as a result of a state change. Returned rather than performed, so
@@ -416,6 +421,7 @@ impl Election {
                 term: current,
                 ok: false,
                 cordoned: false,
+                prefers: Vec::new(),
             });
         }
 
@@ -436,6 +442,7 @@ impl Election {
             term: self.terms.term(),
             ok: true,
             cordoned: false,
+            prefers: Vec::new(),
         })
     }
 
@@ -793,6 +800,7 @@ mod tests {
             term: 1,
             ok: true,
             cordoned: false,
+            prefers: Vec::new(),
         };
         let mut t = t0;
         for _ in 0..30 {
