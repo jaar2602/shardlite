@@ -1166,49 +1166,92 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 Ok(value) => value,
                 Err(message) => return respond::error(request, 400, message),
             };
-            let Some(turns) = body.get("messages").and_then(Value::as_array) else {
-                return respond::error(request, 400, "expected { messages: [{role, content}, …] }");
-            };
-            // Only user/assistant text turns from the client; the system prompt is added server-side,
-            // and tool messages are never accepted from the client.
-            let mut messages = vec![crate::assistant::provider::Message::system(
-                crate::assistant::system_prompt(),
-            )];
-            for turn in turns {
-                let (Some(role), Some(content)) = (
-                    turn.get("role").and_then(Value::as_str),
-                    turn.get("content").and_then(Value::as_str),
-                ) else {
-                    continue;
-                };
-                if role == "user" || role == "assistant" {
-                    messages.push(crate::assistant::provider::Message::plain(role, content));
-                }
-            }
+            use crate::assistant::{self, Harness, ToolExecutor, TurnResult, provider::Message};
 
-            let provider = crate::assistant::provider::OpenAiProvider::new(
+            let provider = assistant::provider::OpenAiProvider::new(
                 provider_cfg.base_url,
                 provider_cfg.api_key,
             );
             let executor = ProxyExecutor { resolved };
-            let harness = crate::assistant::Harness {
+            let harness = Harness {
                 provider: &provider,
                 model: provider_cfg.model,
                 max_tool_calls: provider_cfg.max_tool_calls,
-                tools: crate::assistant::tools_for(session.role),
+                tools: assistant::tools_for(session.role),
                 executor: &executor,
             };
-            match harness.run(messages) {
-                Ok(outcome) => {
+
+            // Two entry points: confirm a paused mutating action, or run a fresh turn.
+            let result = if let Some(confirm) = body.get("confirm") {
+                let action: assistant::PendingAction = match serde_json::from_value(
+                    confirm.get("action").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(a) => a,
+                    Err(_) => return respond::error(request, 400, "bad confirm.action"),
+                };
+                let resume: Vec<Message> = match serde_json::from_value(
+                    confirm.get("resume").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(m) => m,
+                    Err(_) => return respond::error(request, 400, "bad confirm.resume"),
+                };
+                // Permission parity on the confirm path too: the user's role must permit the tool
+                // being confirmed (a client can't smuggle a tool its role was never offered).
+                if !assistant::tools_for(session.role)
+                    .iter()
+                    .any(|t| t.spec.name == action.tool)
+                {
+                    return respond::error(request, 403, "you are not permitted that action");
+                }
+                let outcome = executor.execute(&action.tool, &action.arguments);
+                state.audit.record(
+                    Some(&session.user),
+                    "assistant.write",
+                    &format!("{name}: {}", action.summary),
+                    if outcome.is_ok() { "ok" } else { "failed" },
+                );
+                harness.resume(resume, &action, outcome)
+            } else {
+                let Some(turns) = body.get("messages").and_then(Value::as_array) else {
+                    return respond::error(
+                        request,
+                        400,
+                        "expected { messages: [...] } or { confirm: { action, resume } }",
+                    );
+                };
+                // Only user/assistant text turns from the client; the system prompt is added
+                // server-side, and tool messages are never accepted from the client.
+                let mut messages = vec![Message::system(assistant::system_prompt())];
+                for turn in turns {
+                    let (Some(role), Some(content)) = (
+                        turn.get("role").and_then(Value::as_str),
+                        turn.get("content").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    if role == "user" || role == "assistant" {
+                        messages.push(Message::plain(role, content));
+                    }
+                }
+                harness.run(messages)
+            };
+
+            match result {
+                Ok(TurnResult::Answer { answer, trace }) => {
                     state
                         .audit
                         .record(Some(&session.user), "assistant.chat", name, "ok");
-                    respond::respond_json(
-                        request,
-                        200,
-                        &json!({ "answer": outcome.answer, "trace": outcome.trace }),
-                    )
+                    respond::respond_json(request, 200, &json!({ "answer": answer, "trace": trace }))
                 }
+                Ok(TurnResult::Propose {
+                    pending,
+                    resume,
+                    trace,
+                }) => respond::respond_json(
+                    request,
+                    200,
+                    &json!({ "trace": trace, "pending": pending, "resume": resume }),
+                ),
                 Err(e) => {
                     state
                         .audit
@@ -1495,6 +1538,15 @@ impl crate::assistant::ToolExecutor for ProxyExecutor {
                 .and_then(Value::as_str)
                 .ok_or("run_query needs a 'sql' string argument")?;
             return crate::proxy::post_json_result(&self.resolved, "query_all", &json!({ "sql": sql }));
+        }
+        if name == "run_write" {
+            // Auto-routed write / DDL. /v1/run handles CREATE/ALTER/DROP (DDL reaches every shard)
+            // and keyed INSERT/UPDATE/DELETE. Only reached after a human confirmed the action.
+            let sql = args
+                .get("sql")
+                .and_then(Value::as_str)
+                .ok_or("run_write needs a 'sql' string argument")?;
+            return crate::proxy::post_json_result(&self.resolved, "run", &json!({ "sql": sql }));
         }
         Err(format!("unknown tool '{name}'"))
     }
