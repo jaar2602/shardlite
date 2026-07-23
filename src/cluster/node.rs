@@ -41,6 +41,15 @@ pub trait DurabilitySource: Send + Sync {
     fn durability(&self) -> Durability;
 }
 
+/// Wall-clock ms since the epoch, for display-only timestamps (not consensus logic — that uses
+/// `Instant`).
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Default)]
 struct Counters {
     elections_started: AtomicU64,
@@ -51,6 +60,12 @@ struct Counters {
     votes_granted: AtomicU64,
     votes_refused: AtomicU64,
     handover_failed: AtomicU64,
+    /// Placement applications that actually changed the map — i.e. shards moved. The core "how
+    /// often is the cluster reshuffling" signal: a healthy cluster reshuffles rarely (a node
+    /// joined/left); a rising rate means flapping links or an unstable leader.
+    placement_changes: AtomicU64,
+    /// Wall-clock ms of the last placement change, so an operator sees recency, not just a count.
+    last_change_ms: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +83,11 @@ pub struct ClusterStats {
     /// Placement changes whose file handover failed. Each one is a shard this node was told
     /// to lead and could not safely take, so it is still being led by nobody.
     pub handover_failed: u64,
+    /// Placement applications that moved shards. A high or rising rate means the cluster is
+    /// reshuffling too often — the "is this happening too frequently?" signal.
+    pub placement_changes: u64,
+    /// Wall-clock ms of the last placement change (0 if none yet).
+    pub last_change_ms: u64,
 }
 
 pub struct ClusterNode {
@@ -238,6 +258,8 @@ impl ClusterNode {
             votes_granted: self.counters.votes_granted.load(Ordering::Relaxed),
             votes_refused: self.counters.votes_refused.load(Ordering::Relaxed),
             handover_failed: self.counters.handover_failed.load(Ordering::Relaxed),
+            placement_changes: self.counters.placement_changes.load(Ordering::Relaxed),
+            last_change_ms: self.counters.last_change_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -276,6 +298,13 @@ impl ClusterNode {
             }
             *current = p.clone();
         }
+        // A real reshuffle: record it and when, so operators can see how often shards move.
+        self.counters
+            .placement_changes
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_change_ms
+            .store(unix_millis(), Ordering::Relaxed);
         tracing::info!(
             node = self.id,
             term = p.term,

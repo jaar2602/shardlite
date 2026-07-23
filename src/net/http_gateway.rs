@@ -1297,6 +1297,7 @@ impl HttpGateway {
                         "stepped_down": s.stepped_down, "heartbeats_sent": s.heartbeats_sent,
                         "peer_unreachable": s.peer_unreachable, "votes_granted": s.votes_granted,
                         "votes_refused": s.votes_refused, "handover_failed": s.handover_failed,
+                        "placement_changes": s.placement_changes, "last_change_ms": s.last_change_ms,
                     },
                 })
             }
