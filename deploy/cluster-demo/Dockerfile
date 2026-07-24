@@ -3,7 +3,7 @@
 FROM rust:1-slim AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --features cli,http,json-tcp --bin shardlite
+RUN cargo build --release --features cli,http,json-tcp,s3 --bin shardlite
 
 FROM debian:stable-slim
 RUN apt-get update \

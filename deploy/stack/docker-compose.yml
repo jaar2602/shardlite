@@ -32,7 +32,7 @@ services:
       dockerfile: deploy/cluster-demo/Dockerfile
     command: >
       serve /data --shards 12
-      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure --s3-ready
       --node-id 1 --peers 2=node2:4600,3=node3:4600
     volumes: [node1-data:/data]
     ports: ["8081:8080"]
@@ -40,7 +40,7 @@ services:
     <<: *node
     command: >
       serve /data --shards 12
-      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure --s3-ready
       --node-id 2 --peers 1=node1:4600,3=node3:4600
     volumes: [node2-data:/data]
     ports: ["8082:8080"]
@@ -48,7 +48,7 @@ services:
     <<: *node
     command: >
       serve /data --shards 12
-      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure
+      --listen 0.0.0.0:4600 --http 0.0.0.0:8080 --http-insecure --s3-ready
       --node-id 3 --peers 1=node1:4600,2=node2:4600
     volumes: [node3-data:/data]
     ports: ["8083:8080"]
