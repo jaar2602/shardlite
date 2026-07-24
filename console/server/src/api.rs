@@ -1592,7 +1592,7 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         | ("GET", ["replication" | "config"])
         | ("GET", ["s3", "status"])
         | ("GET", ["schema", _]) => Some(Permission::Observe),
-        ("POST", ["query" | "query_all" | "route"]) => Some(Permission::Query),
+        ("POST", ["query" | "query_all" | "route" | "explain"]) => Some(Permission::Query),
         // /v1/run auto-routes and can write, so it needs write permission.
         ("POST", ["execute" | "tx" | "run"]) => Some(Permission::Write),
         // S3 archival config/snapshot/flush are operator actions (shardlite also requires Admin).

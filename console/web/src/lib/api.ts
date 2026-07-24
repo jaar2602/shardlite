@@ -573,6 +573,9 @@ export function conn(name: string) {
     ) =>
       streamQuery(b, sql, opts),
     queryAll: (sql: string, signal?: AbortSignal) => req<MaterializedQueryResult>("POST", `${b}/query_all`, { sql }, signal),
+    // Describe how a query would run across shards (without running it), so heavy central-execution
+    // plans can be highlighted before you run them.
+    explain: (sql: string, signal?: AbortSignal) => req<QueryPlan>("POST", `${b}/explain`, { sql }, signal),
     // Auto-routed: the server picks the shard(s) from the SQL, so no data key is needed. Used for
     // param-less writes; a write returns the affected count.
     run: (sql: string) => req<{ rows_affected: number; last_insert_rowid: number }>("POST", `${b}/run`, { sql }),
@@ -654,6 +657,14 @@ export interface S3Status {
     last_snapshot_ms: number;
     last_archived_lsn: number;
   }> | null;
+}
+
+// How a read query will run across shards, from POST /v1/explain (via the console proxy).
+export interface QueryPlan {
+  supported: boolean;
+  strategy: string;
+  note: string;
+  heavy: boolean;
 }
 
 export interface S3Connection {

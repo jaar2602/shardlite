@@ -60,6 +60,7 @@ export default function SqlEditor({ name }: { name: string }) {
   const [busyLabel, setBusyLabel] = useState("Running…");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
+  const [queryPlan, setQueryPlan] = useState<api.QueryPlan | null>(null);
   const [results, setResults] = useState<ResultSet[]>([]);
   const [activeResult, setActiveResult] = useState<number | null>(null);
   const [schemaReview, setSchemaReview] = useState<SchemaReview | null>(null);
@@ -104,6 +105,21 @@ export default function SqlEditor({ name }: { name: string }) {
   const writePlan = analysis.plan?.kind === "write" || analysis.plan?.kind === "transaction";
   const targetedRead = readPlan && (targetReads || parameterCount > 0);
   const needsRoute = writePlan || targetedRead;
+
+  // Ask the cluster how a single read statement would run across shards, so a heavy central
+  // execution is flagged before it runs. Debounced, best-effort, and only when not routed to one
+  // shard (a single-shard read has no cross-shard plan to warn about).
+  const explainSql = readPlan && analysis.statements.length === 1 && !targetedRead
+    ? analysis.statements[0].sql
+    : null;
+  useEffect(() => {
+    if (!explainSql || !explainSql.trim()) { setQueryPlan(null); return; }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      api.conn(name).explain(explainSql, controller.signal).then(setQueryPlan).catch(() => { /* best-effort; Run surfaces real errors */ });
+    }, 400);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [explainSql, name]);
   const loadedSaved = saved.find((item) => item.id === activeSavedId);
   const dirty = loadedSaved ? loadedSaved.sql !== sql : false;
 
@@ -558,6 +574,11 @@ export default function SqlEditor({ name }: { name: string }) {
             </Select>
           </div>
           <Tag tone={planTone(analysis.plan)}>{analysis.plan ? planLabel(analysis.plan) : "Check SQL"}</Tag>
+          {explainSql && queryPlan && (
+            <Tag tone={!queryPlan.supported ? "red" : queryPlan.heavy ? "yellow" : "gray"}>
+              <span title={queryPlan.note}>{queryPlan.heavy ? "⚠ " : ""}{queryPlan.strategy}</span>
+            </Tag>
+          )}
           {needsRoute && <input
             aria-label="Data key"
             className="min-w-40 max-w-64 flex-1 border-b border-carbon-text-3 bg-carbon-field px-3 py-2 text-sm outline-none focus:border-carbon-blue"
