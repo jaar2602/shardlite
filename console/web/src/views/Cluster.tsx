@@ -18,7 +18,16 @@ function asId(value: string | number | null | undefined): string | null {
 }
 
 function topologyNodes(snapshot: Snapshot): TopologyNode[] {
-  const { cluster, connection, info } = snapshot;
+  const { cluster, connection, info, observation } = snapshot;
+  // The topology below is one node's view of its peers, which can report a peer as "unknown" even
+  // when it is fine. But the console polls every seed directly, so a node whose own poll just
+  // succeeded is provably up — trust that over a peer's second-hand status.
+  const reachedIds = new Set(
+    observation.nodes
+      .filter((node) => !node.error && node.topology)
+      .map((node) => asId(node.topology?.node))
+      .filter((id): id is string => id !== null),
+  );
   const currentId = asId(cluster.node) ?? (cluster.clustered ? "this node" : connection?.name ?? "local");
   const leaderId = asId(cluster.leader);
   const assignments = { ...(cluster.placement?.assignments ?? {}) };
@@ -43,7 +52,7 @@ function topologyNodes(snapshot: Snapshot): TopologyNode[] {
       return {
         id,
         address: member?.address ?? (isCurrent ? connection?.url : null),
-        status: member?.status ?? (isCurrent ? "up" : "unknown"),
+        status: reachedIds.has(id) ? "up" : member?.status ?? (isCurrent ? "up" : "unknown"),
         role: isLeader ? "leader" : isCurrent ? cluster.role ?? "member" : "member",
         isLeader,
         isCurrent,
