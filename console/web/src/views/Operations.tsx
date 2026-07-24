@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, EmptyState, Page, PageHeader, Select, Spinner, StatCard, Tag } from "../components/ui";
+import { LegendDot, ShardTopology, type ShardCell, type TopologyNode } from "../components/ShardTopology";
 
 export default function Operations({ name }: { name: string }) {
   const { me } = useAuth();
@@ -77,6 +78,20 @@ function OperationDetail({ operation, showInternals, onCancel }: { operation: ap
   const versions = groupVersions(operation.expected_versions);
   const mayCancel = operation.status === "queued" || (operation.status === "running" && operation.stage === "revalidating_preflight");
   const succeeded = operation.outcomes.filter((outcome) => outcome.ok).length;
+  const outcomeByShard = new Map(operation.outcomes.map((outcome) => [outcome.shard, outcome]));
+  const unitCells: ShardCell[] = Array.from(new Set([
+    ...operation.expected_versions.map((version) => version.shard),
+    ...operation.outcomes.map((outcome) => outcome.shard),
+  ])).sort((a, b) => a - b).map((shard) => {
+    const outcome = outcomeByShard.get(shard);
+    const status = outcome ? (outcome.ok ? "applied" : "rejected") : "pending";
+    return {
+      shard,
+      tone: outcome ? (outcome.ok ? "green" : "red") : "gray",
+      title: `unit ${shard} · ${status}${outcome?.error ? ` · ${outcome.error}` : ""}`,
+    };
+  });
+  const unitNodes: TopologyNode[] = [{ id: "database", shards: unitCells }];
   return <Card title={<span>{shortId(operation.id)} <StatusTag status={operation.status} /></span>} actions={mayCancel && <Button variant="danger" onClick={onCancel}>Cancel before execution</Button>}>
     <div className="space-y-4">
       {(operation.status === "partial" || operation.status === "interrupted") && <Banner tone="error">{operation.status === "partial" ? "The schema update was applied to only part of the database. Review the technical evidence and roll forward deliberately." : "The console restarted while this operation was in flight. It was not replayed. Verify the database schema before taking another action."}</Banner>}
@@ -92,6 +107,10 @@ function OperationDetail({ operation, showInternals, onCancel }: { operation: ap
       </dl>
       <div><div className="mb-2 text-xs font-semibold">Approved SQL</div><pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-carbon-border bg-carbon-field p-3 font-mono text-xs">{operation.sql}</pre></div>
       <div className="border border-carbon-border bg-carbon-layer2 p-3 text-xs"><span className="text-carbon-text-3">Database application</span><span className="ml-3 font-mono">{operation.outcomes.length ? `${succeeded}/${operation.outcomes.length} internal steps applied` : "waiting"}</span></div>
+      {(operation.expected_versions.length > 0 || operation.outcomes.length > 0) && <div>
+        <div className="mb-2 text-xs font-semibold">Per-unit application</div>
+        <ShardTopology nodes={unitNodes} legend={<><LegendDot tone="green">applied</LegendDot><LegendDot tone="red">rejected</LegendDot><LegendDot tone="gray">pending</LegendDot></>} />
+      </div>}
       {showInternals && <details className="border border-carbon-border"><summary className="cursor-pointer px-3 py-2 text-xs font-semibold">Storage internals</summary><div className="space-y-3 border-t border-carbon-border p-3"><div><div className="mb-2 text-xs font-semibold">Approved schema versions</div>{versions.map((group) => <p key={group.version} className="font-mono text-xs text-carbon-text-3">v{group.version}: units {compact(group.shards)}</p>)}</div>{operation.outcomes.length > 0 && <DataTable columns={["Unit", "Result", "Error"]} rows={operation.outcomes.map((outcome) => [outcome.shard, <Tag tone={outcome.ok ? "green" : "red"}>{outcome.ok ? "applied" : "rejected"}</Tag>, outcome.error ?? "—"])} />}</div></details>}
       {operation.status === "running" && operation.stage === "executing_on_shardlite" && <Banner tone="info">ShardLite is applying the rollout. Cancellation is no longer safe because part of the database may already have changed.</Banner>}
     </div>

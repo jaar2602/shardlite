@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
+import { LegendDot, ShardTopology, groupByOwner } from "../components/ShardTopology";
 
 function field(record: Record<string, unknown>, key: string): string {
   const value = record[key];
@@ -17,6 +18,8 @@ export default function Replication({ name }: { name: string }) {
   const canOperate = api.permits(me?.role, "operate");
   const [replication, setReplication] = useState<api.ReplicationStatus | null>(null);
   const [s3, setS3] = useState<api.S3Status | null>(null);
+  const [inventory, setInventory] = useState<api.ShardInventory | null>(null);
+  const [view, setView] = useState<"table" | "topology">("table");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -24,9 +27,10 @@ export default function Replication({ name }: { name: string }) {
   const load = useCallback(async () => {
     try {
       const c = api.conn(name);
-      const [rep, status] = await Promise.all([c.replication(), c.s3.status()]);
+      const [rep, status, inv] = await Promise.all([c.replication(), c.s3.status(), c.shardInventory().catch(() => null)]);
       setReplication(rep);
       setS3(status);
+      setInventory(inv);
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Replication status could not be loaded.");
@@ -62,6 +66,11 @@ export default function Replication({ name }: { name: string }) {
   const columns = ["shard", ...shardKeys.filter((key) => key !== "shard")];
   const acks = replication?.acks;
   const s3Shards = s3?.shards ?? [];
+  const topologyNodes = groupByOwner(inventory?.rows ?? [], (row) => ({
+    tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
+    label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
+    title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
+  }));
 
   return (
     <Page>
@@ -81,12 +90,19 @@ export default function Replication({ name }: { name: string }) {
         <StatCard label="Ack wait" value={acks ? `${acks.waited_us} µs` : "—"} />
       </div>
 
-      <Card title="Per-shard replication">
-        <DataTable
-          columns={columns.map((key) => key.replace(/_/g, " "))}
-          empty="No replication evidence reported."
-          rows={shards.map((row) => columns.map((key) => field(row, key)))}
-        />
+      <Card title="Per-shard replication" actions={<ViewToggle view={view} onChange={setView} />}>
+        {view === "topology" ? (
+          <ShardTopology
+            nodes={topologyNodes}
+            legend={<><LegendDot tone="green">healthy</LegendDot><LegendDot tone="yellow">lagging</LegendDot><LegendDot tone="red">unavailable/degraded</LegendDot></>}
+          />
+        ) : (
+          <DataTable
+            columns={columns.map((key) => key.replace(/_/g, " "))}
+            empty="No replication evidence reported."
+            rows={shards.map((row) => columns.map((key) => field(row, key)))}
+          />
+        )}
       </Card>
 
       <Card
@@ -121,6 +137,18 @@ export default function Replication({ name }: { name: string }) {
         </div>}
       </Card>
     </Page>
+  );
+}
+
+function ViewToggle({ view, onChange }: { view: "table" | "topology"; onChange: (v: "table" | "topology") => void }) {
+  return (
+    <div className="inline-flex overflow-hidden border border-carbon-border">
+      {(["table", "topology"] as const).map((o) => (
+        <button key={o} type="button" onClick={() => onChange(o)} className={`px-3 py-1 text-xs ${view === o ? "bg-carbon-blue text-white" : "bg-carbon-layer text-carbon-text-2 hover:bg-carbon-field"}`}>
+          {o === "table" ? "Table" : "Topology"}
+        </button>
+      ))}
+    </div>
   );
 }
 

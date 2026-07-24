@@ -12,6 +12,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Spinner, Tag } from "../components/ui";
+import { LegendDot, ShardTopology, type ShardCell, type TopologyNode } from "../components/ShardTopology";
 
 // The view has three layers over the same set of tables:
 //   erd      — the logical schema: tables + foreign-key relationships.
@@ -288,6 +289,29 @@ function ShardLayer({
     [placement],
   );
   const withS3 = layer === "shard-s3";
+  const [view, setView] = useState<"table" | "topology">("table");
+
+  // Group the selected table's placement rows by their owning node. Placement rows don't carry an
+  // owner, so it's resolved through ownerByShard rather than groupByOwner.
+  const topologyNodes = useMemo<TopologyNode[]>(() => {
+    const byOwner = new Map<string, ShardCell[]>();
+    for (const sh of placement?.shards ?? []) {
+      const owner = ownerByShard.get(sh.shard) ?? "unassigned";
+      const archived = withS3 ? s3ByShard.get(sh.shard) : undefined;
+      const list = byOwner.get(owner) ?? [];
+      list.push({
+        shard: sh.shard,
+        tone: sh.rows == null ? "gray" : archived ? "green" : "blue",
+        label: sh.rows == null ? "—" : sh.rows.toLocaleString(),
+        title: `shard ${sh.shard} · ${sh.rows ?? "?"} rows${withS3 ? (archived ? ` · S3 lsn ${archived.last_snapshot_lsn}` : " · not archived") : ""}`,
+      });
+      byOwner.set(owner, list);
+    }
+    return Array.from(byOwner, ([id, shards]) => ({
+      id,
+      shards: shards.sort((a, b) => a.shard - b.shard),
+    })).sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
+  }, [placement, ownerByShard, s3ByShard, withS3]);
 
   return (
     <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">
@@ -309,6 +333,7 @@ function ShardLayer({
             {placement.total_rows.toLocaleString()} rows across {placement.shard_count} shards
           </span>
         )}
+        <div className="ml-auto"><ViewToggle view={view} onChange={setView} /></div>
       </div>
 
       {withS3 && s3 && !s3.supported && (
@@ -324,6 +349,12 @@ function ShardLayer({
       {busy && !placement ? (
         <Spinner label="Counting rows per shard…" />
       ) : placement ? (
+        view === "topology" ? (
+          <ShardTopology
+            nodes={topologyNodes}
+            legend={<><LegendDot tone="blue">has rows</LegendDot>{withS3 && <LegendDot tone="green">archived</LegendDot>}<LegendDot tone="gray">empty</LegendDot></>}
+          />
+        ) : (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
           {placement.shards.map((sh) => {
             const owner = ownerByShard.get(sh.shard);
@@ -359,9 +390,22 @@ function ShardLayer({
             );
           })}
         </div>
+        )
       ) : (
         <p className="text-sm text-carbon-text-3">Select a table to see where its rows live.</p>
       )}
+    </div>
+  );
+}
+
+function ViewToggle({ view, onChange }: { view: "table" | "topology"; onChange: (v: "table" | "topology") => void }) {
+  return (
+    <div className="inline-flex overflow-hidden border border-carbon-border">
+      {(["table", "topology"] as const).map((o) => (
+        <button key={o} type="button" onClick={() => onChange(o)} className={`px-3 py-1 text-xs ${view === o ? "bg-carbon-blue text-white" : "bg-carbon-layer text-carbon-text-2 hover:bg-carbon-field"}`}>
+          {o === "table" ? "Table" : "Topology"}
+        </button>
+      ))}
     </div>
   );
 }

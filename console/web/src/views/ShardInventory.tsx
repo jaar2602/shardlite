@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
+import { LegendDot, ShardTopology, groupByOwner } from "../components/ShardTopology";
 
 export default function ShardInventory({ name }: { name: string }) {
   const { me } = useAuth();
@@ -14,6 +15,7 @@ export default function ShardInventory({ name }: { name: string }) {
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const [view, setView] = useState<"table" | "topology">("table");
   const [scrollTop, setScrollTop] = useState(0);
   const load = useCallback(async () => {
     try {
@@ -36,6 +38,11 @@ export default function ShardInventory({ name }: { name: string }) {
     !filter || String(row.id).includes(filter) || (row.owner ?? "").toLowerCase().includes(filter.toLowerCase()) || row.state.includes(filter.toLowerCase()),
   ), [filter, rows]);
   const selected = rows.find((row) => row.id === selectedId);
+  const topologyNodes = useMemo(() => groupByOwner(rows, (row) => ({
+    tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
+    label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
+    title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
+  })), [rows]);
   const unavailable = rows.filter((row) => row.state === "unavailable").length;
   const lagging = rows.filter((row) => (row.max_lag ?? 0) > 0).length;
   const rowHeight = 42;
@@ -75,7 +82,15 @@ export default function ShardInventory({ name }: { name: string }) {
     </div>
     <div className="grid items-start gap-3 2xl:grid-cols-[minmax(680px,1fr)_22rem]">
       <section>
-        <div className="mb-3 flex flex-wrap items-end justify-between gap-3"><div className="w-full max-w-sm"><TextInput label="Find a storage unit" placeholder="Unit ID, owner, or state" value={filter} onChange={(event) => { setFilter(event.target.value); setScrollTop(0); }} /></div><span className="font-mono text-xs text-carbon-text-3">showing {filtered.length} of {rows.length}</span></div>
+        <div className="mb-3 flex flex-wrap items-end justify-between gap-3"><div className="w-full max-w-sm"><TextInput label="Find a storage unit" placeholder="Unit ID, owner, or state" value={filter} onChange={(event) => { setFilter(event.target.value); setScrollTop(0); }} /></div><div className="flex items-center gap-3"><span className="font-mono text-xs text-carbon-text-3">showing {filtered.length} of {rows.length}</span><ViewToggle view={view} onChange={setView} /></div></div>
+        {view === "topology" ? (
+          <ShardTopology
+            nodes={topologyNodes}
+            selected={selectedId}
+            onSelect={(shard) => { setSelectedId(shard); setWal(null); setMaintenance(null); }}
+            legend={<><LegendDot tone="green">healthy</LegendDot><LegendDot tone="yellow">lagging</LegendDot><LegendDot tone="red">unavailable/degraded</LegendDot></>}
+          />
+        ) : (
         <div className="overflow-x-auto border border-carbon-border text-xs">
           <div className="min-w-[860px]">
             <div className="grid grid-cols-[80px_1fr_90px_110px_1.2fr_90px_110px] bg-carbon-layer2 px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-carbon-text-2"><span>Unit</span><span>Primary node</span><span>Epoch</span><span>Primary LSN</span><span>Replicas</span><span>Max lag</span><span>State</span></div>
@@ -91,6 +106,7 @@ export default function ShardInventory({ name }: { name: string }) {
             </div>
           </div>
         </div>
+        )}
       </section>
       <Card title={selected ? `Storage unit ${selected.id}` : "Storage unit"}>
         {!selected ? <p className="text-sm text-carbon-text-3">No storage evidence is available.</p> : <div className="space-y-3 text-xs">
@@ -115,4 +131,16 @@ export default function ShardInventory({ name }: { name: string }) {
 
 function Diagnostic({ label, value }: { label: string; value: React.ReactNode }) {
   return <div className="flex items-start justify-between gap-4 border-b border-carbon-border pb-2"><span className="text-carbon-text-3">{label}</span><span className="text-right font-mono">{value}</span></div>;
+}
+
+function ViewToggle({ view, onChange }: { view: "table" | "topology"; onChange: (v: "table" | "topology") => void }) {
+  return (
+    <div className="inline-flex overflow-hidden border border-carbon-border">
+      {(["table", "topology"] as const).map((o) => (
+        <button key={o} type="button" onClick={() => onChange(o)} className={`px-3 py-1 text-xs ${view === o ? "bg-carbon-blue text-white" : "bg-carbon-layer text-carbon-text-2 hover:bg-carbon-field"}`}>
+          {o === "table" ? "Table" : "Topology"}
+        </button>
+      ))}
+    </div>
+  );
 }
