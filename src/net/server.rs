@@ -1006,6 +1006,14 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
         // and its per-shard results are reported individually, because there is no atomicity
         // across shards and pretending otherwise would hide a partial application.
         Request::ExecuteAll { statement } => {
+            // Fail the whole roll fast, with a clear message, on a form no shard could honour (e.g.
+            // an unsupported ALTER) rather than letting each shard return a bare SQLite syntax error.
+            if let Err(e) = crate::db::reject_unsupported(&statement.sql) {
+                let outcomes = (0..shards.shard_count())
+                    .map(|s| (s, ShardOutcome::Rejected(e.to_string())))
+                    .collect();
+                return Response::AllShards { outcomes };
+            }
             let mut outcomes = Vec::new();
             for s in 0..shards.shard_count() {
                 let shard = ShardId(s);

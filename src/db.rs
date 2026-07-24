@@ -193,10 +193,138 @@ pub(crate) fn reject_unsupported(sql: &str) -> Result<()> {
              Use the maintenance path instead — `.vacuum` in the shell, or \
              ShardManager::vacuum."
         }
+        // ALTER TABLE with a form SQLite does not support (a MySQL/Postgres habit). SQLite would
+        // reject it with a bare "near \"MODIFY\": syntax error"; give the actual limitation and the
+        // recreate-table workaround instead.
+        "ALTER" => match alter_unsupported_reason(sql) {
+            Some(reason) => reason,
+            None => return Ok(()),
+        },
         _ => return Ok(()),
     };
     Err(Error::Unsupported(format!(
         "{}: {reason}",
         first_keyword(sql)
     )))
+}
+
+const ALTER_LIMITATION: &str =
+    "SQLite's ALTER TABLE supports only RENAME TO, RENAME COLUMN, ADD COLUMN and DROP COLUMN — not \
+     MODIFY/CHANGE/ALTER COLUMN, and not ADD CONSTRAINT/PRIMARY KEY/FOREIGN KEY/UNIQUE/CHECK/INDEX. \
+     To change a column's type or default, or add/drop a constraint or the primary key, recreate \
+     the table: CREATE a new table with the schema you want, INSERT ... SELECT the rows across, DROP \
+     the old table, then ALTER TABLE ... RENAME the new one into place";
+
+/// If `sql` is an `ALTER TABLE` whose action SQLite cannot perform, the limitation to report;
+/// `None` for the four forms SQLite supports (RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN).
+///
+/// Checks the action keyword at its position (after `ALTER TABLE [IF EXISTS] <name>`) rather than
+/// scanning the whole statement, so a column merely *named* `modify`/`change` is not misread.
+fn alter_unsupported_reason(sql: &str) -> Option<&'static str> {
+    let tokens = ddl_tokens(sql);
+    if tokens.first().map(String::as_str) != Some("ALTER")
+        || tokens.get(1).map(String::as_str) != Some("TABLE")
+    {
+        return None;
+    }
+    // SQLite's ALTER TABLE is `ALTER TABLE <name> <action> …` — no IF EXISTS, and (ATTACH being
+    // refused) no schema-qualified name. So the name is one token and the action is the next.
+    match tokens.get(3).map(String::as_str)? {
+        "RENAME" | "DROP" => None,
+        "ADD" => match tokens.get(4).map(String::as_str) {
+            Some("CONSTRAINT" | "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK" | "INDEX" | "KEY") => {
+                Some(ALTER_LIMITATION)
+            }
+            _ => None, // ADD [COLUMN] <column-def>
+        },
+        _ => Some(ALTER_LIMITATION), // MODIFY, CHANGE, ALTER, …
+    }
+}
+
+/// Upper-cased identifier/keyword tokens outside string and identifier quotes — a crude tokenizer
+/// for the DDL guards. A quoted identifier (`"…"`, `` `…` ``, `[…]`) collapses to one placeholder so
+/// token positions (the table name after `ALTER TABLE`, the action after it) stay stable; a string
+/// literal (`'…'`) contributes nothing.
+fn ddl_tokens(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '\'' | '"' | '`' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] as char != c {
+                    i += 1;
+                }
+                i += 1; // past the closing quote
+                if c != '\'' {
+                    tokens.push("\0".to_string()); // a quoted identifier is a name token
+                }
+            }
+            '[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] as char != ']' {
+                    i += 1;
+                }
+                i += 1;
+                tokens.push("\0".to_string());
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] as char == '_')
+                {
+                    i += 1;
+                }
+                tokens.push(sql[start..i].to_ascii_uppercase());
+            }
+            _ => i += 1,
+        }
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod alter_tests {
+    use super::{alter_unsupported_reason, reject_unsupported};
+
+    #[test]
+    fn sqlite_supported_alter_forms_pass() {
+        for sql in [
+            "ALTER TABLE t ADD COLUMN b INTEGER",
+            "ALTER TABLE t ADD b INTEGER",
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t DROP b",
+            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t RENAME COLUMN a TO a2",
+            "ALTER TABLE \"my table\" ADD COLUMN x INT",
+            // A column literally named after a foreign keyword must NOT trip the guard.
+            "ALTER TABLE t ADD COLUMN modify TEXT",
+            "ALTER TABLE t ADD change TEXT",
+            // A table named after a keyword is fine.
+            "ALTER TABLE modify ADD COLUMN x INT",
+        ] {
+            assert!(alter_unsupported_reason(sql).is_none(), "should be supported: {sql}");
+            assert!(reject_unsupported(sql).is_ok(), "should be allowed: {sql}");
+        }
+    }
+
+    #[test]
+    fn foreign_alter_forms_are_refused_with_guidance() {
+        for sql in [
+            "ALTER TABLE t MODIFY COLUMN a VARCHAR(50)",
+            "ALTER TABLE t CHANGE a a2 TEXT",
+            "ALTER TABLE t ALTER COLUMN b SET DEFAULT 0",
+            "ALTER TABLE t ADD CONSTRAINT chk CHECK (b > 0)",
+            "ALTER TABLE t ADD PRIMARY KEY (a)",
+            "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES u(id)",
+            "ALTER TABLE t ADD UNIQUE (a)",
+            "ALTER TABLE t ADD INDEX idx (a)",
+        ] {
+            assert!(alter_unsupported_reason(sql).is_some(), "should be refused: {sql}");
+            let err = reject_unsupported(sql).unwrap_err().to_string();
+            assert!(err.contains("recreate the table"), "message should guide the fix: {err}");
+        }
+    }
 }
