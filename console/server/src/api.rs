@@ -30,6 +30,7 @@ pub struct AppState {
     pub ai: Arc<crate::ai::AiConfig>,
     pub reports: Arc<crate::reports::Reports>,
     pub dashboards: Arc<crate::reports::Dashboards>,
+    pub s3conns: Arc<crate::s3conns::S3Connections>,
     pub login_limiter: LoginLimiter,
     pub secure_cookie: bool,
     pub streams: StreamSlots,
@@ -1158,6 +1159,112 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             match crate::database::table_placement(&state.registry, name, table) {
                 Ok(placement) => respond::respond_json(request, 200, &placement),
                 Err(error) => respond::error(request, 502, &error),
+            }
+        }
+
+        // --- Saved S3 connections (persisted, secret sealed) ---
+        ("GET", ["s3-connections"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "s3conn.read", "s3-connections");
+            }
+            respond::respond_json(request, 200, &json!(state.s3conns.list()))
+        }
+        ("POST", ["s3-connections"]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(request, state, &session, Permission::Operate, "s3conn.create", "s3-connections");
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let secret = v.get("secret_key").and_then(Value::as_str).map(str::to_string);
+            match state.s3conns.create(
+                &s("name"), &s("bucket"), &s("endpoint"), &s("region"), &s("prefix"), &s("access_key"),
+                secret, &session.user,
+            ) {
+                Ok(view) => {
+                    state.audit.record(Some(&session.user), "s3conn.create", &view.id, "ok");
+                    respond::respond_json(request, 201, &json!(view))
+                }
+                Err(error) => respond::error(request, 400, &error),
+            }
+        }
+        ("PUT", ["s3-connections", id]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(request, state, &session, Permission::Operate, "s3conn.update", id);
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let secret = v.get("secret_key").and_then(Value::as_str).map(str::to_string);
+            match state.s3conns.update(
+                id, &s("name"), &s("bucket"), &s("endpoint"), &s("region"), &s("prefix"), &s("access_key"), secret,
+            ) {
+                Ok(view) => {
+                    state.audit.record(Some(&session.user), "s3conn.update", id, "ok");
+                    respond::respond_json(request, 200, &json!(view))
+                }
+                Err(error) => respond::error(request, 400, &error),
+            }
+        }
+        ("DELETE", ["s3-connections", id]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(request, state, &session, Permission::Operate, "s3conn.delete", id);
+            }
+            match state.s3conns.delete(id) {
+                Ok(()) => {
+                    state.audit.record(Some(&session.user), "s3conn.delete", id, "ok");
+                    respond::respond_json(request, 200, &json!({ "ok": true }))
+                }
+                Err(error) => respond::error(request, 404, &error),
+            }
+        }
+        // Activate a saved S3 connection onto this cluster: decrypt it and push to /v1/s3/config.
+        ("POST", ["connections", name, "s3-activate"]) => {
+            if !session.role.permits(Permission::Operate) {
+                return require(request, state, &session, Permission::Operate, "s3.activate", name);
+            }
+            let v = match json_body(&mut request) {
+                Ok(v) => v,
+                Err(message) => return respond::error(request, 400, message),
+            };
+            let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+            let Some(target) = state.s3conns.resolved(id) else {
+                return respond::error(request, 404, "no such S3 connection, or it has no secret key");
+            };
+            let mut body = serde_json::Map::new();
+            body.insert("enabled".into(), Value::Bool(true));
+            body.insert("bucket".into(), Value::String(target.bucket));
+            body.insert("access_key".into(), Value::String(target.access_key));
+            body.insert("secret_key".into(), Value::String(target.secret_key));
+            if !target.endpoint.is_empty() {
+                body.insert("endpoint".into(), Value::String(target.endpoint));
+            }
+            if !target.region.is_empty() {
+                body.insert("region".into(), Value::String(target.region));
+            }
+            if !target.prefix.is_empty() {
+                body.insert("prefix".into(), Value::String(target.prefix));
+            }
+            let outcome = state
+                .registry
+                .resolve(name)
+                .map_err(|error| error.to_string())
+                .and_then(|resolved| {
+                    crate::proxy::post_json_result(&resolved, "s3/config", &Value::Object(body))
+                });
+            match outcome {
+                Ok(value) => {
+                    state.audit.record(Some(&session.user), "s3.activate", name, "ok");
+                    respond::respond_json(request, 200, &value)
+                }
+                Err(error) => {
+                    state.audit.record(Some(&session.user), "s3.activate", name, "error");
+                    respond::error(request, 502, &error)
+                }
             }
         }
 

@@ -18,6 +18,7 @@ mod proxy;
 mod registry;
 mod reports;
 mod respond;
+mod s3conns;
 mod store;
 mod users;
 
@@ -113,6 +114,10 @@ fn run() -> Result<(), String> {
     )?);
     let reports = Arc::new(reports::Reports::open(&data_dir.join("reports.json"))?);
     let dashboards = Arc::new(reports::Dashboards::open(&data_dir.join("dashboards.json"))?);
+    let s3conns = Arc::new(s3conns::S3Connections::open(
+        &data_dir.join("s3conns.json"),
+        Sealer::from_passphrase(&key),
+    )?);
     let secure_cookie = env_bool("SHARDLITE_CONSOLE_SECURE_COOKIE", false);
 
     metrics::spawn(Arc::clone(&registry), Arc::clone(&metrics));
@@ -128,6 +133,7 @@ fn run() -> Result<(), String> {
         ai,
         reports,
         dashboards,
+        s3conns,
         login_limiter: LoginLimiter::new(),
         secure_cookie,
         streams: StreamSlots::new(query_streams),
