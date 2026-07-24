@@ -489,6 +489,13 @@ export interface SchemaTable {
   foreign_keys: unknown[][];
 }
 
+export interface TablePlacement {
+  table: string;
+  shard_count: number;
+  total_rows: number;
+  shards: { shard: number; rows: number | null }[];
+}
+
 export interface SchemaCatalog {
   objects: SchemaObject[];
   tables: SchemaTable[];
@@ -538,6 +545,9 @@ export function conn(name: string) {
     metrics: () => req<MetricSample[]>("GET", `${b}/metrics`),
     observation: () => req<ClusterObservation>("GET", `${b}/observation`),
     schemaCatalog: () => req<SchemaCatalog>("GET", `${b}/schema-catalog`),
+    // Per-shard row counts for one table — where its rows physically live across the shards.
+    tablePlacement: (table: string) =>
+      req<TablePlacement>("GET", `${b}/tables/${encodeURIComponent(table)}/placement`),
     verifyNode: (endpoint: string) => req<NodeVerification>("POST", `${b}/verify-node`, { endpoint }),
     shardInventory: () => req<ShardInventory>("GET", `${b}/shard-inventory`),
     meshUsers: {

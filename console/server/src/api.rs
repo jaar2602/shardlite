@@ -1130,6 +1130,24 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 None => respond::error(request, 404, "no such connection"),
             }
         }
+        // Per-shard row counts for one table — the "shard" layer of the ERD view: where a table's
+        // rows physically live across the shards.
+        ("GET", ["connections", name, "tables", table, "placement"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(
+                    request,
+                    state,
+                    &session,
+                    Permission::Observe,
+                    "table_placement.read",
+                    name,
+                );
+            }
+            match crate::database::table_placement(&state.registry, name, table) {
+                Ok(placement) => respond::respond_json(request, 200, &placement),
+                Err(error) => respond::error(request, 502, &error),
+            }
+        }
 
         // The AI assistant: run one turn of the harness against this connection. Read-only tools
         // execute automatically (through the same proxy + policy as the UI); the answer + tool trace

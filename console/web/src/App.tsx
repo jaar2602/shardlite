@@ -18,6 +18,7 @@ const WORKSPACE_LINKS: { path: string; label: string; short: string; permission:
   { path: "cluster", label: "Topology", short: "◇", permission: "observe" },
   { path: "query", label: "SQL editor", short: ">_", permission: "query" },
   { path: "schema", label: "Schema", short: "▤", permission: "observe" },
+  { path: "erd", label: "ERD", short: "⊞", permission: "observe" },
   { path: "replication", label: "Replication", short: "⇄", permission: "observe" },
   { path: "operations", label: "Operations", short: "↻", permission: "write" },
   { path: "storage-internals", label: "Storage internals", short: "≋", permission: "operate" },

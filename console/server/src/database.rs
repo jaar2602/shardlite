@@ -90,6 +90,71 @@ pub fn schema_catalog(registry: &Registry, connection: &str) -> Result<SchemaCat
     })
 }
 
+fn shard_count(resolved: &Resolved) -> Result<u32, String> {
+    let (info, _) = proxy::fetch_json_result(resolved, "info")?;
+    info.get("shard_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0 && *count <= 4096)
+        .map(|count| count as u32)
+        .ok_or_else(|| "database returned invalid storage metadata".to_string())
+}
+
+/// Where one table's rows physically live: a per-shard `count(*)`. Every shard carries the table's
+/// schema; only its rows are distributed (by PRIMARY-KEY hash), so this fans out a count to each
+/// shard and reports rows-per-shard (the data-skew picture the ERD "shard" layer draws).
+///
+/// The table name is validated against the live schema with a **bound parameter** before it is
+/// quoted into the count query — an unvalidated name must never be interpolated into SQL. A shard
+/// that errors contributes a `null` count rather than failing the whole view.
+pub fn table_placement(
+    registry: &Registry,
+    connection: &str,
+    table: &str,
+) -> Result<Value, String> {
+    let resolved = registry.resolve(connection).map_err(|error| error.to_string())?;
+    let count = shard_count(&resolved)?;
+
+    let name_param = Value::String(table.to_string());
+    let exists = (0..count).any(|unit| {
+        proxy::query_rows(
+            &resolved,
+            unit,
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name = ?",
+            std::slice::from_ref(&name_param),
+        )
+        .map(|(_, rows)| !rows.is_empty())
+        .unwrap_or(false)
+    });
+    if !exists {
+        return Err(format!("table '{table}' was not found in this database"));
+    }
+
+    // The name is now known to be a real table; quote it (escaping any embedded quote) for the count.
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let sql = format!("SELECT count(*) FROM {quoted}");
+    let mut shards = Vec::with_capacity(count as usize);
+    let mut total: i64 = 0;
+    for unit in 0..count {
+        let rows = match proxy::query_rows(&resolved, unit, &sql, &[]) {
+            Ok((_, rows)) => rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_i64),
+            Err(_) => None,
+        };
+        if let Some(n) = rows {
+            total += n;
+        }
+        shards.push(json!({ "shard": unit, "rows": rows }));
+    }
+    Ok(json!({
+        "table": table,
+        "shard_count": count,
+        "total_rows": total,
+        "shards": shards,
+    }))
+}
+
 fn table_details(
     resolved: &Resolved,
     unit: u32,
