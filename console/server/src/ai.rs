@@ -20,6 +20,10 @@ pub struct AiSettings {
     pub has_key: bool,
     /// Per-turn cap on tool calls; 0 means the default (8).
     pub max_tool_calls: u32,
+    /// Reasoning ("thinking") effort sent as `reasoning_effort` (e.g. low/medium/high). Empty means
+    /// "unset" — the parameter is omitted, so non-reasoning models are unaffected.
+    #[serde(default)]
+    pub reasoning_effort: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -28,6 +32,8 @@ struct Stored {
     model: String,
     enabled: bool,
     max_tool_calls: u32,
+    #[serde(default)]
+    reasoning_effort: String,
     sealed_key: Option<String>,
 }
 
@@ -38,6 +44,8 @@ pub struct ResolvedAi {
     pub model: String,
     pub api_key: String,
     pub max_tool_calls: u32,
+    /// `Some(effort)` to send `reasoning_effort`; `None` to omit it.
+    pub reasoning_effort: Option<String>,
 }
 
 pub struct AiConfig {
@@ -69,6 +77,7 @@ impl AiConfig {
             enabled: s.enabled,
             has_key: s.sealed_key.is_some(),
             max_tool_calls: s.max_tool_calls,
+            reasoning_effort: s.reasoning_effort.clone(),
         }
     }
 
@@ -92,6 +101,14 @@ impl AiConfig {
             } else {
                 s.max_tool_calls
             },
+            reasoning_effort: {
+                let effort = s.reasoning_effort.trim();
+                if effort.is_empty() {
+                    None
+                } else {
+                    Some(effort.to_string())
+                }
+            },
         })
     }
 
@@ -103,6 +120,7 @@ impl AiConfig {
         model: String,
         enabled: bool,
         max_tool_calls: u32,
+        reasoning_effort: String,
         api_key: Option<String>,
     ) -> Result<(), String> {
         let mut s = self.inner.write().unwrap();
@@ -110,6 +128,7 @@ impl AiConfig {
         s.model = model;
         s.enabled = enabled;
         s.max_tool_calls = max_tool_calls;
+        s.reasoning_effort = reasoning_effort;
         match api_key {
             Some(k) if k.is_empty() => s.sealed_key = None,
             Some(k) => s.sealed_key = Some(self.sealer.seal(k.as_bytes())),
@@ -152,6 +171,7 @@ mod tests {
             "gpt-4o".into(),
             true,
             0,
+            "high".into(),
             Some("sk-secret".into()),
         )
         .unwrap();
@@ -164,22 +184,25 @@ mod tests {
         let resolved = cfg.resolved().unwrap();
         assert_eq!(resolved.api_key, "sk-secret");
         assert_eq!(resolved.max_tool_calls, 8);
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
         assert!(cfg.settings().has_key);
+        assert_eq!(cfg.settings().reasoning_effort, "high");
 
-        // Editing with no key preserves it.
-        cfg.update("https://api.openai.com/v1".into(), "gpt-4o-mini".into(), true, 5, None)
+        // Editing with no key preserves it; an empty effort clears it (parameter omitted).
+        cfg.update("https://api.openai.com/v1".into(), "gpt-4o-mini".into(), true, 5, "".into(), None)
             .unwrap();
         let resolved = cfg.resolved().unwrap();
         assert_eq!(resolved.api_key, "sk-secret");
         assert_eq!(resolved.model, "gpt-4o-mini");
         assert_eq!(resolved.max_tool_calls, 5);
+        assert_eq!(resolved.reasoning_effort, None);
 
         // Reopening reads it back through the seal.
         let reopened = AiConfig::open(&path, Sealer::from_passphrase("test-key")).unwrap();
         assert_eq!(reopened.resolved().unwrap().api_key, "sk-secret");
 
         // Disabled → no resolved config.
-        cfg.update("https://api.openai.com/v1".into(), "gpt-4o".into(), false, 0, None)
+        cfg.update("https://api.openai.com/v1".into(), "gpt-4o".into(), false, 0, "".into(), None)
             .unwrap();
         assert!(cfg.resolved().is_none());
     }

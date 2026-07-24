@@ -88,12 +88,15 @@ export interface AiSettings {
   enabled: boolean;
   has_key: boolean;
   max_tool_calls: number;
+  // Thinking-mode effort sent as `reasoning_effort` (e.g. low/medium/high); "" = default (omitted).
+  reasoning_effort: string;
 }
 export interface AiConfigUpdate {
   base_url: string;
   model: string;
   enabled: boolean;
   max_tool_calls: number;
+  reasoning_effort: string;
   // Omit to preserve the stored key; "" clears it; a value seals a new one.
   api_key?: string;
 }

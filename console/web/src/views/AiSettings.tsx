@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import * as api from "../lib/api";
-import { Banner, Button, Card, Page, PageHeader, Spinner, TextInput } from "../components/ui";
+import { Banner, Button, Card, Page, PageHeader, Select, Spinner, TextInput } from "../components/ui";
 
 export default function AiSettings() {
   const [settings, setSettings] = useState<api.AiSettings | null>(null);
-  const [form, setForm] = useState<{ base_url: string; model: string; enabled: boolean; max_tool_calls: number; api_key: string }>({
+  const [form, setForm] = useState<{ base_url: string; model: string; enabled: boolean; max_tool_calls: number; reasoning_effort: string; api_key: string }>({
     base_url: "",
     model: "",
     enabled: false,
     max_tool_calls: 0,
+    reasoning_effort: "",
     api_key: "",
   });
   const [error, setError] = useState<string | null>(null);
@@ -19,7 +20,7 @@ export default function AiSettings() {
     try {
       const value = await api.getAiConfig();
       setSettings(value);
-      setForm({ base_url: value.base_url, model: value.model, enabled: value.enabled, max_tool_calls: value.max_tool_calls, api_key: "" });
+      setForm({ base_url: value.base_url, model: value.model, enabled: value.enabled, max_tool_calls: value.max_tool_calls, reasoning_effort: value.reasoning_effort, api_key: "" });
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
@@ -43,10 +44,11 @@ export default function AiSettings() {
         model: form.model,
         enabled: form.enabled,
         max_tool_calls: form.max_tool_calls,
+        reasoning_effort: form.reasoning_effort,
         ...(preserve ? {} : { api_key: form.api_key }),
       });
       setSettings(value);
-      setForm({ base_url: value.base_url, model: value.model, enabled: value.enabled, max_tool_calls: value.max_tool_calls, api_key: "" });
+      setForm({ base_url: value.base_url, model: value.model, enabled: value.enabled, max_tool_calls: value.max_tool_calls, reasoning_effort: value.reasoning_effort, api_key: "" });
       setMessage("Assistant settings saved.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to save");
@@ -93,6 +95,17 @@ export default function AiSettings() {
               value={form.max_tool_calls}
               onChange={(e) => setForm({ ...form, max_tool_calls: Number(e.target.value) })}
             />
+            <Select
+              label="Thinking effort (reasoning_effort)"
+              value={form.reasoning_effort}
+              onChange={(e) => setForm({ ...form, reasoning_effort: e.target.value })}
+            >
+              <option value="">Default — omit (non-reasoning models)</option>
+              <option value="minimal">Minimal</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </Select>
             <label className="flex items-center gap-2 self-end py-2 text-sm text-carbon-text md:col-span-2">
               <input
                 type="checkbox"

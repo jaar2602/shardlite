@@ -427,12 +427,24 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             let model = value["model"].as_str().unwrap_or("").trim().to_string();
             let enabled = value["enabled"].as_bool().unwrap_or(false);
             let max_tool_calls = value["max_tool_calls"].as_u64().unwrap_or(0) as u32;
+            let reasoning_effort = value["reasoning_effort"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             // preserve-on-omit: absent api_key keeps the stored one; "" clears it.
             let api_key = value
                 .get("api_key")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            match state.ai.update(base_url, model, enabled, max_tool_calls, api_key) {
+            match state.ai.update(
+                base_url,
+                model,
+                enabled,
+                max_tool_calls,
+                reasoning_effort,
+                api_key,
+            ) {
                 Ok(()) => {
                     state
                         .audit
@@ -1189,6 +1201,7 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             let provider = assistant::provider::OpenAiProvider::new(
                 provider_cfg.base_url,
                 provider_cfg.api_key,
+                provider_cfg.reasoning_effort,
             );
             let executor = AssistantExecutor {
                 resolved,

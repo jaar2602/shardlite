@@ -105,13 +105,20 @@ pub trait Provider: Send + Sync {
 pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
+    /// Sent as `reasoning_effort` when set (thinking-mode effort); omitted when `None`.
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
+            reasoning_effort,
         }
     }
 }
@@ -140,6 +147,9 @@ impl Provider for OpenAiProvider {
         if !tools_json.is_empty() {
             body["tools"] = Value::Array(tools_json);
             body["tool_choice"] = Value::String("auto".into());
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = Value::String(effort.clone());
         }
 
         let agent = ureq::AgentBuilder::new()
