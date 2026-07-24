@@ -11,7 +11,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import * as api from "../lib/api";
-import { Banner, Card, Spinner, Tag } from "../components/ui";
+import { Banner, Button, Card, Spinner, Tag } from "../components/ui";
 
 // The view has three layers over the same set of tables:
 //   erd      — the logical schema: tables + foreign-key relationships.
@@ -77,23 +77,26 @@ export default function Erd({ name }: { name: string }) {
   const [placementBusy, setPlacementBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Load the schema (+ shard/S3 context) once. The shard layers reuse inventory/s3 already fetched.
-  useEffect(() => {
-    let live = true;
+  // Load the schema (+ shard/S3 context). Also invoked by the Refresh button so a newly-added table
+  // or foreign key shows without a full page reload.
+  const [reloading, setReloading] = useState(false);
+  const load = useCallback(() => {
     const c = api.conn(name);
-    Promise.all([c.schemaCatalog(), c.shardInventory().catch(() => null), c.s3.status().catch(() => null)])
+    setReloading(true);
+    return Promise.all([c.schemaCatalog(), c.shardInventory().catch(() => null), c.s3.status().catch(() => null)])
       .then(([cat, inv, s3s]) => {
-        if (!live) return;
         setCatalog(cat);
         setInventory(inv);
         setS3(s3s);
         setSelected((prev) => prev ?? cat.tables[0]?.name ?? null);
+        setError(null);
       })
-      .catch((e) => live && setError(e instanceof Error ? e.message : "Failed to load the schema."));
-    return () => {
-      live = false;
-    };
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load the schema."))
+      .finally(() => setReloading(false));
   }, [name]);
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   // Fetch per-shard row counts for the selected table when a shard layer is active.
   useEffect(() => {
@@ -116,7 +119,6 @@ export default function Erd({ name }: { name: string }) {
 
   // ERD graph: one node per table, edges from each foreign key to its referenced table.
   const { nodes, edges } = useMemo(() => {
-    const names = new Set(tables.map((t) => t.name));
     const cols = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
     const nodes: Node[] = tables.map((t, i) => {
       const columns = t.columns.map(readColumn);
@@ -131,15 +133,20 @@ export default function Erd({ name }: { name: string }) {
         },
       };
     });
+    // SQLite table names are case-insensitive, and pragma_foreign_key_list reports the referenced
+    // table exactly as written in the REFERENCES clause — which may differ in case from the CREATE
+    // TABLE name. Resolve case-insensitively to the actual node id, or the edge silently vanishes.
+    const byLower = new Map(tables.map((t) => [t.name.toLowerCase(), t.name]));
     const edges: Edge[] = [];
     for (const t of tables) {
-      t.foreign_keys.forEach((row, i) => {
+      (t.foreign_keys ?? []).forEach((row, i) => {
         const fk = readForeignKey(row);
-        if (!names.has(fk.table) || fk.table === t.name) return;
+        const target = byLower.get(fk.table.toLowerCase());
+        if (!target || target === t.name) return;
         edges.push({
-          id: `${t.name}:${fk.from}->${fk.table}:${fk.to}:${i}`,
+          id: `${t.name}:${fk.from}->${target}:${fk.to}:${i}`,
           source: t.name,
-          target: fk.table,
+          target,
           label: `${fk.from} → ${fk.to}`,
           animated: false,
           style: { stroke: "#4589ff" },
@@ -167,7 +174,10 @@ export default function Erd({ name }: { name: string }) {
             {tables.length} tables · {catalog.consistency.status} schema across the cluster
           </div>
         </div>
-        <Segmented layer={layer} onChange={setLayer} s3Supported={s3?.supported ?? false} />
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" className="min-h-0 px-3 py-1 text-xs" disabled={reloading} onClick={() => void load()}>{reloading ? "Refreshing…" : "Refresh"}</Button>
+          <Segmented layer={layer} onChange={setLayer} s3Supported={s3?.supported ?? false} />
+        </div>
       </div>
 
       {error && <Banner tone="error">{error}</Banner>}
