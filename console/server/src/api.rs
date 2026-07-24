@@ -1249,23 +1249,38 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
             if !target.prefix.is_empty() {
                 body.insert("prefix".into(), Value::String(target.prefix));
             }
-            let outcome = state
-                .registry
-                .resolve(name)
-                .map_err(|error| error.to_string())
-                .and_then(|resolved| {
-                    crate::proxy::post_json_result(&resolved, "s3/config", &Value::Object(body))
-                });
-            match outcome {
-                Ok(value) => {
-                    state.audit.record(Some(&session.user), "s3.activate", name, "ok");
-                    respond::respond_json(request, 200, &value)
+            let body = Value::Object(body);
+            // Every node archives its own shards, so the S3 target must reach ALL of them — not just
+            // whichever seed a single request happens to hit, or the cluster reports "configured" on
+            // some nodes and "not configured" on others (and snapshot/flush fail on the latter).
+            let seeds = match state.registry.resolve_seeds(name) {
+                Ok(seeds) => seeds,
+                Err(RegistryError::NotFound) => return respond::error(request, 404, "no such connection"),
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
                 }
-                Err(error) => {
-                    state.audit.record(Some(&session.user), "s3.activate", name, "error");
-                    respond::error(request, 502, &error)
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let mut applied = Vec::new();
+            let mut failures = Vec::new();
+            for resolved in &seeds {
+                match crate::proxy::post_json_result(resolved, "s3/config", &body) {
+                    Ok(_) => applied.push(resolved.url.clone()),
+                    Err(e) => failures.push(format!("{}: {e}", resolved.url)),
                 }
             }
+            state.audit.record(
+                Some(&session.user),
+                "s3.activate",
+                name,
+                if failures.is_empty() { "ok" } else { "failed" },
+            );
+            let status = if failures.is_empty() { 200 } else { 502 };
+            respond::respond_json(
+                request,
+                status,
+                &serde_json::json!({ "applied": applied, "failures": failures }),
+            )
         }
 
         // The AI assistant: run one turn of the harness against this connection. Read-only tools

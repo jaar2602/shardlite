@@ -92,9 +92,8 @@ export default function Replication({ name }: { name: string }) {
       <Card
         title="S3 archival"
         actions={canOperate && s3?.supported ? <>
-          <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Apply stored S3 config", () => api.conn(name).s3.apply(), "Push this connection's stored S3 config to every node?")}>{busy === "Apply stored S3 config" ? "Applying…" : "Apply stored S3 config"}</Button>
-          <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Snapshot now", () => api.conn(name).s3.snapshot())}>{busy === "Snapshot now" ? "Snapshotting…" : "Snapshot now"}</Button>
-          <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Flush", () => api.conn(name).s3.flush())}>{busy === "Flush" ? "Flushing…" : "Flush"}</Button>
+          <Button variant="secondary" disabled={busy !== null || !s3.configured} title={s3.configured ? undefined : "Activate an S3 connection first (Use for snapshots, below)."} onClick={() => void run("Snapshot now", () => api.conn(name).s3.snapshot())}>{busy === "Snapshot now" ? "Snapshotting…" : "Snapshot now"}</Button>
+          <Button variant="secondary" disabled={busy !== null || !s3.configured} title={s3.configured ? undefined : "Activate an S3 connection first (Use for snapshots, below)."} onClick={() => void run("Flush", () => api.conn(name).s3.flush())}>{busy === "Flush" ? "Flushing…" : "Flush"}</Button>
         </> : undefined}
       >
         {!s3?.supported ? <p className="text-sm text-carbon-text-3">S3 archival is not supported by this database version.</p> : <div className="space-y-3">
