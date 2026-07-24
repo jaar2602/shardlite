@@ -143,6 +143,32 @@ fn grouped_queries_match_a_single_shard() {
 }
 
 #[test]
+fn scalar_wrapped_aggregates_match_a_single_shard() {
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (sharded, single) = twin(&dirs, 16);
+
+    // An aggregate wrapped in a scalar function (ROUND(SUM(..)), COALESCE(SUM(..), 0), arithmetic on
+    // aggregates) cannot be reassembled from per-shard partials, so the planner routes these to
+    // central execution. Compared as multisets against native SQLite — the values must be exact.
+    // `n % 10` keeps cardinality low (incl. a NULL bucket where SUM is NULL) so a wrong merge is
+    // caught rather than passing vacuously.
+    for sql in [
+        // The reported case: ROUND(SUM(..)) alongside a plain COUNT(*).
+        "SELECT n % 10 AS b, count(*) AS c, ROUND(sum(n), 2) AS r FROM t GROUP BY n % 10",
+        // Arithmetic on an aggregate.
+        "SELECT n % 10 AS b, sum(n) * 2 AS d FROM t GROUP BY n % 10",
+        // A scalar over two aggregates.
+        "SELECT n % 10 AS b, sum(n) / count(*) AS mean2 FROM t GROUP BY n % 10",
+        // COALESCE turns the NULL bucket's NULL sum into 0 — must match native.
+        "SELECT n % 10 AS b, coalesce(sum(n), 0) AS z FROM t GROUP BY n % 10",
+        // CAST wrapping.
+        "SELECT n % 10 AS b, cast(sum(n) AS TEXT) AS t2 FROM t GROUP BY n % 10",
+    ] {
+        assert_grouped(&sharded, &single, sql);
+    }
+}
+
+#[test]
 fn grouped_ordering_and_limit_match_a_single_shard() {
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (sharded, single) = twin(&dirs, 16);

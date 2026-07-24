@@ -1050,10 +1050,15 @@ fn plan_grouped(
             }
         }
 
-        // Not an aggregate: it must be one of the grouping expressions.
+        // Not a combinable aggregate: it must be a grouping expression, OR a scalar function that
+        // wraps an aggregate (e.g. ROUND(SUM(total), 2)). The latter can't be reassembled from
+        // per-shard partials but IS computable centrally, so route the whole query there rather than
+        // refuse. A truly bare column (no aggregate, not grouped) is still refused — central
+        // execution would silently pick an arbitrary row for it.
         let norm = normalize_expr(expr);
         match group_norm.iter().position(|g| *g == norm) {
             Some(gi) => outputs.push(OutputCol::Group(gi)),
+            None if expr_contains_aggregate(expr) => needs_central = true,
             None => {
                 return Err(Unsupported {
                     what: "a column that is neither grouped nor aggregated",
@@ -1160,6 +1165,27 @@ fn expr_has_distinct_aggregate(expr: &Expr) -> bool {
     let _ = visit_expressions(expr, |e| {
         if let Expr::Function(f) = e
             && is_distinct_aggregate(f)
+        {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether an expression contains an aggregate anywhere in its tree — e.g. the `SUM` inside
+/// `ROUND(SUM(total), 2)`. A scalar function that *wraps* an aggregate cannot be combined from
+/// per-shard partials (the wrapper would apply before the merge), but it *is* computable centrally,
+/// so this routes such a projection to central execution instead of refusing it.
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if let Expr::Function(f) = e
+            && matches!(
+                f.name.to_string().to_ascii_uppercase().as_str(),
+                "COUNT" | "SUM" | "TOTAL" | "MIN" | "MAX" | "AVG" | "GROUP_CONCAT" | "STRING_AGG"
+            )
         {
             found = true;
             return ControlFlow::Break(());
