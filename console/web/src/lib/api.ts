@@ -301,6 +301,14 @@ export const connections = {
     ),
 };
 
+// Saved, reusable S3 connections (archival targets). Persisted server-side with the secret sealed.
+export const s3Connections = {
+  list: () => req<S3Connection[]>("GET", "/api/s3-connections"),
+  create: (c: S3ConnectionInput) => req<S3Connection>("POST", "/api/s3-connections", c),
+  update: (id: string, c: S3ConnectionInput) => req<S3Connection>("PUT", `/api/s3-connections/${encodeURIComponent(id)}`, c),
+  remove: (id: string) => req("DELETE", `/api/s3-connections/${encodeURIComponent(id)}`),
+};
+
 export type ClusterHealthStatus = "healthy" | "degraded" | "unavailable";
 
 export interface FleetSummary {
@@ -581,6 +589,8 @@ export function conn(name: string) {
       snapshot: () => req<{ ok: boolean; snapshotted: number; errors: string[] }>("POST", `${b}/s3/snapshot`, {}),
       flush: () => req<{ ok: boolean }>("POST", `${b}/s3/flush`, {}),
       apply: () => req<{ applied: string[]; failures: string[] }>("POST", `${b}/apply-s3`, {}),
+      // Push a saved S3 connection onto this cluster as its snapshot target.
+      activate: (id: string) => req<Record<string, unknown>>("POST", `${b}/s3-activate`, { id }),
     },
     // Shard maintenance.
     vacuum: (shard: number) => req<{ ok: boolean }>("POST", `${b}/shards/${shard}/vacuum`, {}),
@@ -644,6 +654,29 @@ export interface S3Status {
     last_snapshot_ms: number;
     last_archived_lsn: number;
   }> | null;
+}
+
+export interface S3Connection {
+  id: string;
+  name: string;
+  bucket: string;
+  endpoint: string;
+  region: string;
+  prefix: string;
+  access_key: string;
+  has_secret: boolean;
+  created_by: string;
+  updated_at: number;
+}
+export interface S3ConnectionInput {
+  name: string;
+  bucket: string;
+  endpoint: string;
+  region: string;
+  prefix: string;
+  access_key: string;
+  // Omit to preserve the stored secret on update; "" clears it; a value seals a new one.
+  secret_key?: string;
 }
 
 export interface S3ConfigBody {

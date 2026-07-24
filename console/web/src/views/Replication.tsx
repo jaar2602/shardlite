@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
@@ -20,10 +20,6 @@ export default function Replication({ name }: { name: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [cfg, setCfg] = useState({ bucket: "", endpoint: "", region: "", prefix: "", access_key: "", secret_key: "" });
-  // Prefill the S3 form from the current target once (keys are never returned). A ref guard keeps the
-  // 5s auto-refresh from clobbering edits in progress.
-  const prefilled = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -43,20 +39,6 @@ export default function Replication({ name }: { name: string }) {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  useEffect(() => {
-    if (s3?.summary && !prefilled.current) {
-      setCfg({
-        bucket: s3.summary.bucket ?? "",
-        endpoint: s3.summary.endpoint ?? "",
-        region: s3.summary.region ?? "",
-        prefix: s3.summary.prefix ?? "",
-        access_key: "",
-        secret_key: "",
-      });
-      prefilled.current = true;
-    }
-  }, [s3]);
-
   const run = async (label: string, action: () => Promise<unknown>, confirmMessage?: string) => {
     if (confirmMessage && !confirm(confirmMessage)) return;
     setBusy(label);
@@ -72,19 +54,6 @@ export default function Replication({ name }: { name: string }) {
       setBusy(null);
     }
   };
-
-  const saveConfig = () =>
-    void run("Configure S3", () =>
-      api.conn(name).s3.config({
-        enabled: true,
-        bucket: cfg.bucket.trim(),
-        region: cfg.region.trim() || undefined,
-        endpoint: cfg.endpoint.trim() || undefined,
-        prefix: cfg.prefix.trim() || undefined,
-        access_key: cfg.access_key,
-        secret_key: cfg.secret_key,
-      }),
-    );
 
   if (!replication && !s3) return <div className="p-6">{error ? <Banner tone="error">{error}</Banner> : <Spinner label="Loading replication status…" />}</div>;
 
@@ -136,39 +105,7 @@ export default function Replication({ name }: { name: string }) {
           </div>
           {s3.last_error && <Banner tone="error">{s3.last_error}</Banner>}
           {canOperate ? (
-            <div className="space-y-3 border border-carbon-border bg-carbon-field/40 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wider text-carbon-text-3">S3 configuration</div>
-              <p className="text-xs text-carbon-text-3">
-                Point this cluster at any S3-compatible store (AWS S3, MinIO, Cloudflare R2, …). Leave the
-                endpoint blank for AWS; set it (path-style) for other stores. Applies to the live cluster now.
-                Keys are never shown back — re-enter them to change the target.
-              </p>
-              {!s3.capture_ready && (
-                <Banner tone="info">Nodes must be started capture-ready (<span className="font-mono">--s3-ready</span> or <span className="font-mono">--s3-bucket</span>) before a target can attach.</Banner>
-              )}
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextInput label="Bucket" value={cfg.bucket} onChange={(e) => setCfg({ ...cfg, bucket: e.target.value })} />
-                <TextInput label="Endpoint (blank = AWS)" placeholder="https://minio.example.com" value={cfg.endpoint} onChange={(e) => setCfg({ ...cfg, endpoint: e.target.value })} />
-                <TextInput label="Region" placeholder="us-east-1" value={cfg.region} onChange={(e) => setCfg({ ...cfg, region: e.target.value })} />
-                <TextInput label="Key prefix (optional)" value={cfg.prefix} onChange={(e) => setCfg({ ...cfg, prefix: e.target.value })} />
-                <TextInput label="Access key" value={cfg.access_key} onChange={(e) => setCfg({ ...cfg, access_key: e.target.value })} />
-                <TextInput label="Secret key" type="password" value={cfg.secret_key} onChange={(e) => setCfg({ ...cfg, secret_key: e.target.value })} />
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button disabled={busy !== null || !cfg.bucket.trim() || !cfg.access_key || !cfg.secret_key} onClick={saveConfig}>
-                  {busy === "Configure S3" ? "Saving…" : s3.configured ? "Update S3 target" : "Save & apply"}
-                </Button>
-                {s3.configured && (
-                  <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Disable S3", () => api.conn(name).s3.config({ enabled: false }), "Detach the S3 target from this cluster?")}>
-                    {busy === "Disable S3" ? "Disabling…" : "Disable S3"}
-                  </Button>
-                )}
-              </div>
-              <p className="text-xs text-carbon-text-3">
-                This configures the running cluster. To persist the target so it re-applies after a node restart,
-                also set S3 on the connection (Connections → edit) and use “Apply stored S3 config”.
-              </p>
-            </div>
+            <S3ConnectionsPanel name={name} s3={s3} />
           ) : (
             s3.summary && <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs sm:grid-cols-4">
               <Summary label="Bucket" value={s3.summary.bucket} />
@@ -190,4 +127,122 @@ export default function Replication({ name }: { name: string }) {
 
 function Summary({ label, value }: { label: string; value: string }) {
   return <div className="min-w-0"><div className="mb-1 text-[10px] uppercase tracking-wider text-carbon-text-3">{label}</div><div className="truncate font-mono text-carbon-text" title={value}>{value || "—"}</div></div>;
+}
+
+const emptyForm = { name: "", bucket: "", endpoint: "", region: "", prefix: "", access_key: "", secret_key: "" };
+const normEndpoint = (e: string) => e.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+
+// Saved, persisted S3 connections for this console. One can be activated as the cluster's snapshot
+// target; the one matching the cluster's live S3 status is labeled.
+function S3ConnectionsPanel({ name, s3 }: { name: string; s3: api.S3Status }) {
+  const [conns, setConns] = useState<api.S3Connection[]>([]);
+  const [editing, setEditing] = useState<string | null>(null); // an id, "new", or null
+  const [form, setForm] = useState(emptyForm);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const load = useCallback(() => api.s3Connections.list().then(setConns).catch((e) => setErr(e instanceof Error ? e.message : "Could not load S3 connections.")), []);
+  useEffect(() => { void load(); }, [load]);
+
+  // Which saved connection is the cluster's current snapshot target (matched on bucket + endpoint;
+  // a blank saved endpoint matches an AWS default).
+  const activeId = useMemo(() => {
+    const su = s3.summary;
+    if (!su) return null;
+    return conns.find((c) =>
+      c.bucket === su.bucket &&
+      (normEndpoint(c.endpoint) === normEndpoint(su.endpoint) || (c.endpoint === "" && /amazonaws\.com/.test(su.endpoint))),
+    )?.id ?? null;
+  }, [conns, s3.summary]);
+
+  const run = async (label: string, fn: () => Promise<unknown>) => {
+    setBusy(label); setErr(null); setMsg(null);
+    try { await fn(); await load(); } catch (e) { setErr(e instanceof Error ? e.message : `${label} failed.`); } finally { setBusy(null); }
+  };
+
+  const save = () => run("save", async () => {
+    const input: api.S3ConnectionInput = {
+      name: form.name, bucket: form.bucket, endpoint: form.endpoint, region: form.region,
+      prefix: form.prefix, access_key: form.access_key,
+      // On edit, a blank secret preserves the stored one (omit); on create, send what was typed.
+      ...(editing !== "new" && form.secret_key === "" ? {} : { secret_key: form.secret_key }),
+    };
+    if (editing === "new") await api.s3Connections.create(input);
+    else await api.s3Connections.update(editing!, input);
+    setEditing(null);
+  });
+
+  const activate = (c: api.S3Connection) => run("activate:" + c.id, async () => {
+    await api.conn(name).s3.activate(c.id);
+    setMsg(`“${c.name}” is now this cluster's snapshot target.`);
+  });
+
+  const remove = (c: api.S3Connection) => {
+    if (!confirm(`Delete the saved S3 connection “${c.name}”?`)) return;
+    void run("delete:" + c.id, () => api.s3Connections.remove(c.id));
+  };
+
+  return (
+    <div className="space-y-3">
+      {err && <Banner tone="error">{err}</Banner>}
+      {msg && <Banner tone="success">{msg}</Banner>}
+      {!s3.capture_ready && <Banner tone="info">Nodes must be started capture-ready (<span className="font-mono">--s3-ready</span> or <span className="font-mono">--s3-bucket</span>) before a target can attach.</Banner>}
+
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-semibold uppercase tracking-wider text-carbon-text-3">Saved S3 connections</div>
+        <Button variant="secondary" className="min-h-0 px-3 py-1 text-xs" disabled={busy !== null} onClick={() => { setForm(emptyForm); setEditing("new"); }}>New S3 connection</Button>
+      </div>
+
+      {conns.length === 0 && editing === null ? (
+        <p className="text-sm text-carbon-text-3">No saved S3 connections yet. Create one to archive this cluster to an S3-compatible store.</p>
+      ) : (
+        <div className="divide-y divide-carbon-border border border-carbon-border">
+          {conns.map((c) => (
+            <div key={c.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-carbon-text">{c.name}</span>
+                  {activeId === c.id && <Tag tone="green">Snapshot target</Tag>}
+                  {!c.has_secret && <Tag tone="yellow">no secret key</Tag>}
+                </div>
+                <div className="truncate font-mono text-xs text-carbon-text-3" title={c.bucket}>
+                  {c.bucket}{c.endpoint ? ` @ ${c.endpoint}` : " (AWS)"}{c.prefix ? ` /${c.prefix}` : ""}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="secondary" className="min-h-0 px-2 py-1 text-xs" disabled={busy !== null || activeId === c.id || !c.has_secret} onClick={() => activate(c)}>
+                  {busy === "activate:" + c.id ? "Activating…" : activeId === c.id ? "Active" : "Use for snapshots"}
+                </Button>
+                <Button variant="secondary" className="min-h-0 px-2 py-1 text-xs" disabled={busy !== null} onClick={() => { setForm({ name: c.name, bucket: c.bucket, endpoint: c.endpoint, region: c.region, prefix: c.prefix, access_key: c.access_key, secret_key: "" }); setEditing(c.id); }}>Edit</Button>
+                <Button variant="secondary" className="min-h-0 px-2 py-1 text-xs" disabled={busy !== null} onClick={() => remove(c)}>Delete</Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing !== null && (
+        <div className="space-y-3 border border-carbon-border bg-carbon-field/40 p-3">
+          <div className="text-xs font-semibold uppercase tracking-wider text-carbon-text-3">{editing === "new" ? "New S3 connection" : "Edit S3 connection"}</div>
+          <p className="text-xs text-carbon-text-3">S3-compatible: leave the endpoint blank for AWS; set it (path-style) for MinIO, Cloudflare R2, or other stores.</p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <TextInput label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+            <TextInput label="Bucket" value={form.bucket} onChange={(e) => setForm({ ...form, bucket: e.target.value })} />
+            <TextInput label="Endpoint (blank = AWS)" placeholder="https://minio.example.com" value={form.endpoint} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} />
+            <TextInput label="Region" placeholder="us-east-1" value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} />
+            <TextInput label="Key prefix (optional)" value={form.prefix} onChange={(e) => setForm({ ...form, prefix: e.target.value })} />
+            <TextInput label="Access key" value={form.access_key} onChange={(e) => setForm({ ...form, access_key: e.target.value })} />
+            <TextInput label={editing === "new" ? "Secret key" : "Secret key (blank keeps current)"} type="password" value={form.secret_key} onChange={(e) => setForm({ ...form, secret_key: e.target.value })} />
+          </div>
+          <div className="flex gap-2">
+            <Button disabled={busy !== null || !form.name.trim() || !form.bucket.trim()} onClick={save}>{busy === "save" ? "Saving…" : "Save"}</Button>
+            <Button variant="secondary" disabled={busy !== null} onClick={() => setEditing(null)}>Cancel</Button>
+          </div>
+        </div>
+      )}
+
+      <p className="text-xs text-carbon-text-3">“Use for snapshots” pushes the saved connection to the live cluster. Saved connections persist across restarts; re-activate a target after a node restart if the cluster shows “not configured”.</p>
+    </div>
+  );
 }
