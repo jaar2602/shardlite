@@ -169,6 +169,28 @@ fn scalar_wrapped_aggregates_match_a_single_shard() {
 }
 
 #[test]
+fn explain_describes_the_strategy_and_flags_central_execution() {
+    // What POST /v1/explain surfaces: a scalar-wrapped aggregate runs centrally (heavy); a plain
+    // grouped aggregate combines from partials (not heavy).
+    let wrapped = plan("SELECT n % 10, ROUND(SUM(n), 2) FROM t GROUP BY n % 10")
+        .unwrap()
+        .describe();
+    assert_eq!(wrapped.strategy, "central execution");
+    assert!(wrapped.heavy, "ROUND(SUM(..)) must be flagged heavy");
+
+    let combinable = plan("SELECT n % 10, SUM(n) FROM t GROUP BY n % 10")
+        .unwrap()
+        .describe();
+    assert!(!combinable.heavy, "a plain grouped SUM combines from partials");
+    assert!(combinable.strategy.contains("grouped"));
+
+    // A DISTINCT aggregate also falls to central execution.
+    assert!(plan("SELECT count(DISTINCT n) FROM t").unwrap().describe().heavy);
+    // A plain scan fans out without a heavy merge.
+    assert!(!plan("SELECT k FROM t").unwrap().describe().heavy);
+}
+
+#[test]
 fn grouped_ordering_and_limit_match_a_single_shard() {
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (sharded, single) = twin(&dirs, 16);

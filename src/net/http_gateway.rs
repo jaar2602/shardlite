@@ -189,6 +189,9 @@ impl HttpGateway {
             (Method::Post, "/v1/query_all") => {
                 return self.handle_query_all(req, role);
             }
+            (Method::Post, "/v1/explain") => {
+                return self.handle_explain(req, role);
+            }
             (Method::Post, "/v1/run") => {
                 return self.handle_run(req, role);
             }
@@ -556,6 +559,38 @@ impl HttpGateway {
                 &self.services,
             );
             Ok(response_to_http(resp))
+        });
+        respond_json(req, out);
+    }
+
+    /// `POST /v1/explain` (Read) — describe how a query would run across shards: its plan strategy
+    /// and whether it is a memory-heavy *central execution*, WITHOUT running it. Planned with this
+    /// node's declared shard keys, so it matches what `query_all` would actually do. Used by the
+    /// console to highlight heavy operations before they run.
+    fn handle_explain(&self, mut req: Request, role: Option<Role>) {
+        let out = self.check(role, Requirement::Read).and_then(|()| {
+            let body = read_body(&mut req)?;
+            let q: SqlBody = serde_json::from_slice(&body)
+                .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            let shard_keys = self.shards.shard_keys();
+            let json = match crate::query::plan_with(&q.sql, &shard_keys) {
+                Ok(plan) => {
+                    let d = plan.describe();
+                    serde_json::json!({
+                        "supported": true,
+                        "strategy": d.strategy,
+                        "note": d.note,
+                        "heavy": d.heavy,
+                    })
+                }
+                Err(unsupported) => serde_json::json!({
+                    "supported": false,
+                    "strategy": "unsupported",
+                    "note": unsupported.to_string(),
+                    "heavy": false,
+                }),
+            };
+            Ok((200, json))
         });
         respond_json(req, out);
     }

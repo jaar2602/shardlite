@@ -125,6 +125,76 @@ pub enum Plan {
     Central(Box<Central>),
 }
 
+/// A human-facing summary of how a query runs across shards, for EXPLAIN. `heavy` marks a plan that
+/// pulls matching rows to the coordinator (central execution) — correct, but memory-heavy and worth
+/// surfacing so an operator can restructure the query or target a single shard.
+#[derive(Debug, Clone)]
+pub struct PlanDescription {
+    pub strategy: &'static str,
+    pub note: &'static str,
+    pub heavy: bool,
+}
+
+impl Plan {
+    /// Describe the plan's cross-shard strategy without running it.
+    pub fn describe(&self) -> PlanDescription {
+        let (strategy, note, heavy) = match self {
+            Plan::SingleShard => (
+                "single shard",
+                "Runs on one shard, routed by key — no fan-out.",
+                false,
+            ),
+            Plan::Concat { .. } => (
+                "fan-out · concat",
+                "Rows are gathered from every shard and concatenated.",
+                false,
+            ),
+            Plan::Merge { .. } => (
+                "fan-out · ordered merge",
+                "Each shard sorts locally; the coordinator k-way merges the streams.",
+                false,
+            ),
+            Plan::Aggregate { .. } => (
+                "fan-out · combined aggregate",
+                "Each shard computes a partial aggregate; the coordinator combines the partials.",
+                false,
+            ),
+            Plan::Grouped(_) => (
+                "fan-out · grouped",
+                "Each shard produces partial groups; the coordinator re-aggregates by group key.",
+                false,
+            ),
+            Plan::PostProcess(_) => (
+                "fan-out · post-processed",
+                "Fan-out, then dedup / sort / offset on the coordinator (DISTINCT / OFFSET).",
+                false,
+            ),
+            Plan::SetOp(_) => (
+                "fan-out · set operation",
+                "Each branch fans out; the coordinator combines them (UNION / INTERSECT / EXCEPT).",
+                false,
+            ),
+            Plan::Subqueries => (
+                "subquery fan-out",
+                "Subqueries are evaluated globally and substituted, then the query fans out.",
+                false,
+            ),
+            Plan::Central(_) => (
+                "central execution",
+                "Matching rows are pulled to the coordinator and the query runs there — correct \
+                 but memory-heavy, and heavier than a pushed-down aggregate. Consider restructuring \
+                 the query or targeting a single shard.",
+                true,
+            ),
+        };
+        PlanDescription {
+            strategy,
+            note,
+            heavy,
+        }
+    }
+}
+
 /// A query answered by materialising its `FROM` sources on the coordinator and running it against
 /// an in-memory SQLite. Each source is fanned out on its own and loaded into a table; `central_sql`
 /// then references those tables by name.
