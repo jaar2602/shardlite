@@ -19,3 +19,6 @@
 # driver build artifacts
 /drivers/rust/target
 **/target/
+
+# local agent tooling / scratch (never commit)
+/.agents
