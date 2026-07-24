@@ -1143,6 +1143,134 @@ pub fn handle(mut request: Request, state: &AppState) -> std::io::Result<()> {
                 None => respond::error(request, 404, "no such connection"),
             }
         }
+        // Cluster-wide replication: each node's /v1/replication reports only the shards IT is primary
+        // for, so a single-node read shows a different subset each time it lands on a different node.
+        // Fan out to every node and merge per shard (the primary's row wins) for one stable view.
+        ("GET", ["connections", name, "replication"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "replication.read", name);
+            }
+            let seeds = match state.registry.resolve_seeds(name) {
+                Ok(seeds) => seeds,
+                Err(RegistryError::NotFound) => return respond::error(request, 404, "no such connection"),
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
+                }
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let mut by_shard: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+            let (mut confirmed, mut timed_out, mut waited) = (0u64, 0u64, 0u64);
+            let (mut any_acks, mut replicated, mut reached) = (false, false, 0u32);
+            for resolved in &seeds {
+                let Ok((v, _)) = crate::proxy::fetch_json_result(resolved, "replication") else {
+                    continue;
+                };
+                reached += 1;
+                if v.get("replicated").and_then(Value::as_bool) == Some(true) {
+                    replicated = true;
+                }
+                if let Some(a) = v.get("acks").filter(|a| !a.is_null()) {
+                    any_acks = true;
+                    confirmed += a.get("confirmed").and_then(Value::as_u64).unwrap_or(0);
+                    timed_out += a.get("timed_out").and_then(Value::as_u64).unwrap_or(0);
+                    waited += a.get("waited_us").and_then(Value::as_u64).unwrap_or(0);
+                }
+                for shard in v.get("shards").and_then(Value::as_array).into_iter().flatten() {
+                    let Some(id) = shard.get("id").and_then(Value::as_u64) else { continue };
+                    // Keep the primary's authoritative row; only fill a shard with a replica row if
+                    // no primary has reported it yet.
+                    let have_primary = by_shard
+                        .get(&id)
+                        .and_then(|e| e.get("role").and_then(Value::as_str))
+                        == Some("primary");
+                    if !have_primary {
+                        by_shard.insert(id, shard.clone());
+                    }
+                }
+            }
+            if reached == 0 {
+                return respond::error(request, 502, "no node answered the replication query");
+            }
+            let acks = if any_acks {
+                json!({ "confirmed": confirmed, "timed_out": timed_out, "waited_us": waited })
+            } else {
+                Value::Null
+            };
+            respond::respond_json(
+                request,
+                200,
+                &json!({
+                    "api_version": 1,
+                    "node": null,
+                    "replicated": replicated,
+                    "acks": acks,
+                    "shards": by_shard.into_values().collect::<Vec<_>>(),
+                }),
+            )
+        }
+        // Cluster-wide S3 status: each node reports only its own shards' archival state, so merge
+        // across nodes (like replication). Cluster-level flags are ANDed over reached nodes, so a
+        // partial activation reads as not-fully-configured rather than flickering.
+        ("GET", ["connections", name, "s3", "status"]) => {
+            if !session.role.permits(Permission::Observe) {
+                return require(request, state, &session, Permission::Observe, "s3_status.read", name);
+            }
+            let seeds = match state.registry.resolve_seeds(name) {
+                Ok(seeds) => seeds,
+                Err(RegistryError::NotFound) => return respond::error(request, 404, "no such connection"),
+                Err(RegistryError::Disabled) => {
+                    return respond::error(request, 409, "this connection is disabled")
+                }
+                Err(e) => return respond::error(request, 502, &e.to_string()),
+            };
+            let mut by_shard: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+            let mut supported = false;
+            let (mut capture_ready, mut configured, mut health) = (true, true, true);
+            let mut summary: Option<Value> = None;
+            let mut last_error: Option<String> = None;
+            let mut reached = 0u32;
+            for resolved in &seeds {
+                let Ok((v, _)) = crate::proxy::fetch_json_result(resolved, "s3/status") else {
+                    continue;
+                };
+                reached += 1;
+                if v.get("supported").and_then(Value::as_bool) == Some(true) {
+                    supported = true;
+                }
+                capture_ready &= v.get("capture_ready").and_then(Value::as_bool).unwrap_or(false);
+                configured &= v.get("configured").and_then(Value::as_bool).unwrap_or(false);
+                if let Some(h) = v.get("health").and_then(Value::as_bool) {
+                    health &= h;
+                }
+                if summary.is_none() {
+                    summary = v.get("summary").filter(|s| !s.is_null()).cloned();
+                }
+                if last_error.is_none() {
+                    last_error = v.get("last_error").and_then(Value::as_str).map(str::to_string);
+                }
+                for shard in v.get("shards").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(id) = shard.get("shard").and_then(Value::as_u64) {
+                        by_shard.entry(id).or_insert_with(|| shard.clone());
+                    }
+                }
+            }
+            if reached == 0 {
+                return respond::error(request, 502, "no node answered the S3 status query");
+            }
+            respond::respond_json(
+                request,
+                200,
+                &json!({
+                    "supported": supported,
+                    "capture_ready": capture_ready,
+                    "configured": configured,
+                    "health": health,
+                    "summary": summary,
+                    "last_error": last_error,
+                    "shards": by_shard.into_values().collect::<Vec<_>>(),
+                }),
+            )
+        }
         // Per-shard row counts for one table — the "shard" layer of the ERD view: where a table's
         // rows physically live across the shards.
         ("GET", ["connections", name, "tables", table, "placement"]) => {
