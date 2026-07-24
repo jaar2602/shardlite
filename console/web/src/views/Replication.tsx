@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
@@ -20,8 +20,10 @@ export default function Replication({ name }: { name: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [showConfig, setShowConfig] = useState(false);
   const [cfg, setCfg] = useState({ bucket: "", endpoint: "", region: "", prefix: "", access_key: "", secret_key: "" });
+  // Prefill the S3 form from the current target once (keys are never returned). A ref guard keeps the
+  // 5s auto-refresh from clobbering edits in progress.
+  const prefilled = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -41,6 +43,20 @@ export default function Replication({ name }: { name: string }) {
     return () => window.clearInterval(timer);
   }, [load]);
 
+  useEffect(() => {
+    if (s3?.summary && !prefilled.current) {
+      setCfg({
+        bucket: s3.summary.bucket ?? "",
+        endpoint: s3.summary.endpoint ?? "",
+        region: s3.summary.region ?? "",
+        prefix: s3.summary.prefix ?? "",
+        access_key: "",
+        secret_key: "",
+      });
+      prefilled.current = true;
+    }
+  }, [s3]);
+
   const run = async (label: string, action: () => Promise<unknown>, confirmMessage?: string) => {
     if (confirmMessage && !confirm(confirmMessage)) return;
     setBusy(label);
@@ -57,18 +73,6 @@ export default function Replication({ name }: { name: string }) {
     }
   };
 
-  // Prefill the form from the current target (keys are never returned, so they start blank).
-  const openConfig = () => {
-    setCfg({
-      bucket: s3?.summary?.bucket ?? "",
-      endpoint: s3?.summary?.endpoint ?? "",
-      region: s3?.summary?.region ?? "",
-      prefix: s3?.summary?.prefix ?? "",
-      access_key: "",
-      secret_key: "",
-    });
-    setShowConfig(true);
-  };
   const saveConfig = () =>
     void run("Configure S3", () =>
       api.conn(name).s3.config({
@@ -119,7 +123,6 @@ export default function Replication({ name }: { name: string }) {
       <Card
         title="S3 archival"
         actions={canOperate && s3?.supported ? <>
-          <Button variant={showConfig ? "primary" : "secondary"} disabled={busy !== null} onClick={() => (showConfig ? setShowConfig(false) : openConfig())}>{showConfig ? "Close config" : "Configure S3"}</Button>
           <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Apply stored S3 config", () => api.conn(name).s3.apply(), "Push this connection's stored S3 config to every node?")}>{busy === "Apply stored S3 config" ? "Applying…" : "Apply stored S3 config"}</Button>
           <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Snapshot now", () => api.conn(name).s3.snapshot())}>{busy === "Snapshot now" ? "Snapshotting…" : "Snapshot now"}</Button>
           <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Flush", () => api.conn(name).s3.flush())}>{busy === "Flush" ? "Flushing…" : "Flush"}</Button>
@@ -131,11 +134,14 @@ export default function Replication({ name }: { name: string }) {
             <Tag tone={s3.configured ? "green" : "gray"}>{s3.configured ? "configured" : "not configured"}</Tag>
             {s3.health != null && <Tag tone={s3.health ? "green" : "red"}>{s3.health ? "healthy" : "unhealthy"}</Tag>}
           </div>
-          {showConfig && (
+          {s3.last_error && <Banner tone="error">{s3.last_error}</Banner>}
+          {canOperate ? (
             <div className="space-y-3 border border-carbon-border bg-carbon-field/40 p-3">
+              <div className="text-xs font-semibold uppercase tracking-wider text-carbon-text-3">S3 configuration</div>
               <p className="text-xs text-carbon-text-3">
                 Point this cluster at any S3-compatible store (AWS S3, MinIO, Cloudflare R2, …). Leave the
                 endpoint blank for AWS; set it (path-style) for other stores. Applies to the live cluster now.
+                Keys are never shown back — re-enter them to change the target.
               </p>
               {!s3.capture_ready && (
                 <Banner tone="info">Nodes must be started capture-ready (<span className="font-mono">--s3-ready</span> or <span className="font-mono">--s3-bucket</span>) before a target can attach.</Banner>
@@ -150,7 +156,7 @@ export default function Replication({ name }: { name: string }) {
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button disabled={busy !== null || !cfg.bucket.trim() || !cfg.access_key || !cfg.secret_key} onClick={saveConfig}>
-                  {busy === "Configure S3" ? "Saving…" : "Save & apply"}
+                  {busy === "Configure S3" ? "Saving…" : s3.configured ? "Update S3 target" : "Save & apply"}
                 </Button>
                 {s3.configured && (
                   <Button variant="secondary" disabled={busy !== null} onClick={() => void run("Disable S3", () => api.conn(name).s3.config({ enabled: false }), "Detach the S3 target from this cluster?")}>
@@ -163,14 +169,14 @@ export default function Replication({ name }: { name: string }) {
                 also set S3 on the connection (Connections → edit) and use “Apply stored S3 config”.
               </p>
             </div>
+          ) : (
+            s3.summary && <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs sm:grid-cols-4">
+              <Summary label="Bucket" value={s3.summary.bucket} />
+              <Summary label="Endpoint" value={s3.summary.endpoint} />
+              <Summary label="Region" value={s3.summary.region} />
+              <Summary label="Prefix" value={s3.summary.prefix} />
+            </div>
           )}
-          {s3.last_error && <Banner tone="error">{s3.last_error}</Banner>}
-          {s3.summary && <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs sm:grid-cols-4">
-            <Summary label="Bucket" value={s3.summary.bucket} />
-            <Summary label="Endpoint" value={s3.summary.endpoint} />
-            <Summary label="Region" value={s3.summary.region} />
-            <Summary label="Prefix" value={s3.summary.prefix} />
-          </div>}
           <DataTable
             columns={["Shard", "Snapshot epoch", "Snapshot LSN", "Last snapshot", "Archived LSN"]}
             empty="No archival snapshots recorded."
