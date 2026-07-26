@@ -421,6 +421,34 @@ fn serve_connection(
                                 gate = Gate::Challenged(nonce);
                                 write_message(r.get_mut(), &Response::Challenge { nonce })?;
                             }
+                            Request::JoinWithToken {
+                                token,
+                                local_cluster,
+                                compatibility,
+                                node,
+                                incarnation,
+                                address,
+                            } => {
+                                // Token admission is deliberately a single request/response
+                                // session. It is accepted before user authentication because the
+                                // short-lived bearer is the credential for learner admission.
+                                let response = handle(
+                                    Request::CatalogCommand(
+                                        crate::cluster::CatalogCommand::JoinWithToken {
+                                            token,
+                                            local_cluster,
+                                            compatibility,
+                                            node,
+                                            incarnation,
+                                            address,
+                                        },
+                                    ),
+                                    shards,
+                                    services,
+                                );
+                                write_message(r.get_mut(), &response)?;
+                                return Ok(());
+                            }
                             _ => {
                                 // One message for every pre-auth request, so the refusal
                                 // teaches nothing about what exists.
@@ -1359,6 +1387,18 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             },
             None => not_a_member("a catalog command"),
         },
+
+        Request::JoinWithToken { token, local_cluster, compatibility, node, incarnation, address } => {
+            match &services.catalog_control {
+                Some(control) => match control.apply(crate::cluster::CatalogCommand::JoinWithToken {
+                    token, local_cluster, compatibility, node, incarnation, address,
+                }) {
+                    Ok(result) => Response::CatalogChanged(result),
+                    Err(error) => error_response(error),
+                },
+                None => not_a_member("a tokenized join"),
+            }
+        }
 
         Request::CatalogInstall {
             leader,

@@ -43,8 +43,11 @@ Hardening completed in this slice:
 - bounded split-log backpressure with a retryable sentinel and resumable, fsynced large-table scan
   checkpoints (including orphan/corrupt checkpoint refusal);
 - per-replica split shadow/install and cleanup acknowledgements with image digest verification;
-- differential support for keyless rowid, composite-key, and BLOB-key tables; virtual and
-  `WITHOUT ROWID` tables remain fail-closed pending module/tuple-identity proof;
+- snapshot/split disk write, short-write, fsync, corruption, and integrity-check fault hooks, plus
+  asymmetric destination-fault qualification and retry tests;
+- differential support for keyless rowid, composite-key, and BLOB-key tables, including
+  composite-primary-key `WITHOUT ROWID` tables via tuple identities; virtual tables remain
+  fail-closed because module-owned state is not portable through SQLite snapshots;
 - capacity weights, failure-domain-aware placement, split/transfer resource budgets, and mutable
   policy controls;
 - console display/edit controls for those policies and a read-only packaged-stack verification
@@ -52,18 +55,19 @@ Hardening completed in this slice:
 
 Still required before calling dynamic mode production-ready:
 
-- an authenticated, single-use join-token issuance and console provisioning workflow (the current
-  console can operate already-joined members, while `shardlite join` remains the explicit
-  self-hosted bootstrap path);
-- production fault injection for true network partitions, disk-full/short-write/fsync corruption,
-  and replica loss under every placement policy, plus deployment verification in a network-enabled
-  CI environment.
+- managed provider orchestration (Kubernetes desired-capacity lifecycle) and richer console
+  provisioning UX; self-hosted admission is now covered by the authenticated, single-use,
+  expiring join-token workflow (`POST /v1/cluster/join-token` and `shardlite join --token`);
+- true asymmetric network partitions, replica loss under every placement policy, long-running soak
+  runs, and deployment verification in a network-enabled CI environment;
+- virtual-table split support remains intentionally refused because module-owned state cannot be
+  reconstructed safely from a generic SQLite snapshot.
 
 Capacity weights and failure-domain-aware replica placement are implemented. The catalog now carries
 operator resource budgets for split/transfer source files and exposes policy/member controls through
 the dynamic HTTP catalog API and console. `deploy/stack/verify.sh` provides a read-only packaged-stack
-smoke check. Join-token issuance/provisioning remains gated on the authenticated token protocol and
-provider orchestration; the Docker demo deliberately stays fixed-shard.
+smoke check. Join-token issuance is durable, single-use, expiring, and exposed through the console's
+Prepare node action; the Docker demo deliberately stays fixed-shard.
 
 ## Console cluster provisioning — Kubernetes (enterprise, licensed)
 
@@ -74,8 +78,8 @@ design, blockers, and slice plan in [console-cluster-provisioning-plan.md](conso
 
 **Hard dependency:** full-lifecycle *scaling* builds on the dynamic membership, bootstrap, transfer,
 and rebalance slices in the [dynamic scaling plan](dynamic-scaling-plan.md). Those core paths now
-exist; the remaining provisioning work is provider orchestration, join-token delivery, resource
-preflight, audit/approval UX, and production failure qualification.
+exist; the remaining provisioning work is provider orchestration, resource preflight, audit/approval
+UX, and production failure qualification.
 
 ## Owner-aware S3 archive (correct stale-local-file recovery)
 

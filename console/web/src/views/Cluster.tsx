@@ -118,6 +118,8 @@ export default function Cluster({ name }: { name: string }) {
   const [drainMessage, setDrainMessage] = useState<string | null>(null);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [catalogMessage, setCatalogMessage] = useState<string | null>(null);
+  const [joinToken, setJoinToken] = useState<string | null>(null);
+  const [joinCommand, setJoinCommand] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef<{ id: number; name: string } | null>(null);
 
@@ -262,18 +264,20 @@ export default function Cluster({ name }: { name: string }) {
             {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
           {canOperate && catalog?.enabled && (
-            <Button
-              variant="secondary"
-              disabled={catalogBusy}
-              onClick={() =>
-                void catalogAction(
-                  "Plan one stable rebalance movement now?",
-                  (client) => client.rebalance(),
-                )
-              }
-            >
-              Rebalance one shard
-            </Button>
+            <>
+              <Button variant="secondary" disabled={catalogBusy} onClick={() => void catalogAction(
+                "Plan one stable rebalance movement now?", (client) => client.rebalance(),
+              )}>Rebalance one shard</Button>
+              <Button variant="secondary" disabled={catalogBusy} onClick={async () => {
+                try {
+                  const issued = await api.conn(name).issueJoinToken();
+                  setJoinToken(issued.token);
+                  setJoinCommand(issued.command);
+                  await navigator.clipboard?.writeText(issued.token);
+                  setCatalogMessage("Single-use join token issued and copied. It expires in 15 minutes.");
+                } catch (e) { setCatalogMessage(e instanceof Error ? e.message : "join token issuance failed"); }
+              }}>Prepare node</Button>
+            </>
           )}
         </div>
       </header>
@@ -282,6 +286,9 @@ export default function Cluster({ name }: { name: string }) {
         <div className="mb-5">
           <Banner tone="error">Refresh failed; showing the last successful observation. {error}</Banner>
         </div>
+      )}
+      {joinToken && (
+        <div className="mb-5"><Banner tone="info"><span className="font-mono break-all">{joinCommand ?? `Join token: ${joinToken}`}</span></Banner></div>
       )}
       {observation.issues.length > 0 && (
         <div className="mb-5">

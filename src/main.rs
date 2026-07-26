@@ -855,7 +855,7 @@ fn init_cluster_cmd(args: &[String]) -> ExitCode {
 }
 
 const JOIN_USAGE: &str = "usage:
-  shardlite join <data-dir> --seed ADDR --node-id N --listen ADDR [--capacity N]
+  shardlite join <data-dir> --seed ADDR --node-id N --listen ADDR [--capacity N] [--token TOKEN]
                  [--cluster-user NAME --cluster-secret SECRET]
 
 The joining node is recorded as a write-ineligible learner, fsyncs the returned catalog locally,
@@ -892,8 +892,86 @@ fn join_cluster_cmd(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let join_token = flag(args, "--token").map(str::to_owned);
 
     let result = (|| -> shardlite::Result<shardlite::cluster::Catalog> {
+        if let Some(token) = join_token {
+            // A token is the admission credential. It is sent as the first frame, before any
+            // user authentication, and the server closes that one-shot connection after durable
+            // registration. Completion uses the normal authenticated connection when configured.
+            let existing_store = if shardlite::cluster::CatalogStore::exists(&dir) {
+                Some(shardlite::cluster::CatalogStore::open(&dir)?)
+            } else {
+                None
+            };
+            let (local_cluster, compatibility) = if let Some(store) = &existing_store {
+                let snapshot = store.snapshot();
+                (Some(snapshot.cluster_id), snapshot.compatibility.clone())
+            } else {
+                (
+                    None,
+                    shardlite::cluster::Compatibility::current(
+                        shardlite::shard::Routing::LinearV1(shardlite::shard::LinearV1::ONE),
+                    )?,
+                )
+            };
+            let joined = shardlite::net::Client::join_with_token(
+                seed,
+                std::time::Duration::from_secs(10),
+                token,
+                local_cluster,
+                compatibility,
+                node,
+                1,
+                address.to_string(),
+            )?;
+            if joined.catalog.routing.shard_count() > capacity {
+                return Err(shardlite::Error::ShardConfig(format!(
+                    "cluster has {} active shards, above this node's capacity {capacity}",
+                    joined.catalog.routing.shard_count()
+                )));
+            }
+            if let Some(store) = existing_store {
+                store.install_committed(joined.catalog.clone())?;
+                let durable_version = store.snapshot().version;
+                let mut client = shardlite::net::Client::connect_full(
+                    seed,
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(30),
+                    credentials.clone(),
+                )?;
+                let completed =
+                    client.catalog_command(shardlite::cluster::CatalogCommand::CompleteJoin {
+                        operation: joined.operation.ok_or_else(|| {
+                            shardlite::Error::ClusterConfig(
+                                "leader returned no join operation".into(),
+                            )
+                        })?,
+                        durable_catalog_version: durable_version,
+                    })?;
+                store.install_committed(completed.catalog.clone())?;
+                return Ok(completed.catalog);
+            }
+            Manifest::open_or_create(&dir, capacity)?;
+            persist_node_id(&dir, node)?;
+            let store = shardlite::cluster::CatalogStore::create(&dir, joined.catalog.clone())?;
+            let durable_version = store.snapshot().version;
+            let mut client = shardlite::net::Client::connect_full(
+                seed,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
+                credentials,
+            )?;
+            let completed =
+                client.catalog_command(shardlite::cluster::CatalogCommand::CompleteJoin {
+                    operation: joined.operation.ok_or_else(|| {
+                        shardlite::Error::ClusterConfig("leader returned no join operation".into())
+                    })?,
+                    durable_catalog_version: durable_version,
+                })?;
+            store.install_committed(completed.catalog.clone())?;
+            return Ok(completed.catalog);
+        }
         let mut client = shardlite::net::Client::connect_full(
             seed,
             std::time::Duration::from_secs(5),
@@ -1726,7 +1804,14 @@ fn build_dynamic_cluster(
         quorum = quorum.with_credentials(name, secret);
     }
     let quorum = Arc::new(quorum);
-    let control = Arc::new(CatalogControl::new(Arc::clone(&quorum)));
+    let join_tokens = Arc::new(
+        shardlite::cluster::JoinTokenStore::open(dir.join("cluster").join("join-tokens.json"))
+            .map_err(|error| error.to_string())?,
+    );
+    let control = Arc::new(CatalogControl::with_join_tokens(
+        Arc::clone(&quorum),
+        join_tokens,
+    ));
 
     let router = Arc::new(shardlite::net::Router::new(Arc::clone(&cluster)));
     manager.set_peer_router(Arc::clone(&router) as Arc<dyn PeerRouter>);

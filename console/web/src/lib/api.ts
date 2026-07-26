@@ -617,6 +617,12 @@ export function conn(name: string) {
     // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
     drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
     rebalance: () => req<CatalogMutation>("POST", `${b}/cluster/rebalance`, {}),
+    issueJoinToken: (ttl_seconds = 900) =>
+      req<{ token: string; expires_at: number; single_use: boolean; scope: string; command: string }>(
+        "POST",
+        `${b}/cluster/join-token`,
+        { ttl_seconds },
+      ),
     scalingPolicy: (policy: ScalingPolicy) =>
       req<CatalogMutation>("POST", `${b}/cluster/policy`, policy),
     memberPolicy: (node: number, capacity_weight: number, failure_domain?: string | null) =>

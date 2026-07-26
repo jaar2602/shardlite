@@ -68,7 +68,7 @@ pub enum Requirement {
 /// its requirement here or fail to compile, rather than defaulting to something.
 pub fn required(req: &Request) -> Requirement {
     match req {
-        Request::Hello { .. } | Request::Auth { .. } => Requirement::Handshake,
+        Request::Hello { .. } | Request::Auth { .. } | Request::JoinWithToken { .. } => Requirement::Handshake,
 
         Request::Query { .. }
         | Request::QueryAll { .. }

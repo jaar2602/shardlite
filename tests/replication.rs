@@ -4,6 +4,7 @@
 //! leaves the network out — the properties under test are ordering, gap detection, and
 //! bootstrap, none of which a transport changes.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use shardlite::error::Error;
@@ -644,6 +645,35 @@ fn a_partial_transfer_of_a_different_snapshot_is_discarded() {
     // The same snapshot still resumes.
     let again = SnapshotTransfer::begin(stage.path(), second).unwrap();
     assert_eq!(again.offset(), 0);
+}
+
+#[test]
+fn a_resumed_transfer_truncates_bytes_left_by_a_short_write() {
+    use shardlite::replication::bootstrap::{SnapshotId, SnapshotTransfer};
+
+    let stage = TempDir::new().unwrap();
+    let id = SnapshotId {
+        shard: S0,
+        epoch: 3,
+        lsn: 44,
+        total_bytes: 8192,
+    };
+    {
+        let mut transfer = SnapshotTransfer::begin(stage.path(), id).unwrap();
+        transfer.write_chunk(&[0x11; 1024]).unwrap();
+    }
+    // Simulate a short write that reached the file but not the durable metadata offset.
+    let partial = stage.path().join("shard_0.partial");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&partial)
+        .unwrap()
+        .write_all(&[0xFF; 4096])
+        .unwrap();
+
+    let resumed = SnapshotTransfer::begin(stage.path(), id).unwrap();
+    assert_eq!(resumed.offset(), 1024);
+    assert_eq!(std::fs::metadata(partial).unwrap().len(), 1024);
 }
 
 #[test]

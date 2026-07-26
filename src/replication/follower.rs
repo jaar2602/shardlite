@@ -223,6 +223,24 @@ impl Follower {
             .and_then(|file| file.sync_all())
             .map_err(|e| Error::Manifest(format!("fsyncing snapshot {}: {e}", tmp.display())))?;
 
+        // Validate the private install before replacing the live file. A transport or storage
+        // fault must leave the previous follower image and position untouched so the caller can
+        // retry from a fresh snapshot.
+        let integrity = crate::rusqlite::Connection::open(&tmp)
+            .and_then(|connection| {
+                connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            })
+            .map_err(|error| {
+                Error::Manifest(format!("checking snapshot {}: {error}", tmp.display()))
+            })?;
+        if integrity != "ok" {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Manifest(format!(
+                "snapshot {} failed integrity_check: {integrity}",
+                tmp.display()
+            )));
+        }
+
         // The rename and the WAL removal are an apply: a reader holding a connection across
         // the rename keeps the *deleted inode* and serves a database frozen at this instant,
         // forever, with no error. Excluding readers and bumping the generation is the only

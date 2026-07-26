@@ -32,7 +32,8 @@ pub use catalog::{
 };
 pub use catalog_quorum::CatalogQuorum;
 pub use control::{
-    CatalogCommand, CatalogCommandResult, CatalogControl, SplitProgress, TransferProgress,
+    CatalogCommand, CatalogCommandResult, CatalogControl, JoinTokenStore, SplitProgress,
+    TransferProgress,
 };
 pub use durability::{CatalogPosition, Comparison, Durability};
 pub use election::{

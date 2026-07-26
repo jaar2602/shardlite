@@ -74,9 +74,35 @@ Passing this suite is necessary, but is not a production zero-downtime claim. Pr
 qualification still needs:
 
 - network partitions before and after ownership/routing commit, including asymmetric partitions;
-- disk-full, short-write, fsync, checksum/corruption, and snapshot-invalidation faults;
-- a continuous concurrent workload with acknowledged-write tracking and an independent SQLite
-  answer oracle during moves, splits, leader changes, and repeated crashes;
+- true kernel-level disk-full behavior and arbitrary filesystem corruption beyond the deterministic
+  hooks listed below;
+- long-running concurrent workload soak with acknowledged-write tracking and an independent SQLite
+  answer oracle across many successive moves, splits, leader changes, and repeated crashes;
 - stale owner and stale router attempts across generation/epoch changes;
 - replica loss, drain while degraded, capture-log pressure, and large resumable backfills;
 - long-running soak tests and packaged deployment tests on the supported operating systems.
+
+## Deterministic storage and partition faults
+
+Qualification builds (`--features failpoints`) accept a per-process fault file through
+`SHARDLITE_FAULT_FILE`. Replacing its contents takes effect without restarting the process;
+removing the file heals the fault. The ignored `dynamic_crash` matrices fault only the destination
+while the source remains healthy, exercising an asymmetric partition and retry path:
+
+- `network.outbound` blocks connections opened by that process;
+- `disk.catalog.{write,short_write,fsync}` fail catalog publication before a new version is
+  acknowledged;
+- `disk.snapshot.{write,short_write,fsync,corrupt}` fail or corrupt resumable whole-shard images;
+- `disk.split.{write,short_write,fsync,corrupt}` fail or corrupt digest-verified split shadows.
+
+Snapshot installs run SQLite `integrity_check` before rename, and failed/corrupt images are
+discarded so a retry cannot splice stale bytes onto a new snapshot. Run the matrices with:
+
+```sh
+cargo test --features failpoints --test dynamic_crash \
+  snapshot_disk_fault_matrix_never_commits_an_invalid_destination \
+  -- --ignored --nocapture --test-threads=1
+cargo test --features failpoints --test dynamic_crash \
+  split_image_disk_faults_never_commit_an_invalid_shadow \
+  -- --ignored --nocapture --test-threads=1
+```

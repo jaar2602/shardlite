@@ -16,7 +16,7 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SplitImageSide {
@@ -54,6 +54,16 @@ pub enum Request {
         version: u32,
         /// Informational; appears in logs to make a connection identifiable.
         client: String,
+    },
+    /// One-shot learner admission. Unlike normal catalog mutations this may be sent before an
+    /// authenticated session exists; the bearer token is validated and consumed by the leader.
+    JoinWithToken {
+        token: String,
+        local_cluster: Option<crate::cluster::ClusterId>,
+        compatibility: crate::cluster::Compatibility,
+        node: u64,
+        incarnation: u64,
+        address: String,
     },
     /// Run a read against one shard.
     Query {

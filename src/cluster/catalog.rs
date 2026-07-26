@@ -2024,11 +2024,28 @@ fn persist_value<T: Serialize>(path: &Path, magic: &[u8], value: &T) -> Result<(
     {
         let mut file = fs::File::create(&tmp)
             .map_err(|error| Error::Manifest(format!("creating {}: {error}", tmp.display())))?;
+        if crate::failpoint::active("disk.catalog.short_write") {
+            // Leave a durable prefix in the temporary file but do not publish it. The caller
+            // observes an I/O error and the previously committed catalog remains authoritative.
+            file.write_all(magic).map_err(|error| {
+                Error::Manifest(format!("short-writing {}: {error}", tmp.display()))
+            })?;
+            return Err(Error::Manifest(format!(
+                "injected short write while persisting {}",
+                path.display()
+            )));
+        }
         file.write_all(magic)
             .and_then(|_| file.write_all(checksum.as_bytes()))
             .and_then(|_| file.write_all(&(body.len() as u64).to_le_bytes()))
             .and_then(|_| file.write_all(&body))
             .map_err(|error| Error::Manifest(format!("writing {}: {error}", tmp.display())))?;
+        if crate::failpoint::active("disk.catalog.fsync") {
+            return Err(Error::Manifest(format!(
+                "injected fsync failure while persisting {}",
+                path.display()
+            )));
+        }
         file.sync_all()
             .map_err(|error| Error::Manifest(format!("fsyncing {}: {error}", tmp.display())))?;
     }

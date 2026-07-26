@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -35,8 +35,12 @@ struct SplitTable {
     name: String,
     /// Declared routing key. `None` is a keyless table anchored to shard 0.
     key: Option<String>,
-    /// A unique lookup identity: either the single primary key or an unshadowed rowid alias.
+    /// A representative identity name (the first column for a tuple identity), retained for
+    /// compatibility with rowid handling and diagnostics.
     identity: String,
+    /// Columns comprising the stable row identity.  WITHOUT ROWID tables may have a composite
+    /// primary key; the identity is represented as a tuple in capture logs/checkpoints.
+    identity_columns: Vec<String>,
     identity_is_rowid: bool,
     columns: Vec<String>,
     log: String,
@@ -460,13 +464,49 @@ impl SplitSupervisor {
                     "split image ended at byte {offset}, expected {total_bytes}"
                 )));
             }
-            file.write_all(&chunk).map_err(|error| {
-                Error::Manifest(format!(
-                    "writing split image {}: {error}",
+            if crate::failpoint::active("disk.split.write") {
+                return Err(Error::Manifest(format!(
+                    "injected disk-full fault while writing split image {}",
                     partial.display()
-                ))
-            })?;
+                )));
+            }
+            if crate::failpoint::active("disk.split.short_write") {
+                let prefix = (chunk.len() / 2).max(1).min(chunk.len());
+                file.write_all(&chunk[..prefix]).map_err(|error| {
+                    Error::Manifest(format!(
+                        "short-writing split image {}: {error}",
+                        partial.display()
+                    ))
+                })?;
+                return Err(Error::Manifest(format!(
+                    "injected short write while writing split image {}",
+                    partial.display()
+                )));
+            }
+            if crate::failpoint::active("disk.split.corrupt") {
+                let mut corrupted = chunk.clone();
+                corrupted[0] ^= 0xA5;
+                file.write_all(&corrupted).map_err(|error| {
+                    Error::Manifest(format!(
+                        "writing split image {}: {error}",
+                        partial.display()
+                    ))
+                })?;
+            } else {
+                file.write_all(&chunk).map_err(|error| {
+                    Error::Manifest(format!(
+                        "writing split image {}: {error}",
+                        partial.display()
+                    ))
+                })?;
+            }
             offset += chunk.len() as u64;
+        }
+        if crate::failpoint::active("disk.split.fsync") {
+            return Err(Error::Manifest(format!(
+                "injected fsync failure while writing split image {}",
+                partial.display()
+            )));
         }
         file.sync_all().map_err(|error| {
             Error::Manifest(format!(
@@ -623,11 +663,20 @@ fn inspect_tables(
             continue;
         }
         let index = tables.len();
-        if sql
-            .trim_start()
-            .to_ascii_uppercase()
-            .starts_with("CREATE VIRTUAL")
-        {
+        let virtual_table = connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_list WHERE name = ?1 AND type = 'virtual' LIMIT 1",
+                [&name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(Error::Sqlite)?
+            .is_some()
+            || sql
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE VIRTUAL");
+        if virtual_table {
             return Err(Error::Unsupported(format!(
                 "online split does not support virtual table `{name}`"
             )));
@@ -641,17 +690,21 @@ fn inspect_tables(
         let sole_primary_key = key
             .as_ref()
             .is_some_and(|key| primary.len() == 1 && primary[0].eq_ignore_ascii_case(key));
-        let (identity, identity_is_rowid) = if sole_primary_key {
-            (key.clone().expect("sole primary key has key"), false)
+        let (identity, identity_columns, identity_is_rowid) = if sole_primary_key {
+            let identity = key.clone().expect("sole primary key has key");
+            (identity.clone(), vec![identity], false)
         } else {
             let upper_sql = sql.to_ascii_uppercase();
             if upper_sql.contains("WITHOUT ROWID") {
-                return Err(Error::Unsupported(format!(
-                    "online split needs a tuple identity for WITHOUT ROWID table `{name}`; \
-                     composite/keyless WITHOUT ROWID tables are not supported yet"
-                )));
-            }
-            let identity = ["rowid", "_rowid_", "oid"]
+                if primary.is_empty() {
+                    return Err(Error::Unsupported(format!(
+                        "online split cannot identify WITHOUT ROWID table `{name}` without a primary key"
+                    )));
+                }
+                let identity = primary.first().cloned().expect("non-empty primary key");
+                (identity, primary, false)
+            } else {
+                let identity = ["rowid", "_rowid_", "oid"]
                 .into_iter()
                 .find(|candidate| {
                     columns
@@ -665,7 +718,8 @@ fn inspect_tables(
                     ))
                 })?
                 .to_string();
-            (identity, true)
+                (identity.clone(), vec![identity], true)
+            }
         };
         if let Some(key) = &key {
             let types_sql = format!(
@@ -689,12 +743,35 @@ fn inspect_tables(
                 )));
             }
         }
+        for identity_column in &identity_columns {
+            let types_sql = format!(
+                "SELECT DISTINCT typeof({}) FROM {} LIMIT 4",
+                quote_ident(identity_column),
+                quote_ident(&name)
+            );
+            let mut types = connection.prepare(&types_sql).map_err(Error::Sqlite)?;
+            let values = types
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(Error::Sqlite)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Sqlite)?;
+            if values
+                .iter()
+                .any(|kind| kind != "integer" && kind != "text" && kind != "blob")
+            {
+                return Err(Error::Unsupported(format!(
+                    "online split requires integer, text, or BLOB identity columns; `{name}.{identity_column}` contains {}",
+                    values.join(", ")
+                )));
+            }
+        }
         let stem = format!("{INTERNAL_PREFIX}{operation}_{index}");
         let state = format!("{INTERNAL_PREFIX}{operation}_state");
         tables.push(SplitTable {
             name,
             key,
             identity,
+            identity_columns,
             identity_is_rowid,
             columns,
             log: format!("{stem}_log"),
@@ -757,8 +834,15 @@ fn install_capture(
     }
     for table in tables {
         statements.push(crate::storage::exec::Statement::new(format!(
-            "CREATE TABLE IF NOT EXISTS {} (seq INTEGER PRIMARY KEY, key)",
-            quote_ident(&table.log)
+            "CREATE TABLE IF NOT EXISTS {} (seq INTEGER PRIMARY KEY, {})",
+            quote_ident(&table.log),
+            table
+                .identity_columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("key_{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
         for (trigger, timing) in [
             (&table.triggers[0], "INSERT"),
@@ -776,15 +860,23 @@ fn install_capture(
                 quote_ident(&table.state),
             )));
         }
-        let immutable_identity = table.identity_is_rowid.then(|| {
+        // Replay addresses rows by their captured identity.  Updating any identity component
+        // during a split would otherwise leave the old key in one shadow and create the new key
+        // in the other; fence this operation as an explicit retryable write instead.
+        let immutable_identity = {
+            let changed = table
+                .identity_columns
+                .iter()
+                .map(|column| format!("NOT (OLD.{0} IS NEW.{0})", quote_ident(column)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
             format!(
-                "SELECT CASE WHEN OLD.{identity} != NEW.{identity} THEN
-                   RAISE(ABORT, 'online split requires stable rowid values for table {table_name}')
+                "SELECT CASE WHEN {changed} THEN
+                   RAISE(ABORT, 'online split requires stable identity values for table {table_name}')
                  END;",
-                identity = quote_ident(&table.identity),
                 table_name = table.name.replace('\'', "''"),
             )
-        });
+        };
         statements.push(crate::storage::exec::Statement::new(format!(
             "CREATE TRIGGER IF NOT EXISTS {} BEFORE UPDATE ON {} BEGIN
                {}
@@ -795,7 +887,7 @@ fn install_capture(
              END",
             quote_ident(&table.triggers[1]),
             quote_ident(&table.name),
-            immutable_identity.unwrap_or_default(),
+            immutable_identity,
             quote_ident(&table.state),
         )));
         for (trigger, timing, value) in [
@@ -803,18 +895,30 @@ fn install_capture(
             (&table.triggers[4], "UPDATE", "NEW"),
             (&table.triggers[5], "DELETE", "OLD"),
         ] {
+            let key_columns = table
+                .identity_columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("key_{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let key_values = table
+                .identity_columns
+                .iter()
+                .map(|column| format!("{value}.{}", quote_ident(column)))
+                .collect::<Vec<_>>()
+                .join(", ");
             statements.push(crate::storage::exec::Statement::new(format!(
                 "CREATE TRIGGER IF NOT EXISTS {} AFTER {timing} ON {} BEGIN
                    UPDATE {} SET pending = pending + 1, next_seq = next_seq + 1
                      WHERE singleton = 1;
-                   INSERT INTO {} (seq, key)
-                     SELECT next_seq, {value}.{} FROM {} WHERE singleton = 1;
+                   INSERT INTO {} (seq, {key_columns})
+                     SELECT next_seq, {key_values} FROM {} WHERE singleton = 1;
                  END",
                 quote_ident(trigger),
                 quote_ident(&table.name),
                 quote_ident(&table.state),
                 quote_ident(&table.log),
-                quote_ident(&table.identity),
                 quote_ident(&table.state),
             )));
         }
@@ -859,6 +963,7 @@ enum CheckpointKey {
     Integer(i64),
     Text(String),
     Blob(Vec<u8>),
+    Tuple(Vec<CheckpointKey>),
 }
 
 #[derive(Debug)]
@@ -951,12 +1056,12 @@ fn build_shadows_resumable(
         let left_tx = left.transaction().map_err(Error::Sqlite)?;
         let right_tx = right.transaction().map_err(Error::Sqlite)?;
         let delete = format!(
-            "DELETE FROM {} WHERE {} = ?1",
+            "DELETE FROM {} WHERE {}",
             quote_ident(&table.name),
-            quote_ident(&table.identity)
+            identity_predicate(&table.identity_columns, 1)
         );
         for row in &rows {
-            let identity = checkpoint_value(&row.identity);
+            let identity = checkpoint_values(&row.identity);
             match row
                 .routing_key
                 .as_ref()
@@ -966,12 +1071,12 @@ fn build_shadows_resumable(
             {
                 shard if shard == source => {
                     right_tx
-                        .execute(&delete, params![identity])
+                        .execute(&delete, rusqlite::params_from_iter(identity.iter()))
                         .map_err(Error::Sqlite)?;
                 }
                 shard if shard == destination => {
                     left_tx
-                        .execute(&delete, params![identity])
+                        .execute(&delete, rusqlite::params_from_iter(identity.iter()))
                         .map_err(Error::Sqlite)?;
                 }
                 shard => {
@@ -1040,27 +1145,50 @@ fn read_backfill_rows(
     after: Option<&CheckpointKey>,
     limit: usize,
 ) -> Result<Vec<BackfillRow>> {
-    let projection = match &table.key {
-        Some(key) if !key.eq_ignore_ascii_case(&table.identity) => {
-            format!("{}, {}", quote_ident(&table.identity), quote_ident(key))
-        }
-        _ => quote_ident(&table.identity),
-    };
+    let projection = table
+        .identity_columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .chain(
+            table
+                .key
+                .iter()
+                .filter(|key| {
+                    !table
+                        .identity_columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(key))
+                })
+                .map(|key| quote_ident(key)),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+    let identity_order = table
+        .identity_columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
     let (sql, values) = match after {
         Some(key) => (
             format!(
-                "SELECT {projection} FROM {} WHERE {} > ?1 ORDER BY {} LIMIT ?2",
-                quote_ident(&table.name),
-                quote_ident(&table.identity),
-                quote_ident(&table.identity),
+                "SELECT {projection} FROM {table} WHERE ({identity_order}) > ({placeholders}) ORDER BY {identity_order} LIMIT ?{limit_index}",
+                table = quote_ident(&table.name),
+                limit_index = table.identity_columns.len() + 1,
+                placeholders = (1..=table.identity_columns.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
-            vec![checkpoint_value(key), Value::Integer(limit as i64)],
+            checkpoint_values(key)
+                .into_iter()
+                .chain(std::iter::once(Value::Integer(limit as i64)))
+                .collect(),
         ),
         None => (
             format!(
-                "SELECT {projection} FROM {} ORDER BY {} LIMIT ?1",
+                "SELECT {projection} FROM {} ORDER BY {identity_order} LIMIT ?1",
                 quote_ident(&table.name),
-                quote_ident(&table.identity),
             ),
             vec![Value::Integer(limit as i64)],
         ),
@@ -1068,25 +1196,30 @@ fn read_backfill_rows(
     let mut statement = snapshot.prepare(&sql).map_err(Error::Sqlite)?;
     statement
         .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            let identity = match row.get_ref(0)? {
-                ValueRef::Integer(value) => CheckpointKey::Integer(value),
-                ValueRef::Text(value) => {
-                    CheckpointKey::Text(String::from_utf8_lossy(value).into_owned())
-                }
-                ValueRef::Blob(value) => CheckpointKey::Blob(value.to_vec()),
-                other => Err(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    other.data_type(),
-                    "split checkpoint identity is not integer, text, or BLOB".into(),
-                ))?,
+            let identities = (0..table.identity_columns.len())
+                .map(|index| checkpoint_from_ref(row.get_ref(index)?))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let identity = if identities.len() == 1 {
+                identities.into_iter().next().expect("one identity")
+            } else {
+                CheckpointKey::Tuple(identities)
             };
-            let routing_key = match &table.key {
-                Some(key) if !key.eq_ignore_ascii_case(&table.identity) => {
-                    Some(owned_value(row.get_ref(1)?))
-                }
-                Some(_) => Some(checkpoint_value(&identity)),
-                None => None,
-            };
+            let routing_key = table.key.as_ref().and_then(|key| {
+                table
+                    .identity_columns
+                    .iter()
+                    .position(|column| column.eq_ignore_ascii_case(key))
+                    .map(|index| {
+                        checkpoint_values(&identity)
+                            .get(index)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .or_else(|| {
+                        let offset = table.identity_columns.len();
+                        Some(owned_value(row.get_ref(offset).ok()?))
+                    })
+            });
             Ok(BackfillRow {
                 identity,
                 routing_key,
@@ -1102,7 +1235,39 @@ fn checkpoint_value(key: &CheckpointKey) -> Value {
         CheckpointKey::Integer(value) => Value::Integer(*value),
         CheckpointKey::Text(value) => Value::Text(value.clone()),
         CheckpointKey::Blob(value) => Value::Blob(value.clone()),
+        CheckpointKey::Tuple(_) => Value::Null,
     }
+}
+
+fn checkpoint_values(key: &CheckpointKey) -> Vec<Value> {
+    match key {
+        CheckpointKey::Tuple(values) => values.iter().map(checkpoint_value).collect(),
+        value => vec![checkpoint_value(value)],
+    }
+}
+
+fn checkpoint_from_ref(value: ValueRef<'_>) -> rusqlite::Result<CheckpointKey> {
+    Ok(match value {
+        ValueRef::Integer(value) => CheckpointKey::Integer(value),
+        ValueRef::Text(value) => CheckpointKey::Text(String::from_utf8_lossy(value).into_owned()),
+        ValueRef::Blob(value) => CheckpointKey::Blob(value.to_vec()),
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                other.data_type(),
+                "split checkpoint identity is not integer, text, or BLOB".into(),
+            ));
+        }
+    })
+}
+
+fn identity_predicate(columns: &[String], offset: usize) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{} = ?{}", quote_ident(column), offset + index))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn write_backfill_checkpoint(path: &Path, checkpoint: &BackfillCheckpoint) -> Result<()> {
@@ -1159,13 +1324,28 @@ fn replay_dirty(
     let mut consumed = Vec::new();
     for table in tables {
         let log_query = format!(
-            "SELECT seq, key FROM {} ORDER BY seq",
+            "SELECT seq, {} FROM {} ORDER BY seq",
+            table
+                .identity_columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("key_{i}"))
+                .collect::<Vec<_>>()
+                .join(", "),
             quote_ident(&table.log)
         );
         let mut log = source_db.prepare(&log_query).map_err(Error::Sqlite)?;
         let entries = log
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, owned_value(row.get_ref(1)?)))
+                let keys = (0..table.identity_columns.len())
+                    .map(|index| checkpoint_from_ref(row.get_ref(index + 1)?))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let key = if keys.len() == 1 {
+                    keys.into_iter().next().expect("one identity")
+                } else {
+                    CheckpointKey::Tuple(keys)
+                };
+                Ok((row.get::<_, i64>(0)? as u64, key))
             })
             .map_err(Error::Sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -1175,7 +1355,7 @@ fn replay_dirty(
         }
         let table_highest = entries.last().map(|entry| entry.0).unwrap_or_default();
         let select = format!(
-            "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1",
+            "SELECT {} FROM {} WHERE {} LIMIT 1",
             table
                 .columns
                 .iter()
@@ -1183,12 +1363,12 @@ fn replay_dirty(
                 .collect::<Vec<_>>()
                 .join(", "),
             quote_ident(&table.name),
-            quote_ident(&table.identity)
+            identity_predicate(&table.identity_columns, 1)
         );
         let delete = format!(
-            "DELETE FROM {} WHERE {} = ?1",
+            "DELETE FROM {} WHERE {}",
             quote_ident(&table.name),
-            quote_ident(&table.identity)
+            identity_predicate(&table.identity_columns, 1)
         );
         let insert_columns = if table.identity_is_rowid {
             std::iter::once(quote_ident(&table.identity))
@@ -1214,18 +1394,23 @@ fn replay_dirty(
         let right_tx = right.transaction().map_err(Error::Sqlite)?;
         for (sequence, key) in entries {
             highest = highest.max(sequence);
+            let key_values = checkpoint_values(&key);
             left_tx
-                .execute(&delete, params![&key])
+                .execute(&delete, rusqlite::params_from_iter(key_values.iter()))
                 .map_err(Error::Sqlite)?;
             right_tx
-                .execute(&delete, params![&key])
+                .execute(&delete, rusqlite::params_from_iter(key_values.iter()))
                 .map_err(Error::Sqlite)?;
             let row = source_db
-                .query_row(&select, params![&key], |row| {
-                    (0..table.columns.len())
-                        .map(|index| row.get::<_, Value>(index))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                })
+                .query_row(
+                    &select,
+                    rusqlite::params_from_iter(key_values.iter()),
+                    |row| {
+                        (0..table.columns.len())
+                            .map(|index| row.get::<_, Value>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    },
+                )
                 .optional()
                 .map_err(Error::Sqlite)?;
             let Some(values) = row else {
@@ -1243,7 +1428,7 @@ fn replay_dirty(
                 None => source,
             };
             let insert_values = if table.identity_is_rowid {
-                std::iter::once(&key)
+                std::iter::once(&key_values[0])
                     .chain(values.iter())
                     .collect::<Vec<_>>()
             } else {
@@ -1817,6 +2002,105 @@ mod tests {
             settings_rows(&source.path(dir.path()))
         );
         assert!(settings_rows(&paths.right).is_empty());
+    }
+
+    #[test]
+    fn without_rowid_composite_identity_is_captured_as_a_tuple() {
+        let dir = TempDir::new().unwrap();
+        let source = ShardId(0);
+        {
+            let connection = Connection::open(source.path(dir.path())).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE pairs (
+                         tenant TEXT NOT NULL,
+                         sequence INTEGER NOT NULL,
+                         payload TEXT,
+                         PRIMARY KEY (tenant, sequence)
+                     ) WITHOUT ROWID;
+                     INSERT INTO pairs VALUES ('a', 1, 'one'), ('a', 2, 'two'), ('b', 1, 'three');",
+                )
+                .unwrap();
+        }
+        let manager = ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap();
+        manager
+            .set_routing(Routing::LinearV1(LinearV1::ONE))
+            .unwrap();
+        manager.declare_shard_key("pairs", "tenant").unwrap();
+        let tables = inspect_tables(&source.path(dir.path()), 71, &manager.shard_keys()).unwrap();
+        assert_eq!(tables[0].identity_columns, vec!["tenant", "sequence"]);
+        assert!(!tables[0].identity_is_rowid);
+        install_capture(&manager, source, &tables, 100).unwrap();
+        let moved_identity = manager
+            .execute_one(
+                source,
+                Statement::new("UPDATE pairs SET sequence = 9 WHERE tenant = 'a' AND sequence = 1"),
+            )
+            .unwrap();
+        assert!(
+            matches!(moved_identity, Outcome::Rejected(message) if message.contains("stable identity"))
+        );
+        ensure_outcomes(
+            manager
+                .execute_txn(
+                    source,
+                    vec![
+                        Statement::new("UPDATE pairs SET payload = 'changed' WHERE tenant = 'a' AND sequence = 2"),
+                        Statement::new("DELETE FROM pairs WHERE tenant = 'b' AND sequence = 1"),
+                        Statement::new("INSERT INTO pairs VALUES ('c', 4, 'new')"),
+                    ],
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let connection = Connection::open(source.path(dir.path())).unwrap();
+        let mut statement = connection
+            .prepare("SELECT key_0, key_1 FROM __shardlite_split_71_0_log ORDER BY seq")
+            .unwrap();
+        let keys = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![("a".into(), 2), ("b".into(), 1), ("c".into(), 4)]
+        );
+
+        let paths = SplitPaths::new(dir.path(), 71);
+        fs::create_dir_all(&paths.dir).unwrap();
+        manager.snapshot(source, &paths.snapshot).unwrap();
+        let after = Routing::LinearV1(LinearV1::for_shard_count(2).unwrap());
+        build_shadows_resumable(&paths, &tables, source, ShardId(1), after, 2).unwrap();
+    }
+
+    #[test]
+    fn virtual_tables_are_refused_before_capture_install() {
+        let dir = TempDir::new().unwrap();
+        let source = ShardId(0);
+        let connection = Connection::open(source.path(dir.path())).unwrap();
+        connection
+            .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+            .unwrap();
+        let error = inspect_tables(
+            &source.path(dir.path()),
+            73,
+            &crate::query::ShardKeys::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("virtual table `docs`"))
+        );
     }
 
     #[test]

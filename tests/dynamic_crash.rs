@@ -283,23 +283,29 @@ fn transient_network_and_catalog_disk_faults_heal_without_unsafe_commit() {
     seed_rows(&node1_addr);
 
     let before = catalog_state(&node1_addr);
-    node1.set_fault("disk.catalog.write");
-    let mut client = Client::connect_with(&node1_addr, Duration::from_secs(1)).unwrap();
-    assert!(
-        client
-            .catalog_command(CatalogCommand::Cordon {
-                node: 1,
-                cordoned: true,
-            })
-            .is_err(),
-        "an injected catalog disk failure must not be acknowledged"
-    );
-    assert_eq!(
-        catalog_state(&node1_addr).version,
-        before.version,
-        "a failed catalog fsync must leave the committed version unchanged"
-    );
-    node1.clear_fault();
+    for fault in [
+        "disk.catalog.write",
+        "disk.catalog.short_write",
+        "disk.catalog.fsync",
+    ] {
+        node1.set_fault(fault);
+        let mut client = Client::connect_with(&node1_addr, Duration::from_secs(1)).unwrap();
+        assert!(
+            client
+                .catalog_command(CatalogCommand::Cordon {
+                    node: 1,
+                    cordoned: true,
+                })
+                .is_err(),
+            "an injected {fault} must not be acknowledged"
+        );
+        assert_eq!(
+            catalog_state(&node1_addr).version,
+            before.version,
+            "a failed catalog write must leave the committed version unchanged"
+        );
+        node1.clear_fault();
+    }
     let mut client = Client::connect_with(&node1_addr, Duration::from_secs(1)).unwrap();
     client
         .catalog_command(CatalogCommand::Cordon {
@@ -381,6 +387,81 @@ fn transient_network_and_catalog_disk_faults_heal_without_unsafe_commit() {
             || stale_owner.to_string().contains("being followed"),
         "the old primary returned an unexpected stale-owner result: {stale_owner}"
     );
+}
+
+#[test]
+#[ignore = "live snapshot fault qualification; run explicitly with --ignored"]
+fn snapshot_disk_fault_matrix_never_commits_an_invalid_destination() {
+    // These faults are injected in the destination process only.  This is intentionally
+    // asymmetric: the source remains healthy and can continue serving reads/writes while the
+    // destination retries its bootstrap.  The operation must not cross the ownership fence until
+    // a complete, fsynced, integrity-checked image is available.
+    for fault in [
+        "disk.snapshot.write",
+        "disk.snapshot.short_write",
+        "disk.snapshot.fsync",
+        "disk.snapshot.corrupt",
+    ] {
+        qualify_image_fault(fault, OperationKind::Transfer, 2);
+    }
+}
+
+#[test]
+#[ignore = "live split fault qualification; run explicitly with --ignored"]
+fn split_image_disk_faults_never_commit_an_invalid_shadow() {
+    // A one-shard cluster joins a second node by splitting the source image. The same fault
+    // matrix must hold for both shadow images and their digest-verified cutover.
+    for fault in [
+        "disk.split.write",
+        "disk.split.short_write",
+        "disk.split.fsync",
+        "disk.split.corrupt",
+    ] {
+        qualify_image_fault(fault, OperationKind::Split, 1);
+    }
+}
+
+fn qualify_image_fault(fault: &str, kind: OperationKind, initial_shards: u32) {
+    let fixture = TempDir::new().unwrap();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_shardlite"));
+    let node1_dir = fixture.path().join("node-1");
+    let node2_dir = fixture.path().join("node-2");
+    let node1_addr = free_addr();
+    let node2_addr = free_addr();
+    init(&binary, &node1_dir, &node1_addr, initial_shards);
+    let mut node1 = ServerProcess::start(&binary, &node1_dir, None, Path::new("unused"));
+    wait_ready(&node1_addr, &mut node1);
+    wait_leader(&node1_addr);
+    seed_rows(&node1_addr);
+
+    // `join` only bootstraps the durable directory.  The server process is started after the
+    // fault is armed, so all destination-side snapshot writes observe the same injected fault.
+    join(&binary, &node2_dir, &node1_addr, &node2_addr);
+    let node2_fault_file = node2_dir.join(".qualification-faults");
+    std::fs::write(&node2_fault_file, fault).unwrap();
+    let mut node2 = ServerProcess::start(&binary, &node2_dir, None, Path::new("unused"));
+    wait_ready(&node2_addr, &mut node2);
+
+    wait_catalog(&node1_addr, Duration::from_secs(20), |catalog| {
+        catalog
+            .operations
+            .values()
+            .any(|operation| operation.kind == kind)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !operation_complete(&catalog_state(&node1_addr), kind),
+        "{fault} allowed ownership commit before destination image was valid"
+    );
+
+    // Healing the fault must make the existing durable transfer retry.  No file deletion or
+    // manual catalog repair is allowed in this path.
+    node2.clear_fault();
+    wait_catalog(&node1_addr, Duration::from_secs(45), |catalog| {
+        operation_complete(catalog, kind)
+    });
+    assert_exact_rows(&node1_addr);
+    assert_exact_rows(&node2_addr);
 }
 
 fn catalog_state(address: &str) -> Catalog {

@@ -1749,7 +1749,7 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("POST", ["cluster", "drain" | "cordon" | "step-down" | "prefer"]) => {
             Some(Permission::Operate)
         }
-        ("POST", ["cluster", "rebalance" | "voters"])
+        ("POST", ["cluster", "rebalance" | "voters" | "join-token"])
         | ("POST", ["cluster", "policy"])
         | ("POST", ["cluster", "members", _, "cordon" | "drain" | "policy"])
         | ("DELETE", ["cluster", "members", _]) => Some(Permission::Operate),

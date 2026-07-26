@@ -121,6 +121,41 @@ pub struct Client {
 }
 
 impl Client {
+    /// Redeem a one-shot join token without requiring a pre-existing cluster user. The request is
+    /// sent as the first frame on a short-lived connection and the server closes it after the
+    /// catalog response, preventing token reuse on a kept-alive session.
+    pub fn join_with_token(
+        addr: &str,
+        timeout: Duration,
+        token: String,
+        local_cluster: Option<crate::cluster::ClusterId>,
+        compatibility: crate::cluster::Compatibility,
+        node: u64,
+        incarnation: u64,
+        address: String,
+    ) -> Result<crate::cluster::CatalogCommandResult> {
+        let tcp = Self::connect_tcp(addr, timeout, timeout)?;
+        let mut stream = super::transport::Stream::Plain(tcp);
+        write_message(
+            &mut stream,
+            &Request::JoinWithToken {
+                token,
+                local_cluster,
+                compatibility,
+                node,
+                incarnation,
+                address,
+            },
+        )?;
+        match read_message(&mut stream)? {
+            Response::CatalogChanged(result) => Ok(result),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(Error::Protocol(format!(
+                "unexpected token join response: {other:?}"
+            ))),
+        }
+    }
+
     pub fn connect(addr: &str) -> Result<Self> {
         Self::connect_with(addr, Duration::from_secs(30))
     }

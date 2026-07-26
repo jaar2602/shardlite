@@ -439,8 +439,9 @@ interrupted install/cleanup roll forward.
 Split preflight accepts declared text/integer/BLOB shard keys whether they are a single primary key,
 part of a composite key, or backed by SQLite's rowid; keyless rowid tables remain anchored to shard
 0. Capture rows carry a stable row identity, so replay reads the committed source row and does not
-re-run user SQL. Virtual tables and `WITHOUT ROWID` tables still fail closed until their module and
-tuple-identity behavior has a differential proof. A source may have replicas: every current copy is
+re-run user SQL. Composite-primary-key `WITHOUT ROWID` tables use tuple identities for capture,
+ordering, and replay; virtual tables remain fail closed because module-owned state is not portable
+through SQLite snapshots. A source may have replicas: every current copy is
 required to durably acknowledge both shadow installs before the routing epoch commits. The capture
 log is bounded with an explicit retryable backpressure sentinel, and large scans fsync a resumable
 row cursor after each batch. Phase-by-phase process-exit/restart qualification verifies automatic
@@ -475,6 +476,6 @@ than they deliver:
   starts small, but raising that implementation ceiling still requires a format/runtime change.
 - **HA logical split requires every current copy to acknowledge both shadow installs.** A lagging or
   unavailable replica blocks the routing commit until it catches up or the operation is aborted.
-- **A split has schema limits.** Virtual tables and `WITHOUT ROWID` tables are refused until their
-  module/tuple identity behavior has a differential proof; keyless rowid and composite-key tables
-  are supported with stable row identities.
+- **A split has schema limits.** Virtual tables are refused because module-owned state is not
+  portable through a generic SQLite snapshot. Keyless rowid and composite-key tables, including
+  composite-primary-key `WITHOUT ROWID` tables, use stable scalar/tuple identities.

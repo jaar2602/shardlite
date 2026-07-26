@@ -83,8 +83,9 @@ shardlite serve ./node-2
 The leader then splits or transfers one shard at a time to use the new capacity. Dynamic mode is
 experimental: online splits support declared text/integer/BLOB keys, composite-key and keyless
 rowid tables, and require every current replica to durably acknowledge both shadow installs before
-the routing epoch commits. Virtual and `WITHOUT ROWID` tables still fail closed pending differential
-proof. See the [dynamic scaling plan](docs/dynamic-scaling-plan.md) and [backlog status](docs/backlog.md).
+the routing epoch commits. Composite-primary-key `WITHOUT ROWID` tables are supported through tuple
+identity capture; virtual tables still fail closed because their module state is not portable via
+SQLite snapshots. See the [dynamic scaling plan](docs/dynamic-scaling-plan.md) and [backlog status](docs/backlog.md).
 
 Dynamic topology crash recovery has a deterministic, process-level qualification suite. It kills
 real server processes without running destructors, restarts the same data directories, waits for

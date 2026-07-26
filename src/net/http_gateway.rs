@@ -231,6 +231,9 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/voters") => {
                 return self.handle_catalog_voters(req, role);
             }
+            (Method::Post, "/v1/cluster/join-token") => {
+                return self.handle_join_token(req, role);
+            }
             (Method::Post, p) if p.starts_with("/v1/cluster/members/") => {
                 let suffix = p.trim_start_matches("/v1/cluster/members/").to_string();
                 return self.handle_catalog_member(req, role, suffix, false);
@@ -1096,6 +1099,68 @@ impl HttpGateway {
             self.check(role, Requirement::Admin)?;
             let result = self.catalog_command(crate::cluster::CatalogCommand::Rebalance)?;
             Ok((202, result))
+        })();
+        respond_json(req, out);
+    }
+
+    /// `POST /v1/cluster/join-token` (Admin) — issue a short-lived, single-use learner admission
+    /// credential. The response contains only the bearer value and expiry; the durable ledger
+    /// stores a hash, so a catalog backup cannot mint a usable token.
+    fn handle_join_token(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let cluster = self
+                .services
+                .cluster
+                .as_ref()
+                .ok_or_else(|| HttpError::new(409, "this is not a cluster member"))?;
+            if !cluster.is_leader() {
+                return Err(HttpError::new(
+                    409,
+                    &format!(
+                        "join tokens must be issued by the catalog leader; this node sees leader {:?}",
+                        cluster.leader()
+                    ),
+                ));
+            }
+            let body = read_body(&mut req)?;
+            #[derive(serde::Deserialize, Default)]
+            struct Body {
+                ttl_seconds: Option<u64>,
+            }
+            let b: Body = if body.is_empty() {
+                Body::default()
+            } else {
+                serde_json::from_slice(&body)
+                    .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?
+            };
+            let control = self
+                .services
+                .catalog_control
+                .as_ref()
+                .ok_or_else(|| HttpError::new(409, "dynamic catalog mode is not enabled"))?;
+            let (token, expires_at) = control
+                .issue_join_token(b.ttl_seconds.unwrap_or(900))
+                .map_err(|e| error_to_http(&e))?;
+            let seed = control
+                .snapshot()
+                .members
+                .get(&cluster.id())
+                .map(|member| member.address.clone())
+                .unwrap_or_else(|| self.cfg.addr.clone());
+            Ok((
+                201,
+                serde_json::json!({
+                    "token": token,
+                    "expires_at": expires_at,
+                    "single_use": true,
+                    "scope": "learner-admission",
+                    "command": format!(
+                        "shardlite join <data-dir> --seed {} --node-id <N> --listen <ADDR> --token {}",
+                        seed, token
+                    ),
+                }),
+            ))
         })();
         respond_json(req, out);
     }

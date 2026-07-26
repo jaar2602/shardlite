@@ -205,6 +205,12 @@ impl SnapshotTransfer {
         me.file
             .seek(SeekFrom::Start(written))
             .map_err(|e| Error::Manifest(format!("seeking partial to {written}: {e}")))?;
+        // A failed short write may have left bytes beyond the durable metadata offset. Truncate
+        // before retrying; otherwise those stale bytes could survive a successful retry and turn
+        // into a byte-valid but wrong-sized SQLite image.
+        me.file
+            .set_len(written)
+            .map_err(|e| Error::Manifest(format!("truncating {}: {e}", me.partial.display())))?;
         me.persist_meta()?;
         Ok(me)
     }
@@ -227,11 +233,45 @@ impl SnapshotTransfer {
         if data.is_empty() {
             return Ok(());
         }
-        self.file
-            .write_all(data)
-            .map_err(|e| Error::Manifest(format!("writing {}: {e}", self.partial.display())))?;
+        // Qualification builds can exercise filesystem failures deterministically. Every fault
+        // is injected before the progress marker advances, so retrying this chunk is safe.
+        if crate::failpoint::active("disk.snapshot.write") {
+            return Err(Error::Manifest(format!(
+                "injected disk-full fault while writing {}",
+                self.partial.display()
+            )));
+        }
+        if crate::failpoint::active("disk.snapshot.short_write") {
+            let prefix = (data.len() / 2).max(1).min(data.len());
+            self.file
+                .write_all(&data[..prefix])
+                .map_err(|e| Error::Manifest(format!("writing {}: {e}", self.partial.display())))?;
+            return Err(Error::Manifest(format!(
+                "injected short write while writing {}",
+                self.partial.display()
+            )));
+        }
+        if crate::failpoint::active("disk.snapshot.corrupt") {
+            // Mutate only the private transfer image. The install path integrity-checks it before
+            // rename, keeping the follower's previous image intact on rejection.
+            let mut corrupted = data.to_vec();
+            corrupted[0] ^= 0xA5;
+            self.file
+                .write_all(&corrupted)
+                .map_err(|e| Error::Manifest(format!("writing {}: {e}", self.partial.display())))?;
+        } else {
+            self.file
+                .write_all(data)
+                .map_err(|e| Error::Manifest(format!("writing {}: {e}", self.partial.display())))?;
+        }
         // Durable before the offset moves. A crash between the two replays a chunk, which
         // is harmless; the reverse order would skip one, which is not.
+        if crate::failpoint::active("disk.snapshot.fsync") {
+            return Err(Error::Manifest(format!(
+                "injected fsync failure while writing {}",
+                self.partial.display()
+            )));
+        }
         self.file
             .sync_data()
             .map_err(|e| Error::Manifest(format!("syncing {}: {e}", self.partial.display())))?;
@@ -248,7 +288,17 @@ impl SnapshotTransfer {
             )));
         }
         drop(self.file);
-        follower.install_snapshot(self.id.shard, self.id.epoch, self.id.lsn, &self.partial)?;
+        if let Err(error) =
+            follower.install_snapshot(self.id.shard, self.id.epoch, self.id.lsn, &self.partial)
+        {
+            // A complete transfer can still fail validation (for example a checksum or media
+            // corruption fault). Do not retain that image as a resumable prefix: retrying from
+            // its end would reproduce the same invalid bytes forever. The follower's previous
+            // image is untouched because install_snapshot validates before rename.
+            let _ = std::fs::remove_file(&self.partial);
+            let _ = std::fs::remove_file(&self.meta);
+            return Err(error);
+        }
         let _ = std::fs::remove_file(&self.partial);
         let _ = std::fs::remove_file(&self.meta);
         tracing::info!(shard = %self.id.shard, bytes = self.written, "snapshot installed");

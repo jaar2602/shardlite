@@ -1,6 +1,9 @@
 //! Typed, idempotent catalog mutations shared by native RPC, HTTP, and the reconciler.
 
-use std::sync::Arc;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +49,17 @@ pub enum SplitProgress {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CatalogCommand {
     Join {
+        local_cluster: Option<ClusterId>,
+        compatibility: Compatibility,
+        node: u64,
+        incarnation: u64,
+        address: String,
+    },
+    /// A learner admission carrying a single-use, expiring token issued by the console/API.
+    /// Kept separate from the internal Join command so callers cannot accidentally bypass the
+    /// admission credential when exposing a management endpoint.
+    JoinWithToken {
+        token: String,
         local_cluster: Option<ClusterId>,
         compatibility: Compatibility,
         node: u64,
@@ -101,11 +115,137 @@ pub struct CatalogCommandResult {
 
 pub struct CatalogControl {
     quorum: Arc<CatalogQuorum>,
+    join_tokens: Arc<JoinTokenStore>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JoinTokenRecord {
+    hash: [u8; 32],
+    expires_at: u64,
+    used: bool,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct JoinTokenFile {
+    tokens: Vec<JoinTokenRecord>,
+}
+
+/// Durable token ledger. Only hashes are written to disk; the bearer value is returned once and
+/// cannot be recovered from a catalog or backup. The mutex makes consume atomic for concurrent
+/// HTTP requests, while fsync-before-return keeps issuance/consumption crash-safe.
+pub struct JoinTokenStore {
+    path: Option<PathBuf>,
+    state: Mutex<JoinTokenFile>,
+}
+
+impl JoinTokenStore {
+    pub fn memory() -> Self {
+        Self {
+            path: None,
+            state: Mutex::new(JoinTokenFile::default()),
+        }
+    }
+
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let state = if path.exists() {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| Error::Manifest(format!("reading join tokens: {e}")))?;
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .map_err(|e| Error::Manifest(format!("decoding join tokens: {e}")))?
+                .0
+        } else {
+            JoinTokenFile::default()
+        };
+        Ok(Self {
+            path: Some(path),
+            state: Mutex::new(state),
+        })
+    }
+
+    fn persist(&self, state: &JoinTokenFile) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Manifest(format!("creating join token directory: {e}")))?;
+        let tmp = path.with_extension("tmp");
+        let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
+            .map_err(|e| Error::Manifest(format!("encoding join tokens: {e}")))?;
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| Error::Manifest(format!("creating join token file: {e}")))?;
+            f.write_all(&bytes)
+                .and_then(|_| f.sync_all())
+                .map_err(|e| Error::Manifest(format!("persisting join tokens: {e}")))?;
+        }
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::Manifest(format!("installing join tokens: {e}")))?;
+        let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+        Ok(())
+    }
+
+    pub fn issue(&self, ttl: u64) -> Result<(String, u64)> {
+        let ttl = ttl.clamp(60, 86_400);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expires_at = now.saturating_add(ttl);
+        let raw = crate::net::auth::nonce()?;
+        let token = raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let rec = JoinTokenRecord {
+            hash: *blake3::hash(token.as_bytes()).as_bytes(),
+            expires_at,
+            used: false,
+        };
+        let mut state = self.state.lock().expect("join token mutex poisoned");
+        state.tokens.retain(|t| !t.used && t.expires_at > now);
+        state.tokens.push(rec);
+        self.persist(&state)?;
+        Ok((token, expires_at))
+    }
+
+    pub fn consume(&self, token: &str) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let hash = *blake3::hash(token.as_bytes()).as_bytes();
+        let mut state = self.state.lock().expect("join token mutex poisoned");
+        let rec = state
+            .tokens
+            .iter_mut()
+            .find(|r| r.hash == hash)
+            .ok_or_else(|| Error::ClusterConfig("join token is invalid or already used".into()))?;
+        if rec.used || rec.expires_at <= now {
+            return Err(Error::ClusterConfig(
+                "join token is expired or already used".into(),
+            ));
+        }
+        rec.used = true;
+        self.persist(&state)
+    }
 }
 
 impl CatalogControl {
     pub fn new(quorum: Arc<CatalogQuorum>) -> Self {
-        Self { quorum }
+        Self {
+            quorum,
+            join_tokens: Arc::new(JoinTokenStore::memory()),
+        }
+    }
+
+    pub fn with_join_tokens(quorum: Arc<CatalogQuorum>, store: Arc<JoinTokenStore>) -> Self {
+        Self {
+            quorum,
+            join_tokens: store,
+        }
+    }
+
+    pub fn issue_join_token(&self, ttl: u64) -> Result<(String, u64)> {
+        self.join_tokens.issue(ttl)
     }
 
     pub fn snapshot(&self) -> Catalog {
@@ -193,6 +333,41 @@ impl CatalogControl {
                             })
                             .map(|candidate| candidate.id);
                     } else {
+                        operation = Some(catalog.start_join(
+                            local_cluster,
+                            compatibility,
+                            node,
+                            incarnation,
+                            address.clone(),
+                        )?);
+                    }
+                }
+                CatalogCommand::JoinWithToken {
+                    token,
+                    local_cluster,
+                    ref compatibility,
+                    node,
+                    incarnation,
+                    ref address,
+                } => {
+                    catalog.validate_join(local_cluster, compatibility)?;
+                    if let Some(member) = catalog.members.get(&node) {
+                        if member.incarnation != incarnation || member.address != *address {
+                            return Err(Error::ClusterConfig(format!(
+                                "node {node} is already registered as a different member"
+                            )));
+                        }
+                        self.join_tokens.consume(&token)?;
+                        operation = catalog
+                            .operations
+                            .values()
+                            .find(|candidate| {
+                                candidate.kind == OperationKind::Join
+                                    && candidate.destination == Some(node)
+                            })
+                            .map(|candidate| candidate.id);
+                    } else {
+                        self.join_tokens.consume(&token)?;
                         operation = Some(catalog.start_join(
                             local_cluster,
                             compatibility,
@@ -335,7 +510,9 @@ impl CatalogControl {
 
 fn command_boundary(command: &CatalogCommand) -> &'static str {
     match command {
-        CatalogCommand::Join { .. } => "join.after_registered",
+        CatalogCommand::Join { .. } | CatalogCommand::JoinWithToken { .. } => {
+            "join.after_registered"
+        }
         CatalogCommand::CompleteJoin { .. } => "join.after_complete",
         CatalogCommand::Rebalance => "catalog.rebalance.after_commit",
         CatalogCommand::Transfer { progress, .. } => match progress {
@@ -375,6 +552,27 @@ fn command_boundary(command: &CatalogCommand) -> &'static str {
         CatalogCommand::Remove { .. } => "member.after_remove",
         CatalogCommand::BeginVoterChange { .. } => "voter.after_joint_commit",
         CatalogCommand::FinalizeVoterChange => "voter.after_finalize_commit",
+    }
+}
+
+#[cfg(test)]
+mod join_token_tests {
+    use super::JoinTokenStore;
+
+    #[test]
+    fn issued_token_is_single_use() {
+        let store = JoinTokenStore::memory();
+        let (token, expiry) = store.issue(60).unwrap();
+        assert!(expiry > 0);
+        store.consume(&token).unwrap();
+        assert!(store.consume(&token).is_err());
+    }
+
+    #[test]
+    fn wrong_token_is_refused() {
+        let store = JoinTokenStore::memory();
+        let (_token, _) = store.issue(60).unwrap();
+        assert!(store.consume("not-a-token").is_err());
     }
 }
 
