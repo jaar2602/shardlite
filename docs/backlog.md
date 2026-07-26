@@ -35,16 +35,35 @@ Implemented:
   whole-shard transfer, fenced transfer repair, and online split boundaries, with automatic
   prepared-value, membership, voter-transition, and operation recovery.
 
+Hardening completed in this slice:
+
+- deterministic network/disk fault hooks, stale-owner/router checks, and continuous concurrent
+  read/write differential workload qualification (including repeated process restarts and replica
+  loss; the long-running tests are intentionally `#[ignore]` and require a network-enabled runner);
+- bounded split-log backpressure with a retryable sentinel and resumable, fsynced large-table scan
+  checkpoints (including orphan/corrupt checkpoint refusal);
+- per-replica split shadow/install and cleanup acknowledgements with image digest verification;
+- differential support for keyless rowid, composite-key, and BLOB-key tables; virtual and
+  `WITHOUT ROWID` tables remain fail-closed pending module/tuple-identity proof;
+- capacity weights, failure-domain-aware placement, split/transfer resource budgets, and mutable
+  policy controls;
+- console display/edit controls for those policies and a read-only packaged-stack verification
+  script at `deploy/stack/verify.sh`.
+
 Still required before calling dynamic mode production-ready:
 
-- network-partition, disk-full/corruption, checksum, and stale-owner/router fault injection;
-- continuous concurrent read/write differential workloads during move/split and coordinator
-  failover, including repeated crashes and replica loss;
-- bounded split-log backpressure and resumable large-table scan checkpoints;
-- per-replica split shadow/install acknowledgements (the current split refuses replicated sources);
-- broader split schema support after differential proof for keyless/virtual/composite-key cases;
-- capacity weights, failure-domain placement rules, resource budgets, and policy thresholds;
-- console join-token/provisioning workflow and build/deployment verification in the packaged stack.
+- an authenticated, single-use join-token issuance and console provisioning workflow (the current
+  console can operate already-joined members, while `shardlite join` remains the explicit
+  self-hosted bootstrap path);
+- production fault injection for true network partitions, disk-full/short-write/fsync corruption,
+  and replica loss under every placement policy, plus deployment verification in a network-enabled
+  CI environment.
+
+Capacity weights and failure-domain-aware replica placement are implemented. The catalog now carries
+operator resource budgets for split/transfer source files and exposes policy/member controls through
+the dynamic HTTP catalog API and console. `deploy/stack/verify.sh` provides a read-only packaged-stack
+smoke check. Join-token issuance/provisioning remains gated on the authenticated token protocol and
+provider orchestration; the Docker demo deliberately stays fixed-shard.
 
 ## Console cluster provisioning — Kubernetes (enterprise, licensed)
 

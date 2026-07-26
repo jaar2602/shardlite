@@ -5,7 +5,7 @@
 //! Network quorum replication is deliberately layered above it so a catalog entry cannot be
 //! acknowledged remotely before the local voter has made it crash-safe.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -23,10 +23,10 @@ use super::term::NodeId;
 const DIRECTORY: &str = "cluster";
 const FILE: &str = "catalog";
 const PREPARED_FILE: &str = "catalog.prepared";
-const MAGIC: &[u8] = b"shardlite-catalog-v1\n";
-const PREPARED_MAGIC: &[u8] = b"shardlite-catalog-prepared-v1\n";
+const MAGIC: &[u8] = b"shardlite-catalog-v2\n";
+const PREPARED_MAGIC: &[u8] = b"shardlite-catalog-prepared-v2\n";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
-pub const CATALOG_FORMAT_VERSION: u32 = 1;
+pub const CATALOG_FORMAT_VERSION: u32 = 2;
 
 /// Stable identity of one cluster. A local data directory may never silently join another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -153,11 +153,67 @@ pub struct Member {
     pub address: String,
     pub role: MemberRole,
     pub state: MemberState,
+    /// Relative primary-placement capacity. A node with weight 4 receives approximately four
+    /// times as many primaries as a node with weight 1.
+    pub capacity_weight: u32,
+    /// Operator supplied topology label (for example an availability zone). Replica placement
+    /// prefers distinct non-empty domains.
+    pub failure_domain: Option<String>,
 }
 
 impl Member {
     pub fn may_receive_placement(&self) -> bool {
         self.role != MemberRole::Learner && self.state == MemberState::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScalingPolicy {
+    /// Maximum retained logical dirty-row records before affected writes receive backpressure.
+    pub split_log_max_rows: u64,
+    /// Rows durably processed between resumable split checkpoints.
+    pub split_backfill_batch_rows: u32,
+    /// Refuse a split whose source file exceeds this size. Zero disables the ceiling.
+    pub max_split_source_bytes: u64,
+    /// Refuse a whole-shard transfer whose source file exceeds this budget. Zero disables it.
+    #[serde(default)]
+    pub max_transfer_source_bytes: u64,
+    /// Current implementation deliberately serializes topology changes; values above one are
+    /// refused until per-node movement accounting is implemented.
+    pub max_concurrent_topology_operations: u32,
+}
+
+impl Default for ScalingPolicy {
+    fn default() -> Self {
+        Self {
+            split_log_max_rows: 100_000,
+            split_backfill_batch_rows: 2_048,
+            max_split_source_bytes: 0,
+            max_transfer_source_bytes: 0,
+            max_concurrent_topology_operations: 1,
+        }
+    }
+}
+
+impl ScalingPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if self.split_log_max_rows == 0 {
+            return Err(Error::ClusterConfig(
+                "split_log_max_rows must be at least one".into(),
+            ));
+        }
+        if self.split_backfill_batch_rows == 0 {
+            return Err(Error::ClusterConfig(
+                "split_backfill_batch_rows must be at least one".into(),
+            ));
+        }
+        if self.max_concurrent_topology_operations != 1 {
+            return Err(Error::ClusterConfig(
+                "max_concurrent_topology_operations must remain 1 in this release".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -237,6 +293,12 @@ pub struct CatalogOperation {
     /// destination was already a replica before the move; otherwise bootstrap temporarily added
     /// a copy and cleanup removes the source to restore the prior copy count.
     pub retain_source_replica: bool,
+    /// Nodes that must install both split images before the routing epoch may publish.
+    pub split_required_nodes: BTreeSet<NodeId>,
+    /// Required nodes that durably installed both images.
+    pub split_installed_nodes: BTreeSet<NodeId>,
+    /// Required nodes that removed split capture/staging state after routing commit.
+    pub split_cleaned_nodes: BTreeSet<NodeId>,
     pub created_version: u64,
     pub last_error: Option<String>,
 }
@@ -249,6 +311,7 @@ pub struct Catalog {
     pub routing_epoch: u64,
     pub compatibility: Compatibility,
     pub routing: Routing,
+    pub scaling_policy: ScalingPolicy,
     pub members: BTreeMap<NodeId, Member>,
     /// Joint consensus while changing voters. Decisions require a majority of both sets.
     pub voter_transition: Option<VoterTransition>,
@@ -286,6 +349,8 @@ impl Catalog {
                 address,
                 role: MemberRole::Voter,
                 state: MemberState::Active,
+                capacity_weight: 1,
+                failure_domain: None,
             },
         );
         let catalog = Self {
@@ -295,6 +360,7 @@ impl Catalog {
             routing_epoch: 1,
             compatibility,
             routing,
+            scaling_policy: ScalingPolicy::default(),
             members,
             voter_transition: None,
             placements: BTreeMap::new(),
@@ -346,6 +412,8 @@ impl Catalog {
                 address,
                 role: MemberRole::Learner,
                 state: MemberState::Active,
+                capacity_weight: 1,
+                failure_domain: None,
             },
         );
         Ok(())
@@ -371,6 +439,35 @@ impl Catalog {
             .get_mut(&node)
             .ok_or_else(|| Error::ClusterConfig(format!("node {node} is not a member")))?;
         member.state = state;
+        Ok(())
+    }
+
+    pub fn set_member_policy(
+        &mut self,
+        node: NodeId,
+        capacity_weight: u32,
+        failure_domain: Option<String>,
+    ) -> Result<()> {
+        if capacity_weight == 0 {
+            return Err(Error::ClusterConfig(
+                "member capacity_weight must be at least one".into(),
+            ));
+        }
+        let failure_domain = failure_domain
+            .map(|domain| domain.trim().to_string())
+            .filter(|domain| !domain.is_empty());
+        let member = self
+            .members
+            .get_mut(&node)
+            .ok_or_else(|| Error::ClusterConfig(format!("node {node} is not a member")))?;
+        member.capacity_weight = capacity_weight;
+        member.failure_domain = failure_domain;
+        Ok(())
+    }
+
+    pub fn set_scaling_policy(&mut self, policy: ScalingPolicy) -> Result<()> {
+        policy.validate()?;
+        self.scaling_policy = policy;
         Ok(())
     }
 
@@ -473,16 +570,41 @@ impl Catalog {
             )));
         }
 
+        let mut primary_counts: BTreeMap<NodeId, u64> =
+            eligible.iter().copied().map(|node| (node, 0)).collect();
         for shard_number in 0..self.routing.shard_count() {
-            let primary_index = shard_number as usize % eligible.len();
-            let replicas = (1..copies)
-                .map(|offset| eligible[(primary_index + offset) % eligible.len()])
+            let primary = eligible
+                .iter()
+                .copied()
+                .min_by(|left, right| {
+                    normalized_load_cmp(
+                        primary_counts[left],
+                        self.members[left].capacity_weight,
+                        primary_counts[right],
+                        self.members[right].capacity_weight,
+                    )
+                    .then_with(|| left.cmp(right))
+                })
+                .expect("eligible is non-empty");
+            *primary_counts.get_mut(&primary).expect("eligible count") += 1;
+            let mut replica_candidates: Vec<NodeId> = eligible
+                .iter()
+                .copied()
+                .filter(|node| *node != primary)
                 .collect();
+            replica_candidates.sort_by_key(|node| {
+                let same_domain = same_failure_domain(
+                    self.members[&primary].failure_domain.as_deref(),
+                    self.members[node].failure_domain.as_deref(),
+                );
+                (same_domain, *node)
+            });
+            let replicas = replica_candidates.into_iter().take(copies - 1).collect();
             self.placements.insert(
                 ShardId(shard_number),
                 ReplicaSet {
                     generation: 1,
-                    primary: eligible[primary_index],
+                    primary,
                     replicas,
                 },
             );
@@ -567,6 +689,9 @@ impl Catalog {
                 routing_before: None,
                 routing_after: None,
                 retain_source_replica: false,
+                split_required_nodes: BTreeSet::new(),
+                split_installed_nodes: BTreeSet::new(),
+                split_cleaned_nodes: BTreeSet::new(),
                 created_version: self.version,
                 last_error: None,
             },
@@ -740,10 +865,8 @@ impl Catalog {
 
     /// Plan the next deterministic linear-hash split.
     ///
-    /// The first live-split implementation deliberately requires a single-copy placement. A
-    /// routing epoch must not publish until every required copy has installed both shadows; until
-    /// replica split/install acknowledgements are represented in the catalog, refusing an HA
-    /// split is safer than leaving a promotable replica with the old unsplit image.
+    /// Every current copy is recorded as a required split participant. Routing cannot publish
+    /// until all of them durably acknowledge both shadow images.
     pub fn start_split(&mut self) -> Result<u64> {
         let Routing::LinearV1(current) = self.routing else {
             return Err(Error::ClusterConfig(
@@ -770,13 +893,8 @@ impl Catalog {
         let placement = self.placements.get(&source).ok_or_else(|| {
             Error::ClusterConfig(format!("{source} has no committed placement to split"))
         })?;
-        if !placement.replicas.is_empty() {
-            return Err(Error::ClusterConfig(format!(
-                "{source} has {} replicas; online split waits for per-replica shadow install \
-                 acknowledgements, which are not implemented yet",
-                placement.replicas.len()
-            )));
-        }
+        let mut required_nodes: BTreeSet<NodeId> = placement.replicas.iter().copied().collect();
+        required_nodes.insert(placement.primary);
         if self.placements.contains_key(&destination) {
             return Err(Error::ClusterConfig(format!(
                 "split destination {destination} already has a placement"
@@ -793,6 +911,7 @@ impl Catalog {
         let operation = self.operations.get_mut(&id).expect("new split operation");
         operation.routing_before = Some(self.routing);
         operation.routing_after = Some(next);
+        operation.split_required_nodes = required_nodes;
         Ok(id)
     }
 
@@ -861,10 +980,31 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn record_split_installed(&mut self, operation: u64, node: NodeId) -> Result<()> {
+        let op = self.operation_in(operation, OperationKind::Split, OperationPhase::Installing)?;
+        if !op.split_required_nodes.contains(&node) {
+            return Err(Error::ClusterConfig(format!(
+                "node {node} is not a required participant in split operation {operation}"
+            )));
+        }
+        op.split_installed_nodes.insert(node);
+        Ok(())
+    }
+
     /// Publish an already-installed pair of split images and its new routing epoch atomically in
     /// one catalog value.
     pub fn commit_split(&mut self, operation: u64) -> Result<()> {
-        let (source, owner, generation, before, after, final_sequence, durable_sequence) = {
+        let (
+            source,
+            owner,
+            generation,
+            before,
+            after,
+            final_sequence,
+            durable_sequence,
+            required_nodes,
+            installed_nodes,
+        ) = {
             let op =
                 self.operation_in(operation, OperationKind::Split, OperationPhase::Installing)?;
             (
@@ -875,11 +1015,23 @@ impl Catalog {
                 op.routing_after.expect("validated new split routing"),
                 op.final_lsn,
                 op.durable_lsn,
+                op.split_required_nodes.clone(),
+                op.split_installed_nodes.clone(),
             )
         };
         if final_sequence.is_none() || durable_sequence < final_sequence {
             return Err(Error::ClusterConfig(format!(
                 "split operation {operation} has not durably replayed its final logical sequence"
+            )));
+        }
+        if !required_nodes.is_subset(&installed_nodes) {
+            let missing: Vec<_> = required_nodes
+                .difference(&installed_nodes)
+                .copied()
+                .collect();
+            return Err(Error::ClusterConfig(format!(
+                "split operation {operation} cannot commit; nodes {missing:?} have not installed \
+                 both split images"
             )));
         }
         if self.routing != before {
@@ -909,7 +1061,11 @@ impl Catalog {
             ReplicaSet {
                 generation: 1,
                 primary: owner,
-                replicas: Vec::new(),
+                replicas: required_nodes
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != owner)
+                    .collect(),
             },
         );
         self.routing = after;
@@ -933,7 +1089,30 @@ impl Catalog {
         )
     }
 
+    pub fn record_split_cleaned(&mut self, operation: u64, node: NodeId) -> Result<()> {
+        let op = self.operation_in(operation, OperationKind::Split, OperationPhase::Cleaning)?;
+        if !op.split_required_nodes.contains(&node) {
+            return Err(Error::ClusterConfig(format!(
+                "node {node} is not a required participant in split operation {operation}"
+            )));
+        }
+        op.split_cleaned_nodes.insert(node);
+        Ok(())
+    }
+
     pub fn complete_split(&mut self, operation: u64) -> Result<()> {
+        let op = self.operation_in(operation, OperationKind::Split, OperationPhase::Cleaning)?;
+        if !op.split_required_nodes.is_subset(&op.split_cleaned_nodes) {
+            let missing: Vec<_> = op
+                .split_required_nodes
+                .difference(&op.split_cleaned_nodes)
+                .copied()
+                .collect();
+            return Err(Error::ClusterConfig(format!(
+                "split operation {operation} cannot complete; nodes {missing:?} have not cleaned \
+                 their split staging state"
+            )));
+        }
         self.transition(
             operation,
             OperationKind::Split,
@@ -1278,6 +1457,25 @@ impl Catalog {
                 "catalog routing has no active shards".into(),
             ));
         }
+        self.scaling_policy.validate()?;
+        for member in self.members.values() {
+            if member.capacity_weight == 0 {
+                return Err(Error::ClusterConfig(format!(
+                    "member {} has zero placement capacity weight",
+                    member.node
+                )));
+            }
+            if member
+                .failure_domain
+                .as_ref()
+                .is_some_and(|domain| domain.trim().is_empty())
+            {
+                return Err(Error::ClusterConfig(format!(
+                    "member {} has an empty failure domain",
+                    member.node
+                )));
+            }
+        }
         if !self
             .members
             .values()
@@ -1416,11 +1614,27 @@ impl Catalog {
                     || operation.destination != Some(owner)
                     || operation.expected_generation.is_none()
                     || !self.members.contains_key(&owner)
+                    || !operation.split_required_nodes.contains(&owner)
+                    || operation.split_required_nodes.is_empty()
+                    || !operation
+                        .split_installed_nodes
+                        .is_subset(&operation.split_required_nodes)
+                    || !operation
+                        .split_cleaned_nodes
+                        .is_subset(&operation.split_required_nodes)
                 {
                     return Err(Error::ClusterConfig(format!(
                         "split operation {} references invalid topology state",
                         operation.id
                     )));
+                }
+                for node in &operation.split_required_nodes {
+                    if !self.members.contains_key(node) {
+                        return Err(Error::ClusterConfig(format!(
+                            "split operation {} requires missing node {node}",
+                            operation.id
+                        )));
+                    }
                 }
                 let committed = matches!(
                     operation.phase,
@@ -1429,6 +1643,26 @@ impl Catalog {
                 if committed && self.routing != Routing::LinearV1(after) {
                     return Err(Error::ClusterConfig(format!(
                         "committed split operation {} does not match catalog routing",
+                        operation.id
+                    )));
+                }
+                if committed
+                    && !operation
+                        .split_required_nodes
+                        .is_subset(&operation.split_installed_nodes)
+                {
+                    return Err(Error::ClusterConfig(format!(
+                        "committed split operation {} is missing install acknowledgements",
+                        operation.id
+                    )));
+                }
+                if operation.phase == OperationPhase::Complete
+                    && !operation
+                        .split_required_nodes
+                        .is_subset(&operation.split_cleaned_nodes)
+                {
+                    return Err(Error::ClusterConfig(format!(
+                        "complete split operation {} is missing cleanup acknowledgements",
                         operation.id
                     )));
                 }
@@ -1741,6 +1975,19 @@ impl CatalogStore {
     }
 }
 
+fn normalized_load_cmp(
+    left_count: u64,
+    left_weight: u32,
+    right_count: u64,
+    right_weight: u32,
+) -> std::cmp::Ordering {
+    (left_count as u128 * right_weight as u128).cmp(&(right_count as u128 * left_weight as u128))
+}
+
+fn same_failure_domain(left: Option<&str>, right: Option<&str>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
+}
+
 fn catalog_path(dir: &Path) -> PathBuf {
     dir.join(DIRECTORY).join(FILE)
 }
@@ -1754,6 +2001,12 @@ fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
 }
 
 fn persist_value<T: Serialize>(path: &Path, magic: &[u8], value: &T) -> Result<()> {
+    if crate::failpoint::active("disk.catalog.write") {
+        return Err(Error::Manifest(format!(
+            "injected disk-full fault while persisting {}",
+            path.display()
+        )));
+    }
     let parent = path.parent().expect("catalog path has parent");
     fs::create_dir_all(parent)
         .map_err(|error| Error::Manifest(format!("creating {}: {error}", parent.display())))?;
@@ -1913,6 +2166,67 @@ mod tests {
         catalog.promote(2, MemberRole::Storage).unwrap();
         catalog.initialize_placements(1).unwrap();
         catalog
+    }
+
+    #[test]
+    fn initial_placement_honours_weights_and_separates_replica_domains() {
+        let routing = Routing::LinearV1(LinearV1::for_shard_count(8).unwrap());
+        let mut catalog = Catalog::bootstrap(
+            ClusterId([8; 16]),
+            1,
+            "node-1:4600".into(),
+            routing,
+            Compatibility::current(routing).unwrap(),
+        )
+        .unwrap();
+        for node in 2..=3 {
+            catalog
+                .add_learner(node, 1, format!("node-{node}:4600"))
+                .unwrap();
+            catalog.promote(node, MemberRole::Storage).unwrap();
+        }
+        catalog
+            .set_member_policy(1, 3, Some("zone-a".into()))
+            .unwrap();
+        catalog
+            .set_member_policy(2, 1, Some("zone-a".into()))
+            .unwrap();
+        catalog
+            .set_member_policy(3, 1, Some("zone-b".into()))
+            .unwrap();
+        catalog.initialize_placements(2).unwrap();
+
+        let primaries_on_one = catalog
+            .placements
+            .values()
+            .filter(|placement| placement.primary == 1)
+            .count();
+        assert!(
+            primaries_on_one >= 4,
+            "higher-capacity node did not receive proportionally more primaries"
+        );
+        for placement in catalog.placements.values() {
+            let primary_domain = catalog.members[&placement.primary]
+                .failure_domain
+                .as_deref();
+            assert!(
+                placement.replicas.iter().any(|replica| {
+                    catalog.members[replica].failure_domain.as_deref() != primary_domain
+                }),
+                "replica was not placed in the available alternate failure domain"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_policy_rejects_unbounded_or_unsupported_runtime_settings() {
+        let mut catalog = catalog();
+        let mut policy = ScalingPolicy::default();
+        policy.split_log_max_rows = 0;
+        assert!(catalog.set_scaling_policy(policy).is_err());
+        let mut policy = ScalingPolicy::default();
+        policy.max_concurrent_topology_operations = 2;
+        assert!(catalog.set_scaling_policy(policy).is_err());
     }
 
     #[test]
@@ -2128,6 +2442,7 @@ mod tests {
         catalog.prepare_split(operation).unwrap();
         catalog.begin_split_fencing(operation).unwrap();
         catalog.split_fenced(operation, 9).unwrap();
+        catalog.record_split_installed(operation, 1).unwrap();
         let old_epoch = catalog.routing_epoch;
         catalog.commit_split(operation).unwrap();
 
@@ -2141,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_refuses_a_source_with_unacknowledged_replica_installs() {
+    fn a_split_waits_for_every_replica_install_before_routing_commit() {
         let mut catalog = placed_catalog();
         catalog
             .placements
@@ -2149,8 +2464,24 @@ mod tests {
             .unwrap()
             .replicas
             .push(2);
-        let error = catalog.start_split().unwrap_err();
-        assert!(error.to_string().contains("replica"), "{error}");
+        let operation = catalog.start_split().unwrap();
+        assert_eq!(
+            catalog.operations[&operation].split_required_nodes,
+            BTreeSet::from([1, 2])
+        );
+        catalog.begin_split_snapshot(operation).unwrap();
+        catalog.split_snapshot_ready(operation, 3).unwrap();
+        catalog.record_split_replay(operation, 8).unwrap();
+        catalog.prepare_split(operation).unwrap();
+        catalog.begin_split_fencing(operation).unwrap();
+        catalog.split_fenced(operation, 9).unwrap();
+        catalog.record_split_installed(operation, 1).unwrap();
+        let error = catalog.commit_split(operation).unwrap_err();
+        assert!(error.to_string().contains("[2]"), "{error}");
+
+        catalog.record_split_installed(operation, 2).unwrap();
+        catalog.commit_split(operation).unwrap();
+        assert_eq!(catalog.placements[&ShardId(1)].replicas, vec![2]);
     }
 
     #[test]

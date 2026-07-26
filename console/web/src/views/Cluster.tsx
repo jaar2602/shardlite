@@ -397,6 +397,34 @@ export default function Cluster({ name }: { name: string }) {
                     Joint consensus: [{catalog.voter_transition.old.join(", ")}] → [{catalog.voter_transition.new.join(", ")}]
                   </p>
                 )}
+                {catalog.scaling_policy && (
+                  <div className="border border-carbon-border bg-carbon-bg px-3 py-2 text-xs">
+                    <div className="mb-2 font-semibold text-carbon-text">Safety budgets</div>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-carbon-text-3 sm:grid-cols-3">
+                      <span>capture rows <b className="font-mono text-carbon-text">{catalog.scaling_policy.split_log_max_rows.toLocaleString()}</b></span>
+                      <span>backfill batch <b className="font-mono text-carbon-text">{catalog.scaling_policy.split_backfill_batch_rows.toLocaleString()}</b></span>
+                      <span>split max <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_split_source_bytes ? `${catalog.scaling_policy.max_split_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
+                      <span>transfer max <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_transfer_source_bytes ? `${catalog.scaling_policy.max_transfer_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
+                      <span>concurrency <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_concurrent_topology_operations}</b></span>
+                    </div>
+                    {canOperate && (
+                      <Button
+                        className="mt-2"
+                        variant="secondary"
+                        disabled={catalogBusy}
+                        onClick={() => {
+                          const policy = catalog.scaling_policy;
+                          const maxSplit = Number(prompt("Maximum split source bytes (0 = unlimited)", String(policy.max_split_source_bytes)));
+                          const maxTransfer = Number(prompt("Maximum transfer source bytes (0 = unlimited)", String(policy.max_transfer_source_bytes)));
+                          if (!Number.isSafeInteger(maxSplit) || maxSplit < 0 || !Number.isSafeInteger(maxTransfer) || maxTransfer < 0) return;
+                          void catalogAction("Apply dynamic scaling resource budgets?", (client) => client.scalingPolicy({ ...policy, max_split_source_bytes: maxSplit, max_transfer_source_bytes: maxTransfer }));
+                        }}
+                      >
+                        Edit safety budgets
+                      </Button>
+                    )}
+                  </div>
+                )}
                 {canOperate && (
                   <div className="flex flex-wrap gap-2 pt-2">
                     <Button
@@ -527,6 +555,30 @@ export default function Cluster({ name }: { name: string }) {
                       <div className="my-3 border-t border-carbon-border" />
                       <div className="mb-2 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">Catalog membership</div>
                       <div className="flex flex-wrap gap-2">
+                        {(() => {
+                          const member = catalog.members?.find((item) => String(item.node) === selected.id);
+                          return (
+                            <>
+                              <DetailRow label="capacity weight" value={valueOrDash(member?.capacity_weight ?? 1)} />
+                              <DetailRow label="failure domain" value={member?.failure_domain ?? "unlabelled"} />
+                              <Button
+                                variant="secondary"
+                                disabled={catalogBusy}
+                                onClick={() => {
+                                  const weight = Number(prompt("Capacity weight (positive integer)", String(member?.capacity_weight ?? 1)));
+                                  if (!Number.isInteger(weight) || weight < 1) return;
+                                  const domain = prompt("Failure domain (optional, e.g. az-a)", member?.failure_domain ?? "");
+                                  void catalogAction(
+                                    `Apply placement policy to node ${selected.id}?`,
+                                    (client) => client.memberPolicy(Number(selected.id), weight, domain),
+                                  );
+                                }}
+                              >
+                                Edit placement policy
+                              </Button>
+                            </>
+                          );
+                        })()}
                         <Button
                           variant="secondary"
                           disabled={catalogBusy}

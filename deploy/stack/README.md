@@ -3,6 +3,11 @@
 One command brings up the whole app on Docker — a **3-node HA cluster** and the **web console** —
 with every piece of state on a **Docker volume**, so it survives restarts.
 
+The packaged demo intentionally uses a legacy fixed-shard (12-shard) topology so it starts
+deterministically on a clean Docker host. It is not the dynamic-scaling qualification environment:
+`--shards` is a creation-time setting for these services. Exercise dynamic joins, splits, capacity
+weights, and fenced movement with `shardlite init`/`shardlite join` directories instead.
+
 ```sh
 cd deploy/stack
 ./shardlite-stack up
@@ -26,6 +31,7 @@ connection is already there to browse, query, and point the AI assistant at.
 | `./shardlite-stack logs [svc]` | Follow logs — all services, or one (`node1`/`node2`/`node3`/`console`). |
 | `./shardlite-stack register` | Re-register the cluster connection (idempotent). |
 | `./shardlite-stack destroy` | Stop **and delete all volumes + secrets** (asks for confirmation). |
+| `./verify.sh` | Read-only smoke check for compose config, node/console health, and dynamic catalog policy. |
 
 ## What persists, and how
 

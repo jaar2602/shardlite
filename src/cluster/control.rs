@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Catalog, CatalogQuorum, ClusterId, Compatibility, MemberRole, MemberState, OperationKind,
-    OperationPhase, RebalanceDecision,
+    OperationPhase, RebalanceDecision, ScalingPolicy,
 };
 use crate::error::{Error, Result};
 
@@ -35,8 +35,10 @@ pub enum SplitProgress {
     Prepare,
     BeginFencing,
     Fenced { sequence: u64 },
+    ReplicaInstalled { node: u64 },
     Commit,
     BeginCleanup,
+    ReplicaCleaned { node: u64 },
     Complete,
     Abort { reason: String },
 }
@@ -66,6 +68,14 @@ pub enum CatalogCommand {
     Cordon {
         node: u64,
         cordoned: bool,
+    },
+    SetMemberPolicy {
+        node: u64,
+        capacity_weight: u32,
+        failure_domain: Option<String>,
+    },
+    SetScalingPolicy {
+        policy: ScalingPolicy,
     },
     Drain {
         node: u64,
@@ -253,6 +263,16 @@ impl CatalogControl {
                         },
                     )?;
                 }
+                CatalogCommand::SetMemberPolicy {
+                    node,
+                    capacity_weight,
+                    ref failure_domain,
+                } => {
+                    catalog.set_member_policy(node, capacity_weight, failure_domain.clone())?;
+                }
+                CatalogCommand::SetScalingPolicy { ref policy } => {
+                    catalog.set_scaling_policy(policy.clone())?;
+                }
                 CatalogCommand::Drain { node } => {
                     operation = catalog
                         .operations
@@ -340,12 +360,16 @@ fn command_boundary(command: &CatalogCommand) -> &'static str {
             SplitProgress::Prepare => "split.after_prepared",
             SplitProgress::BeginFencing => "split.after_fencing",
             SplitProgress::Fenced { .. } => "split.after_fenced",
+            SplitProgress::ReplicaInstalled { .. } => "split.after_replica_installed",
             SplitProgress::Commit => "split.after_committed",
             SplitProgress::BeginCleanup => "split.after_cleaning",
+            SplitProgress::ReplicaCleaned { .. } => "split.after_replica_cleaned",
             SplitProgress::Complete => "split.after_complete",
             SplitProgress::Abort { .. } => "split.after_aborted",
         },
         CatalogCommand::Cordon { .. } => "member.after_cordon",
+        CatalogCommand::SetMemberPolicy { .. } => "member.after_policy",
+        CatalogCommand::SetScalingPolicy { .. } => "catalog.after_scaling_policy",
         CatalogCommand::Drain { .. } => "member.after_drain",
         CatalogCommand::CompleteDrain { .. } => "member.after_drain_complete",
         CatalogCommand::Remove { .. } => "member.after_remove",
@@ -379,9 +403,15 @@ fn apply_split(catalog: &mut Catalog, id: u64, progress: &SplitProgress) -> Resu
         SplitProgress::Fenced { sequence } if current == OperationPhase::Fencing => {
             catalog.split_fenced(id, *sequence)
         }
+        SplitProgress::ReplicaInstalled { node } if current == OperationPhase::Installing => {
+            catalog.record_split_installed(id, *node)
+        }
         SplitProgress::Commit if current == OperationPhase::Installing => catalog.commit_split(id),
         SplitProgress::BeginCleanup if current == OperationPhase::Committed => {
             catalog.begin_split_cleanup(id)
+        }
+        SplitProgress::ReplicaCleaned { node } if current == OperationPhase::Cleaning => {
+            catalog.record_split_cleaned(id, *node)
         }
         SplitProgress::Complete if current == OperationPhase::Cleaning => {
             catalog.complete_split(id)
@@ -421,8 +451,10 @@ fn split_progress_already_applied(phase: OperationPhase, progress: &SplitProgres
         SplitProgress::Prepare => OperationPhase::Prepared,
         SplitProgress::BeginFencing => OperationPhase::Fencing,
         SplitProgress::Fenced { .. } => OperationPhase::Installing,
+        SplitProgress::ReplicaInstalled { .. } => OperationPhase::Installing,
         SplitProgress::Commit => OperationPhase::Committed,
         SplitProgress::BeginCleanup => OperationPhase::Cleaning,
+        SplitProgress::ReplicaCleaned { .. } => OperationPhase::Cleaning,
         SplitProgress::Complete => OperationPhase::Complete,
         SplitProgress::Abort { .. } => OperationPhase::Aborted,
     };

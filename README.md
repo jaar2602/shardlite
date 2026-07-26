@@ -81,10 +81,10 @@ shardlite serve ./node-2
 ```
 
 The leader then splits or transfers one shard at a time to use the new capacity. Dynamic mode is
-experimental: online splits currently require every table's declared shard key to be its single
-text/integer primary key, and refuse a source with replicas until replica shadow-install
-acknowledgements are implemented. See the [dynamic scaling plan](docs/dynamic-scaling-plan.md) and
-[backlog status](docs/backlog.md).
+experimental: online splits support declared text/integer/BLOB keys, composite-key and keyless
+rowid tables, and require every current replica to durably acknowledge both shadow installs before
+the routing epoch commits. Virtual and `WITHOUT ROWID` tables still fail closed pending differential
+proof. See the [dynamic scaling plan](docs/dynamic-scaling-plan.md) and [backlog status](docs/backlog.md).
 
 Dynamic topology crash recovery has a deterministic, process-level qualification suite. It kills
 real server processes without running destructors, restarts the same data directories, waits for
@@ -92,6 +92,13 @@ automatic catalog/operation repair, and compares complete rows:
 
 ```sh
 cargo test --features failpoints --test dynamic_crash -- --ignored --nocapture --test-threads=1
+```
+
+For the concurrent differential workload (split/transfer, reader validation, replica loss, and
+coordinator restart), run:
+
+```sh
+cargo test --features failpoints --test dynamic_workload -- --ignored --nocapture --test-threads=1
 ```
 
 The failpoint feature is excluded from normal production builds. See

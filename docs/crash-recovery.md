@@ -24,6 +24,16 @@ real servers:
 cargo test --features failpoints --test dynamic_crash -- --ignored --nocapture --test-threads=1
 ```
 
+The longer concurrent differential workload is a separate ignored target:
+
+```sh
+cargo test --features failpoints --test dynamic_workload -- --ignored --nocapture --test-threads=1
+```
+
+It keeps point writes and readers active while a split/transfer runs, restarts the destination
+twice, restarts the coordinator, and compares every acknowledged row with an independent SQLite
+oracle. These process-level tests require a runner that permits loopback TCP binds.
+
 Run one named boundary while debugging:
 
 ```sh

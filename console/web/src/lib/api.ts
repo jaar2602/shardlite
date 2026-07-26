@@ -617,6 +617,13 @@ export function conn(name: string) {
     // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
     drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
     rebalance: () => req<CatalogMutation>("POST", `${b}/cluster/rebalance`, {}),
+    scalingPolicy: (policy: ScalingPolicy) =>
+      req<CatalogMutation>("POST", `${b}/cluster/policy`, policy),
+    memberPolicy: (node: number, capacity_weight: number, failure_domain?: string | null) =>
+      req<CatalogMutation>("POST", `${b}/cluster/members/${node}/policy`, {
+        capacity_weight,
+        failure_domain: failure_domain || null,
+      }),
     cordonMember: (node: number, cordoned: boolean) =>
       req<CatalogMutation>("POST", `${b}/cluster/members/${node}/cordon`, { cordoned }),
     drainMember: (node: number) =>
@@ -642,6 +649,16 @@ export interface CatalogMember {
   address: string;
   role: "learner" | "storage" | "voter";
   state: "active" | "cordoned" | "draining";
+  capacity_weight?: number;
+  failure_domain?: string | null;
+}
+
+export interface ScalingPolicy {
+  split_log_max_rows: number;
+  split_backfill_batch_rows: number;
+  max_split_source_bytes: number;
+  max_transfer_source_bytes: number;
+  max_concurrent_topology_operations: number;
 }
 
 export interface CatalogOperation {
@@ -664,6 +681,7 @@ export interface ClusterCatalog {
   active_shards?: number;
   local_shard_capacity?: number;
   routing?: Record<string, unknown>;
+  scaling_policy?: ScalingPolicy;
   voter_transition?: { old: number[]; new: number[] } | null;
   members?: CatalogMember[];
   placements?: Array<Record<string, unknown>>;

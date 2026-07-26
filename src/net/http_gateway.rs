@@ -225,6 +225,9 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/rebalance") => {
                 return self.handle_catalog_rebalance(req, role);
             }
+            (Method::Post, "/v1/cluster/policy") => {
+                return self.handle_catalog_policy(req, role);
+            }
             (Method::Post, "/v1/cluster/voters") => {
                 return self.handle_catalog_voters(req, role);
             }
@@ -1097,6 +1100,19 @@ impl HttpGateway {
         respond_json(req, out);
     }
 
+    fn handle_catalog_policy(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let body = read_body(&mut req)?;
+            let policy: crate::cluster::ScalingPolicy = serde_json::from_slice(&body)
+                .map_err(|error| HttpError::new(400, &format!("bad JSON: {error}")))?;
+            let result =
+                self.catalog_command(crate::cluster::CatalogCommand::SetScalingPolicy { policy })?;
+            Ok((200, result))
+        })();
+        respond_json(req, out);
+    }
+
     fn handle_catalog_voters(&self, mut req: Request, role: Option<Role>) {
         let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
             self.check(role, Requirement::Admin)?;
@@ -1159,6 +1175,22 @@ impl HttpGateway {
                         crate::cluster::CatalogCommand::Cordon {
                             node,
                             cordoned: body.cordoned,
+                        }
+                    }
+                    "policy" if !remove => {
+                        #[derive(serde::Deserialize)]
+                        struct Body {
+                            capacity_weight: u32,
+                            #[serde(default)]
+                            failure_domain: Option<String>,
+                        }
+                        let body = read_body(&mut req)?;
+                        let body: Body = serde_json::from_slice(&body)
+                            .map_err(|error| HttpError::new(400, &format!("bad JSON: {error}")))?;
+                        crate::cluster::CatalogCommand::SetMemberPolicy {
+                            node,
+                            capacity_weight: body.capacity_weight,
+                            failure_domain: body.failure_domain,
                         }
                     }
                     "drain" if !remove => crate::cluster::CatalogCommand::Drain { node },
@@ -1672,6 +1704,8 @@ impl HttpGateway {
                     "address": member.address,
                     "role": format!("{:?}", member.role).to_lowercase(),
                     "state": format!("{:?}", member.state).to_lowercase(),
+                    "capacity_weight": member.capacity_weight,
+                    "failure_domain": member.failure_domain,
                     "placement_eligible": member.may_receive_placement(),
                 })
             })
@@ -1717,6 +1751,7 @@ impl HttpGateway {
             "version": catalog.version,
             "routing_epoch": catalog.routing_epoch,
             "routing": catalog.routing,
+            "scaling_policy": catalog.scaling_policy,
             "active_shards": catalog.routing.shard_count(),
             "local_shard_capacity": self.shards.config().shard_count,
             "voter_transition": catalog.voter_transition,

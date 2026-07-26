@@ -1,17 +1,20 @@
 //! Online logical split reconciliation for linear routing.
 //!
 //! The visible source remains authoritative while two hidden shadows are built. Small durable
-//! trigger logs record primary keys dirtied after the snapshot barrier; replay reads the resulting
-//! row from the source, so nondeterministic SQL and user-trigger side effects are never re-executed.
+//! trigger logs record stable row identities dirtied after the snapshot barrier; replay reads the
+//! resulting row from the source, so nondeterministic SQL and user-trigger side effects are never
+//! re-executed.
 //! Only the selected source shard is fenced for the final replay and two-file install.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::net::Client;
@@ -24,14 +27,21 @@ use super::{
 };
 
 const INTERNAL_PREFIX: &str = "__shardlite_split_";
+pub(crate) const BACKPRESSURE_SENTINEL: &str = "SHARDLITE_SPLIT_BACKPRESSURE";
+const DEFAULT_BACKFILL_BATCH_ROWS: usize = 2_048;
 
 #[derive(Debug, Clone)]
 struct SplitTable {
     name: String,
-    key: String,
+    /// Declared routing key. `None` is a keyless table anchored to shard 0.
+    key: Option<String>,
+    /// A unique lookup identity: either the single primary key or an unshadowed rowid alias.
+    identity: String,
+    identity_is_rowid: bool,
     columns: Vec<String>,
     log: String,
-    triggers: [String; 3],
+    state: String,
+    triggers: [String; 6],
 }
 
 pub struct SplitSupervisor {
@@ -83,12 +93,44 @@ impl SplitSupervisor {
         let owner = operation
             .source
             .ok_or_else(|| Error::ClusterConfig("split has no source owner".into()))?;
+        let participant = operation.split_required_nodes.contains(&self.node);
+
+        // The source gate was deliberately closed at the final replay barrier. Once routing is
+        // committed, reopen the complete current primary set in one replacement operation; opening
+        // only the two split shards would accidentally close unrelated shards.
+        if self.node == owner
+            && matches!(
+                operation.phase,
+                OperationPhase::Committed | OperationPhase::Cleaning | OperationPhase::Complete
+            )
+        {
+            let mine: Vec<ShardId> = catalog
+                .placements
+                .iter()
+                .filter_map(|(&shard, placement)| (placement.primary == self.node).then_some(shard))
+                .collect();
+            self.cluster.fence().open_for(&mine, self.cluster.term());
+        }
 
         if self.cluster.is_leader() {
             let progress = match operation.phase {
                 OperationPhase::Planned => Some(SplitProgress::BeginSnapshot),
                 OperationPhase::Prepared => Some(SplitProgress::BeginFencing),
+                OperationPhase::Installing
+                    if operation
+                        .split_required_nodes
+                        .is_subset(&operation.split_installed_nodes) =>
+                {
+                    Some(SplitProgress::Commit)
+                }
                 OperationPhase::Committed => Some(SplitProgress::BeginCleanup),
+                OperationPhase::Cleaning
+                    if operation
+                        .split_required_nodes
+                        .is_subset(&operation.split_cleaned_nodes) =>
+                {
+                    Some(SplitProgress::Complete)
+                }
                 _ => None,
             };
             if let Some(progress) = progress {
@@ -98,6 +140,15 @@ impl SplitSupervisor {
                 })?;
                 return Ok(());
             }
+        }
+
+        if operation.phase == OperationPhase::Installing && participant {
+            self.install_and_ack(operation, owner)?;
+            return Ok(());
+        }
+        if operation.phase == OperationPhase::Cleaning && participant {
+            self.cleanup_and_ack(operation, owner)?;
+            return Ok(());
         }
         if self.node != owner {
             return Ok(());
@@ -117,8 +168,6 @@ impl SplitSupervisor {
             }
             OperationPhase::CatchingUp => self.build_and_replay(operation)?,
             OperationPhase::Fencing => self.fence_and_finalize(operation)?,
-            OperationPhase::Installing => self.install_and_commit(operation)?,
-            OperationPhase::Cleaning => self.cleanup(operation)?,
             _ => {}
         }
         Ok(())
@@ -127,12 +176,25 @@ impl SplitSupervisor {
     fn capture_and_snapshot(&self, operation: &CatalogOperation) -> Result<()> {
         let source = split_source(operation)?;
         self.manager.ensure_open(source)?;
-        let tables = inspect_tables(
-            &source.path(self.manager.dir()),
-            operation.id,
-            &self.manager.shard_keys(),
-        )?;
-        install_capture(&self.manager, source, &tables)?;
+        let policy = self.catalog.snapshot().scaling_policy;
+        let source_path = source.path(self.manager.dir());
+        let source_bytes = fs::metadata(&source_path)
+            .map_err(|error| {
+                Error::Manifest(format!(
+                    "reading split source size {}: {error}",
+                    source_path.display()
+                ))
+            })?
+            .len();
+        if policy.max_split_source_bytes > 0 && source_bytes > policy.max_split_source_bytes {
+            return Err(Error::ClusterConfig(format!(
+                "split source is {source_bytes} bytes, above policy max_split_source_bytes {}; \
+                 raise the resource budget before retrying",
+                policy.max_split_source_bytes
+            )));
+        }
+        let tables = inspect_tables(&source_path, operation.id, &self.manager.shard_keys())?;
+        install_capture(&self.manager, source, &tables, split_capture_limit(&policy))?;
         crate::failpoint::hit("split.owner.after_capture_install");
 
         let paths = SplitPaths::new(self.manager.dir(), operation.id);
@@ -161,12 +223,19 @@ impl SplitSupervisor {
             &self.manager.shard_keys(),
         )?;
         if !paths.backfill_ready.exists() {
-            build_shadows(&paths, &tables, source, destination, after)?;
+            build_shadows_resumable(
+                &paths,
+                &tables,
+                source,
+                destination,
+                after,
+                split_backfill_batch_rows(&self.catalog.snapshot().scaling_policy),
+            )?;
             durable_marker(&paths.backfill_ready, b"ready\n")?;
             crate::failpoint::hit("split.owner.after_backfill");
         }
         drop_shadow_triggers(&paths, &tables)?;
-        let sequence = replay_dirty(
+        let replay = replay_dirty(
             &source.path(self.manager.dir()),
             &paths,
             &tables,
@@ -174,10 +243,13 @@ impl SplitSupervisor {
             destination,
             after,
         )?;
+        prune_replayed(&self.manager, source, &tables, &replay.consumed)?;
         crate::failpoint::hit("split.owner.after_replay");
         self.submit(CatalogCommand::Split {
             operation: operation.id,
-            progress: SplitProgress::Replay { sequence },
+            progress: SplitProgress::Replay {
+                sequence: replay.highest,
+            },
         })?;
         self.submit(CatalogCommand::Split {
             operation: operation.id,
@@ -204,7 +276,7 @@ impl SplitSupervisor {
                 &self.manager.shard_keys(),
             )?;
             drop_shadow_triggers(&paths, &tables)?;
-            let sequence = replay_dirty(
+            let replay = replay_dirty(
                 &source.path(self.manager.dir()),
                 &paths,
                 &tables,
@@ -212,12 +284,16 @@ impl SplitSupervisor {
                 destination,
                 after,
             )?;
+            // The source gate is already closed. Do not try to prune through its writer queue:
+            // that queue correctly refuses every write past the fence. Cleanup drops the capture
+            // tables after routing commit; only the shadow files need to be durable here.
+            cleanup_shadow_capture(&paths, &tables)?;
             restore_user_triggers(&paths.snapshot, &paths.left, &paths.right)?;
             verify_shadow(&paths.left)?;
             verify_shadow(&paths.right)?;
-            durable_marker(&paths.finalized, format!("{sequence}\n").as_bytes())?;
+            durable_marker(&paths.finalized, format!("{}\n", replay.highest).as_bytes())?;
             crate::failpoint::hit("split.owner.after_finalize");
-            sequence
+            replay.highest
         };
         self.submit(CatalogCommand::Split {
             operation: operation.id,
@@ -225,11 +301,37 @@ impl SplitSupervisor {
         })
     }
 
-    fn install_and_commit(&self, operation: &CatalogOperation) -> Result<()> {
+    fn install_and_ack(&self, operation: &CatalogOperation, owner: u64) -> Result<()> {
         let source = split_source(operation)?;
         let destination = split_destination(operation)?;
         let paths = SplitPaths::new(self.manager.dir(), operation.id);
-        if !paths.installed.exists() {
+        fs::create_dir_all(&paths.dir).map_err(|error| {
+            Error::Manifest(format!("creating {}: {error}", paths.dir.display()))
+        })?;
+        if self.node != owner {
+            self.pull_split_image(
+                owner,
+                operation.id,
+                crate::net::protocol::SplitImageSide::Source,
+            )?;
+            self.pull_split_image(
+                owner,
+                operation.id,
+                crate::net::protocol::SplitImageSide::Destination,
+            )?;
+        }
+        // The marker is durable, but it is intentionally not trusted by itself: a crash or an
+        // operator restoring only the marker must never make a replica acknowledge images it does
+        // not hold.  The shadow files and their installed destinations are compared before a
+        // previously completed install is reused.
+        let already_installed = paths.installed.exists()
+            && split_install_matches(
+                &paths,
+                &source.path(self.manager.dir()),
+                &destination.path(self.manager.dir()),
+            );
+        if !already_installed {
+            remove_if_exists(&paths.installed)?;
             self.manager.follow(source)?;
             self.manager.follow(destination)?;
             install_shadow(&paths.left, &source.path(self.manager.dir()))?;
@@ -237,30 +339,35 @@ impl SplitSupervisor {
             sync_dir(self.manager.dir())?;
             durable_marker(&paths.installed, b"installed\n")?;
             crate::failpoint::hit("split.owner.after_install");
-            self.manager.lead(source);
-            self.manager.lead(destination);
+            if self.node == owner {
+                self.manager.lead(source);
+                self.manager.lead(destination);
+            }
         }
         self.submit(CatalogCommand::Split {
             operation: operation.id,
-            progress: SplitProgress::Commit,
+            progress: SplitProgress::ReplicaInstalled { node: self.node },
         })
     }
 
-    fn cleanup(&self, operation: &CatalogOperation) -> Result<()> {
+    fn cleanup_and_ack(&self, operation: &CatalogOperation, owner: u64) -> Result<()> {
         let source = split_source(operation)?;
         let destination = split_destination(operation)?;
-        let tables = inspect_tables(
-            &source.path(self.manager.dir()),
-            operation.id,
-            &self.manager.shard_keys(),
-        )?;
-        cleanup_capture(&self.manager, source, &tables)?;
-        cleanup_capture(&self.manager, destination, &tables)?;
+        if self.node == owner {
+            let tables = inspect_tables(
+                &source.path(self.manager.dir()),
+                operation.id,
+                &self.manager.shard_keys(),
+            )?;
+            cleanup_capture(&self.manager, source, &tables)?;
+            cleanup_capture(&self.manager, destination, &tables)?;
+        }
         let paths = SplitPaths::new(self.manager.dir(), operation.id);
         let mut cleanup = vec![
             paths.snapshot.clone(),
             paths.left.clone(),
             paths.right.clone(),
+            paths.backfill_checkpoint.clone(),
             paths.backfill_ready.clone(),
             paths.finalized.clone(),
             paths.installed.clone(),
@@ -292,8 +399,96 @@ impl SplitSupervisor {
         crate::failpoint::hit("split.owner.after_cleanup");
         self.submit(CatalogCommand::Split {
             operation: operation.id,
-            progress: SplitProgress::Complete,
+            progress: SplitProgress::ReplicaCleaned { node: self.node },
         })
+    }
+
+    fn pull_split_image(
+        &self,
+        owner: u64,
+        operation: u64,
+        side: crate::net::protocol::SplitImageSide,
+    ) -> Result<()> {
+        let catalog = self.catalog.snapshot();
+        let address = catalog
+            .members
+            .get(&owner)
+            .map(|member| member.address.clone())
+            .ok_or_else(|| {
+                Error::ClusterConfig(format!("split image owner node {owner} is not a member"))
+            })?;
+        let credentials = self
+            .credentials
+            .as_ref()
+            .map(|(name, secret)| (name.clone(), crate::net::auth::derive_key(secret)));
+        let mut client = Client::connect_full(
+            &address,
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            credentials,
+        )?;
+        let (total_bytes, expected_digest) = client.split_image_info(operation, side)?;
+        let destination = staged_image_path(self.manager.dir(), operation, side);
+        if destination.exists() && digest_path(&destination)? == expected_digest {
+            return Ok(());
+        }
+        let partial = destination.with_extension("pulling");
+        let mut offset = fs::metadata(&partial)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if offset > total_bytes {
+            remove_if_exists(&partial)?;
+            offset = 0;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&partial)
+            .map_err(|error| {
+                Error::Manifest(format!(
+                    "opening split image {}: {error}",
+                    partial.display()
+                ))
+            })?;
+        while offset < total_bytes {
+            let wanted = (total_bytes - offset)
+                .min(crate::replication::bootstrap::DEFAULT_CHUNK as u64)
+                as u32;
+            let chunk = client.split_image_read(operation, side, offset, wanted)?;
+            if chunk.is_empty() {
+                return Err(Error::Protocol(format!(
+                    "split image ended at byte {offset}, expected {total_bytes}"
+                )));
+            }
+            file.write_all(&chunk).map_err(|error| {
+                Error::Manifest(format!(
+                    "writing split image {}: {error}",
+                    partial.display()
+                ))
+            })?;
+            offset += chunk.len() as u64;
+        }
+        file.sync_all().map_err(|error| {
+            Error::Manifest(format!(
+                "fsyncing split image {}: {error}",
+                partial.display()
+            ))
+        })?;
+        drop(file);
+        if digest_path(&partial)? != expected_digest {
+            remove_if_exists(&partial)?;
+            return Err(Error::Protocol(format!(
+                "split image for operation {operation} failed its digest"
+            )));
+        }
+        fs::rename(&partial, &destination).map_err(|error| {
+            Error::Manifest(format!(
+                "installing pulled split image {}: {error}",
+                destination.display()
+            ))
+        })?;
+        sync_dir(destination.parent().expect("split image parent"))?;
+        Ok(())
     }
 
     fn submit(&self, command: CatalogCommand) -> Result<()> {
@@ -322,12 +517,30 @@ impl SplitSupervisor {
     }
 }
 
+fn split_install_matches(paths: &SplitPaths, source: &Path, destination: &Path) -> bool {
+    if !paths.left.exists() || !paths.right.exists() || !source.exists() || !destination.exists() {
+        return false;
+    }
+    match (
+        digest_path(&paths.left),
+        digest_path(source),
+        digest_path(&paths.right),
+        digest_path(destination),
+    ) {
+        (Ok(left), Ok(source), Ok(right), Ok(destination)) => {
+            left == source && right == destination
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct SplitPaths {
     dir: PathBuf,
     snapshot: PathBuf,
     left: PathBuf,
     right: PathBuf,
+    backfill_checkpoint: PathBuf,
     backfill_ready: PathBuf,
     finalized: PathBuf,
     installed: PathBuf,
@@ -343,11 +556,24 @@ impl SplitPaths {
             snapshot: dir.join("source.snapshot.db"),
             left: dir.join("left.shadow.db"),
             right: dir.join("right.shadow.db"),
+            backfill_checkpoint: dir.join("backfill.checkpoint"),
             backfill_ready: dir.join("backfill.ready"),
             finalized: dir.join("finalized"),
             installed: dir.join("installed"),
             dir,
         }
+    }
+}
+
+pub(crate) fn staged_image_path(
+    root: &Path,
+    operation: u64,
+    side: crate::net::protocol::SplitImageSide,
+) -> PathBuf {
+    let paths = SplitPaths::new(root, operation);
+    match side {
+        crate::net::protocol::SplitImageSide::Source => paths.left,
+        crate::net::protocol::SplitImageSide::Destination => paths.right,
     }
 }
 
@@ -406,55 +632,80 @@ fn inspect_tables(
                 "online split does not support virtual table `{name}`"
             )));
         }
-        let key = shard_keys
-            .get(&name.to_ascii_lowercase())
-            .cloned()
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "online split requires every table to declare a shard key; `{name}` has none"
-                ))
-            })?;
+        let key = shard_keys.get(&name.to_ascii_lowercase()).cloned();
         let columns = table_columns(&connection, &name)?;
         let primary: Vec<String> = table_info(&connection, &name)?
             .into_iter()
             .filter_map(|(column, primary)| (primary > 0).then_some(column))
             .collect();
-        if primary.len() != 1 || !primary[0].eq_ignore_ascii_case(&key) {
-            return Err(Error::Unsupported(format!(
-                "online split currently requires `{name}` shard key `{key}` to be its only PRIMARY \
-                 KEY column"
-            )));
-        }
-        let types_sql = format!(
-            "SELECT DISTINCT typeof({}) FROM {} LIMIT 3",
-            quote_ident(&key),
-            quote_ident(&name)
-        );
-        let mut types = connection.prepare(&types_sql).map_err(Error::Sqlite)?;
-        let values = types
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(Error::Sqlite)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::Sqlite)?;
-        if values
-            .iter()
-            .any(|kind| kind != "integer" && kind != "text")
-        {
-            return Err(Error::Unsupported(format!(
-                "online split requires text or integer shard keys; `{name}` contains {}",
-                values.join(", ")
-            )));
+        let sole_primary_key = key
+            .as_ref()
+            .is_some_and(|key| primary.len() == 1 && primary[0].eq_ignore_ascii_case(key));
+        let (identity, identity_is_rowid) = if sole_primary_key {
+            (key.clone().expect("sole primary key has key"), false)
+        } else {
+            let upper_sql = sql.to_ascii_uppercase();
+            if upper_sql.contains("WITHOUT ROWID") {
+                return Err(Error::Unsupported(format!(
+                    "online split needs a tuple identity for WITHOUT ROWID table `{name}`; \
+                     composite/keyless WITHOUT ROWID tables are not supported yet"
+                )));
+            }
+            let identity = ["rowid", "_rowid_", "oid"]
+                .into_iter()
+                .find(|candidate| {
+                    columns
+                        .iter()
+                        .all(|column| !column.eq_ignore_ascii_case(candidate))
+                })
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "online split cannot identify rows in `{name}` because all SQLite rowid \
+                         aliases are shadowed by columns"
+                    ))
+                })?
+                .to_string();
+            (identity, true)
+        };
+        if let Some(key) = &key {
+            let types_sql = format!(
+                "SELECT DISTINCT typeof({}) FROM {} LIMIT 4",
+                quote_ident(key),
+                quote_ident(&name)
+            );
+            let mut types = connection.prepare(&types_sql).map_err(Error::Sqlite)?;
+            let values = types
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(Error::Sqlite)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Sqlite)?;
+            if values
+                .iter()
+                .any(|kind| kind != "integer" && kind != "text" && kind != "blob")
+            {
+                return Err(Error::Unsupported(format!(
+                    "online split requires integer, text, or BLOB shard keys; `{name}` contains {}",
+                    values.join(", ")
+                )));
+            }
         }
         let stem = format!("{INTERNAL_PREFIX}{operation}_{index}");
+        let state = format!("{INTERNAL_PREFIX}{operation}_state");
         tables.push(SplitTable {
             name,
             key,
+            identity,
+            identity_is_rowid,
             columns,
             log: format!("{stem}_log"),
+            state,
             triggers: [
-                format!("{stem}_insert"),
-                format!("{stem}_update"),
-                format!("{stem}_delete"),
+                format!("{stem}_guard_insert"),
+                format!("{stem}_guard_update"),
+                format!("{stem}_guard_delete"),
+                format!("{stem}_capture_insert"),
+                format!("{stem}_capture_update"),
+                format!("{stem}_capture_delete"),
             ],
         });
     }
@@ -478,25 +729,93 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn install_capture(manager: &ShardManager, shard: ShardId, tables: &[SplitTable]) -> Result<()> {
+fn install_capture(
+    manager: &ShardManager,
+    shard: ShardId,
+    tables: &[SplitTable],
+    max_rows: u64,
+) -> Result<()> {
+    if max_rows == 0 {
+        return Err(Error::ShardConfig(
+            "split capture row limit must be at least one".into(),
+        ));
+    }
     let mut statements = Vec::new();
+    if let Some(first) = tables.first() {
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 pending INTEGER NOT NULL CHECK (pending >= 0),
+                 next_seq INTEGER NOT NULL CHECK (next_seq >= 0)
+             )",
+            quote_ident(&first.state)
+        )));
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "INSERT OR IGNORE INTO {} (singleton, pending, next_seq) VALUES (1, 0, 0)",
+            quote_ident(&first.state)
+        )));
+    }
     for table in tables {
         statements.push(crate::storage::exec::Statement::new(format!(
-            "CREATE TABLE IF NOT EXISTS {} (seq INTEGER PRIMARY KEY AUTOINCREMENT, key)",
+            "CREATE TABLE IF NOT EXISTS {} (seq INTEGER PRIMARY KEY, key)",
             quote_ident(&table.log)
         )));
-        for (trigger, timing, value) in [
-            (&table.triggers[0], "INSERT", "NEW"),
-            (&table.triggers[1], "UPDATE", "NEW"),
-            (&table.triggers[2], "DELETE", "OLD"),
+        for (trigger, timing) in [
+            (&table.triggers[0], "INSERT"),
+            (&table.triggers[2], "DELETE"),
         ] {
             statements.push(crate::storage::exec::Statement::new(format!(
-                "CREATE TRIGGER IF NOT EXISTS {} AFTER {timing} ON {} BEGIN INSERT INTO {} (key) \
-                 VALUES ({value}.{}); END",
+                "CREATE TRIGGER IF NOT EXISTS {} BEFORE {timing} ON {}
+                 WHEN (SELECT pending FROM {} WHERE singleton = 1) >= {max_rows}
+                 BEGIN
+                   SELECT RAISE(ABORT, '{BACKPRESSURE_SENTINEL}: retained dirty-key limit \
+                         {max_rows} reached; retry after split catch-up');
+                 END",
                 quote_ident(trigger),
                 quote_ident(&table.name),
+                quote_ident(&table.state),
+            )));
+        }
+        let immutable_identity = table.identity_is_rowid.then(|| {
+            format!(
+                "SELECT CASE WHEN OLD.{identity} != NEW.{identity} THEN
+                   RAISE(ABORT, 'online split requires stable rowid values for table {table_name}')
+                 END;",
+                identity = quote_ident(&table.identity),
+                table_name = table.name.replace('\'', "''"),
+            )
+        });
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "CREATE TRIGGER IF NOT EXISTS {} BEFORE UPDATE ON {} BEGIN
+               {}
+               SELECT CASE WHEN
+                 (SELECT pending FROM {} WHERE singleton = 1) >= {max_rows}
+               THEN RAISE(ABORT, '{BACKPRESSURE_SENTINEL}: retained dirty-key limit \
+                    {max_rows} reached; retry after split catch-up') END;
+             END",
+            quote_ident(&table.triggers[1]),
+            quote_ident(&table.name),
+            immutable_identity.unwrap_or_default(),
+            quote_ident(&table.state),
+        )));
+        for (trigger, timing, value) in [
+            (&table.triggers[3], "INSERT", "NEW"),
+            (&table.triggers[4], "UPDATE", "NEW"),
+            (&table.triggers[5], "DELETE", "OLD"),
+        ] {
+            statements.push(crate::storage::exec::Statement::new(format!(
+                "CREATE TRIGGER IF NOT EXISTS {} AFTER {timing} ON {} BEGIN
+                   UPDATE {} SET pending = pending + 1, next_seq = next_seq + 1
+                     WHERE singleton = 1;
+                   INSERT INTO {} (seq, key)
+                     SELECT next_seq, {value}.{} FROM {} WHERE singleton = 1;
+                 END",
+                quote_ident(trigger),
+                quote_ident(&table.name),
+                quote_ident(&table.state),
                 quote_ident(&table.log),
-                quote_ident(&table.key)
+                quote_ident(&table.identity),
+                quote_ident(&table.state),
             )));
         }
     }
@@ -517,6 +836,12 @@ fn cleanup_capture(manager: &ShardManager, shard: ShardId, tables: &[SplitTable]
             quote_ident(&table.log)
         )));
     }
+    if let Some(first) = tables.first() {
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(&first.state)
+        )));
+    }
     ensure_outcomes(manager.execute_txn(shard, statements)?)
 }
 
@@ -529,75 +854,294 @@ fn ensure_outcomes(outcomes: Vec<Outcome>) -> Result<()> {
     Ok(())
 }
 
-fn build_shadows(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum CheckpointKey {
+    Integer(i64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct BackfillRow {
+    identity: CheckpointKey,
+    routing_key: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BackfillCheckpoint {
+    table: usize,
+    after: Option<CheckpointKey>,
+}
+
+fn build_shadows_resumable(
     paths: &SplitPaths,
     tables: &[SplitTable],
     source: ShardId,
     destination: ShardId,
     after: Routing,
+    batch_rows: usize,
 ) -> Result<()> {
-    fs::copy(&paths.snapshot, &paths.left).map_err(|error| {
-        Error::Manifest(format!(
-            "creating left split shadow {}: {error}",
-            paths.left.display()
-        ))
-    })?;
-    fs::copy(&paths.snapshot, &paths.right).map_err(|error| {
-        Error::Manifest(format!(
-            "creating right split shadow {}: {error}",
-            paths.right.display()
-        ))
-    })?;
+    if batch_rows == 0 {
+        return Err(Error::ShardConfig(
+            "split backfill batch size must be at least one".into(),
+        ));
+    }
+    let mut checkpoint = if paths.backfill_checkpoint.exists() {
+        let checkpoint = read_backfill_checkpoint(&paths.backfill_checkpoint)?;
+        // A checkpoint is only useful together with the two files it advances.  Treat a
+        // half-created staging directory as a failed operation instead of silently marking the
+        // split ready with rows missing from one shadow.  The marker is written after both files
+        // have been fsynced, so this can only happen after manual tampering or a lost filesystem
+        // entry; either way retrying from an inconsistent cursor would be unsafe.
+        if !paths.left.exists() || !paths.right.exists() {
+            return Err(Error::Manifest(format!(
+                "split backfill checkpoint {} has no matching shadow files",
+                paths.backfill_checkpoint.display()
+            )));
+        }
+        if checkpoint.table > tables.len() {
+            return Err(Error::Manifest(format!(
+                "split backfill checkpoint {} references table {} but source has {} tables",
+                paths.backfill_checkpoint.display(),
+                checkpoint.table,
+                tables.len()
+            )));
+        }
+        if checkpoint.table == tables.len() && checkpoint.after.is_some() {
+            return Err(Error::Manifest(format!(
+                "split backfill checkpoint {} has a row cursor after the final table",
+                paths.backfill_checkpoint.display()
+            )));
+        }
+        checkpoint
+    } else {
+        remove_if_exists(&paths.left)?;
+        remove_if_exists(&paths.right)?;
+        copy_shadow_source(&paths.snapshot, &paths.left, "left")?;
+        copy_shadow_source(&paths.snapshot, &paths.right, "right")?;
+        let left = open_shadow(&paths.left)?;
+        let right = open_shadow(&paths.right)?;
+        drop_all_triggers(&left)?;
+        drop_all_triggers(&right)?;
+        drop(left);
+        drop(right);
+        sync_file(&paths.left)?;
+        sync_file(&paths.right)?;
+        let checkpoint = BackfillCheckpoint {
+            table: 0,
+            after: None,
+        };
+        write_backfill_checkpoint(&paths.backfill_checkpoint, &checkpoint)?;
+        checkpoint
+    };
+
     let snapshot = open_readonly(&paths.snapshot)?;
-    let mut left = open_shadow(&paths.left)?;
-    let mut right = open_shadow(&paths.right)?;
-    drop_all_triggers(&left)?;
-    drop_all_triggers(&right)?;
-    {
+    while checkpoint.table < tables.len() {
+        let table = &tables[checkpoint.table];
+        let rows = read_backfill_rows(&snapshot, table, checkpoint.after.as_ref(), batch_rows)?;
+        if rows.is_empty() {
+            checkpoint.table += 1;
+            checkpoint.after = None;
+            write_backfill_checkpoint(&paths.backfill_checkpoint, &checkpoint)?;
+            continue;
+        }
+
+        let mut left = open_shadow(&paths.left)?;
+        let mut right = open_shadow(&paths.right)?;
         let left_tx = left.transaction().map_err(Error::Sqlite)?;
         let right_tx = right.transaction().map_err(Error::Sqlite)?;
-        for table in tables {
-            let query = format!(
-                "SELECT {} FROM {}",
-                quote_ident(&table.key),
-                quote_ident(&table.name)
-            );
-            let mut statement = snapshot.prepare(&query).map_err(Error::Sqlite)?;
-            let mut rows = statement.query([]).map_err(Error::Sqlite)?;
-            let delete = format!(
-                "DELETE FROM {} WHERE {} = ?1",
-                quote_ident(&table.name),
-                quote_ident(&table.key)
-            );
-            while let Some(row) = rows.next().map_err(Error::Sqlite)? {
-                let key = owned_value(row.get_ref(0).map_err(Error::Sqlite)?);
-                match route_value(after, &key)? {
-                    shard if shard == source => {
-                        right_tx
-                            .execute(&delete, params![key])
-                            .map_err(Error::Sqlite)?;
-                    }
-                    shard if shard == destination => {
-                        left_tx
-                            .execute(&delete, params![key])
-                            .map_err(Error::Sqlite)?;
-                    }
-                    shard => {
-                        return Err(Error::ClusterConfig(format!(
-                            "linear split routed a row from {source} to unexpected {shard}"
-                        )));
-                    }
+        let delete = format!(
+            "DELETE FROM {} WHERE {} = ?1",
+            quote_ident(&table.name),
+            quote_ident(&table.identity)
+        );
+        for row in &rows {
+            let identity = checkpoint_value(&row.identity);
+            match row
+                .routing_key
+                .as_ref()
+                .map(|key| route_value(after, key))
+                .transpose()?
+                .unwrap_or(source)
+            {
+                shard if shard == source => {
+                    right_tx
+                        .execute(&delete, params![identity])
+                        .map_err(Error::Sqlite)?;
+                }
+                shard if shard == destination => {
+                    left_tx
+                        .execute(&delete, params![identity])
+                        .map_err(Error::Sqlite)?;
+                }
+                shard => {
+                    return Err(Error::ClusterConfig(format!(
+                        "linear split routed a row from {source} to unexpected {shard}"
+                    )));
                 }
             }
         }
         left_tx.commit().map_err(Error::Sqlite)?;
         right_tx.commit().map_err(Error::Sqlite)?;
+        drop(left);
+        drop(right);
+        sync_file(&paths.left)?;
+        sync_file(&paths.right)?;
+        checkpoint.after = rows.last().map(|row| row.identity.clone());
+        write_backfill_checkpoint(&paths.backfill_checkpoint, &checkpoint)?;
+        crate::failpoint::hit("split.owner.after_backfill_batch");
     }
-    drop(left);
-    drop(right);
-    sync_file(&paths.left)?;
-    sync_file(&paths.right)?;
     Ok(())
+}
+
+fn split_capture_limit(policy: &super::ScalingPolicy) -> u64 {
+    std::env::var("SHARDLITE_SPLIT_LOG_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(policy.split_log_max_rows.max(1))
+}
+
+fn split_backfill_batch_rows(policy: &super::ScalingPolicy) -> usize {
+    std::env::var("SHARDLITE_SPLIT_BACKFILL_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(
+            usize::try_from(policy.split_backfill_batch_rows)
+                .unwrap_or(DEFAULT_BACKFILL_BATCH_ROWS),
+        )
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Manifest(format!(
+            "removing stale split file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn copy_shadow_source(source: &Path, destination: &Path, side: &str) -> Result<()> {
+    fs::copy(source, destination).map_err(|error| {
+        Error::Manifest(format!(
+            "creating {side} split shadow {}: {error}",
+            destination.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn read_backfill_rows(
+    snapshot: &Connection,
+    table: &SplitTable,
+    after: Option<&CheckpointKey>,
+    limit: usize,
+) -> Result<Vec<BackfillRow>> {
+    let projection = match &table.key {
+        Some(key) if !key.eq_ignore_ascii_case(&table.identity) => {
+            format!("{}, {}", quote_ident(&table.identity), quote_ident(key))
+        }
+        _ => quote_ident(&table.identity),
+    };
+    let (sql, values) = match after {
+        Some(key) => (
+            format!(
+                "SELECT {projection} FROM {} WHERE {} > ?1 ORDER BY {} LIMIT ?2",
+                quote_ident(&table.name),
+                quote_ident(&table.identity),
+                quote_ident(&table.identity),
+            ),
+            vec![checkpoint_value(key), Value::Integer(limit as i64)],
+        ),
+        None => (
+            format!(
+                "SELECT {projection} FROM {} ORDER BY {} LIMIT ?1",
+                quote_ident(&table.name),
+                quote_ident(&table.identity),
+            ),
+            vec![Value::Integer(limit as i64)],
+        ),
+    };
+    let mut statement = snapshot.prepare(&sql).map_err(Error::Sqlite)?;
+    statement
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            let identity = match row.get_ref(0)? {
+                ValueRef::Integer(value) => CheckpointKey::Integer(value),
+                ValueRef::Text(value) => {
+                    CheckpointKey::Text(String::from_utf8_lossy(value).into_owned())
+                }
+                ValueRef::Blob(value) => CheckpointKey::Blob(value.to_vec()),
+                other => Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    other.data_type(),
+                    "split checkpoint identity is not integer, text, or BLOB".into(),
+                ))?,
+            };
+            let routing_key = match &table.key {
+                Some(key) if !key.eq_ignore_ascii_case(&table.identity) => {
+                    Some(owned_value(row.get_ref(1)?))
+                }
+                Some(_) => Some(checkpoint_value(&identity)),
+                None => None,
+            };
+            Ok(BackfillRow {
+                identity,
+                routing_key,
+            })
+        })
+        .map_err(Error::Sqlite)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::Sqlite)
+}
+
+fn checkpoint_value(key: &CheckpointKey) -> Value {
+    match key {
+        CheckpointKey::Integer(value) => Value::Integer(*value),
+        CheckpointKey::Text(value) => Value::Text(value.clone()),
+        CheckpointKey::Blob(value) => Value::Blob(value.clone()),
+    }
+}
+
+fn write_backfill_checkpoint(path: &Path, checkpoint: &BackfillCheckpoint) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(checkpoint, bincode::config::standard()).map_err(
+        |error| {
+            Error::Manifest(format!(
+                "encoding split checkpoint {}: {error}",
+                path.display()
+            ))
+        },
+    )?;
+    durable_marker(path, &bytes)
+}
+
+fn read_backfill_checkpoint(path: &Path) -> Result<BackfillCheckpoint> {
+    let bytes = fs::read(path)
+        .map_err(|error| Error::Manifest(format!("reading {}: {error}", path.display())))?;
+    let (checkpoint, consumed): (BackfillCheckpoint, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).map_err(
+            |error| {
+                Error::Manifest(format!(
+                    "parsing split checkpoint {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    if consumed != bytes.len() {
+        return Err(Error::Manifest(format!(
+            "split checkpoint {} has trailing bytes",
+            path.display()
+        )));
+    }
+    Ok(checkpoint)
+}
+
+#[derive(Debug)]
+struct ReplayResult {
+    highest: u64,
+    consumed: Vec<(String, u64)>,
 }
 
 fn replay_dirty(
@@ -607,11 +1151,12 @@ fn replay_dirty(
     source: ShardId,
     destination: ShardId,
     after: Routing,
-) -> Result<u64> {
+) -> Result<ReplayResult> {
     let source_db = open_readonly(source_path)?;
     let mut left = open_shadow(&paths.left)?;
     let mut right = open_shadow(&paths.right)?;
     let mut highest = 0;
+    let mut consumed = Vec::new();
     for table in tables {
         let log_query = format!(
             "SELECT seq, key FROM {} ORDER BY seq",
@@ -628,6 +1173,7 @@ fn replay_dirty(
         if entries.is_empty() {
             continue;
         }
+        let table_highest = entries.last().map(|entry| entry.0).unwrap_or_default();
         let select = format!(
             "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1",
             table
@@ -637,23 +1183,29 @@ fn replay_dirty(
                 .collect::<Vec<_>>()
                 .join(", "),
             quote_ident(&table.name),
-            quote_ident(&table.key)
+            quote_ident(&table.identity)
         );
         let delete = format!(
             "DELETE FROM {} WHERE {} = ?1",
             quote_ident(&table.name),
-            quote_ident(&table.key)
+            quote_ident(&table.identity)
         );
-        let insert = format!(
-            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
-            quote_ident(&table.name),
+        let insert_columns = if table.identity_is_rowid {
+            std::iter::once(quote_ident(&table.identity))
+                .chain(table.columns.iter().map(|column| quote_ident(column)))
+                .collect::<Vec<_>>()
+        } else {
             table
                 .columns
                 .iter()
                 .map(|column| quote_ident(column))
                 .collect::<Vec<_>>()
-                .join(", "),
-            (1..=table.columns.len())
+        };
+        let insert = format!(
+            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+            quote_ident(&table.name),
+            insert_columns.join(", "),
+            (1..=insert_columns.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -679,14 +1231,31 @@ fn replay_dirty(
             let Some(values) = row else {
                 continue;
             };
-            let target = route_value(after, &key)?;
+            let target = match &table.key {
+                Some(routing_key) => {
+                    let index = table
+                        .columns
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(routing_key))
+                        .expect("inspected shard key is a table column");
+                    route_value(after, &values[index])?
+                }
+                None => source,
+            };
+            let insert_values = if table.identity_is_rowid {
+                std::iter::once(&key)
+                    .chain(values.iter())
+                    .collect::<Vec<_>>()
+            } else {
+                values.iter().collect::<Vec<_>>()
+            };
             if target == source {
                 left_tx
-                    .execute(&insert, rusqlite::params_from_iter(values.iter()))
+                    .execute(&insert, rusqlite::params_from_iter(insert_values.iter()))
                     .map_err(Error::Sqlite)?;
             } else if target == destination {
                 right_tx
-                    .execute(&insert, rusqlite::params_from_iter(values.iter()))
+                    .execute(&insert, rusqlite::params_from_iter(insert_values.iter()))
                     .map_err(Error::Sqlite)?;
             } else {
                 return Err(Error::ClusterConfig(format!(
@@ -696,12 +1265,42 @@ fn replay_dirty(
         }
         left_tx.commit().map_err(Error::Sqlite)?;
         right_tx.commit().map_err(Error::Sqlite)?;
+        consumed.push((table.log.clone(), table_highest));
     }
     drop(left);
     drop(right);
     sync_file(&paths.left)?;
     sync_file(&paths.right)?;
-    Ok(highest)
+    Ok(ReplayResult { highest, consumed })
+}
+
+fn prune_replayed(
+    manager: &ShardManager,
+    shard: ShardId,
+    tables: &[SplitTable],
+    consumed: &[(String, u64)],
+) -> Result<()> {
+    let Some(state) = tables.first().map(|table| table.state.as_str()) else {
+        return Ok(());
+    };
+    let mut statements = Vec::new();
+    for (log, through) in consumed {
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "UPDATE {} SET pending = pending - (
+                 SELECT COUNT(*) FROM {} WHERE seq <= {through}
+             ) WHERE singleton = 1",
+            quote_ident(state),
+            quote_ident(log),
+        )));
+        statements.push(crate::storage::exec::Statement::new(format!(
+            "DELETE FROM {} WHERE seq <= {through}",
+            quote_ident(log)
+        )));
+    }
+    if statements.is_empty() {
+        return Ok(());
+    }
+    ensure_outcomes(manager.execute_txn(shard, statements)?)
 }
 
 fn max_sequence(path: &Path, tables: &[SplitTable]) -> Result<u64> {
@@ -726,6 +1325,31 @@ fn drop_shadow_triggers(paths: &SplitPaths, _tables: &[SplitTable]) -> Result<()
     let right = open_shadow(&paths.right)?;
     drop_all_triggers(&left)?;
     drop_all_triggers(&right)?;
+    Ok(())
+}
+
+fn cleanup_shadow_capture(paths: &SplitPaths, tables: &[SplitTable]) -> Result<()> {
+    for path in [&paths.left, &paths.right] {
+        let connection = open_shadow(path)?;
+        for table in tables {
+            connection
+                .execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {};",
+                    quote_ident(&table.log)
+                ))
+                .map_err(Error::Sqlite)?;
+        }
+        if let Some(first) = tables.first() {
+            connection
+                .execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {};",
+                    quote_ident(&first.state)
+                ))
+                .map_err(Error::Sqlite)?;
+        }
+    }
+    sync_file(&paths.left)?;
+    sync_file(&paths.right)?;
     Ok(())
 }
 
@@ -850,9 +1474,10 @@ fn route_value(routing: Routing, value: &Value) -> Result<ShardId> {
     let bytes = match value {
         Value::Integer(value) => value.to_le_bytes().to_vec(),
         Value::Text(value) => value.as_bytes().to_vec(),
+        Value::Blob(value) => value.clone(),
         _ => {
             return Err(Error::Unsupported(
-                "online split encountered a non-text/non-integer shard key".into(),
+                "online split encountered a shard key outside integer, text, or BLOB".into(),
             ));
         }
     };
@@ -904,6 +1529,24 @@ fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| Error::Manifest(format!("fsyncing {}: {error}", path.display())))
+}
+
+fn digest_path(path: &Path) -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)
+        .map_err(|error| Error::Manifest(format!("opening {}: {error}", path.display())))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::Manifest(format!("hashing {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 impl std::fmt::Debug for SplitSupervisor {
@@ -961,14 +1604,14 @@ mod tests {
             .unwrap();
         manager.declare_shard_key("users", "id").unwrap();
         let tables = inspect_tables(&source.path(dir.path()), 7, &manager.shard_keys()).unwrap();
-        install_capture(&manager, source, &tables).unwrap();
+        install_capture(&manager, source, &tables, 100).unwrap();
 
         let paths = SplitPaths::new(dir.path(), 7);
         fs::create_dir_all(&paths.dir).unwrap();
         manager.snapshot(source, &paths.snapshot).unwrap();
         let destination = ShardId(1);
         let after = Routing::LinearV1(LinearV1::for_shard_count(2).unwrap());
-        build_shadows(&paths, &tables, source, destination, after).unwrap();
+        build_shadows_resumable(&paths, &tables, source, destination, after, 2).unwrap();
 
         ensure_outcomes(
             manager
@@ -1010,6 +1653,292 @@ mod tests {
         assert_eq!(live["alpha"], vec![0xaa]);
         assert!(!live.contains_key("bravo"));
         assert_eq!(live["delta"].len(), 12);
+    }
+
+    #[test]
+    fn capture_limit_backpressures_then_reopens_after_replay_pruning() {
+        let dir = TempDir::new().unwrap();
+        let source = ShardId(0);
+        {
+            let connection = Connection::open(source.path(dir.path())).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE users (id TEXT PRIMARY KEY, payload TEXT) STRICT;",
+                )
+                .unwrap();
+        }
+        let manager = ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap();
+        manager.declare_shard_key("users", "id").unwrap();
+        let tables = inspect_tables(&source.path(dir.path()), 9, &manager.shard_keys()).unwrap();
+        install_capture(&manager, source, &tables, 2).unwrap();
+
+        for key in ["a", "b"] {
+            let outcome = manager
+                .execute_one(
+                    source,
+                    Statement::new(format!("INSERT INTO users VALUES ('{key}', 'accepted')")),
+                )
+                .unwrap();
+            assert!(matches!(outcome, Outcome::Ok(_)));
+        }
+        let blocked = manager
+            .execute_one(
+                source,
+                Statement::new("INSERT INTO users VALUES ('c', 'retry')"),
+            )
+            .unwrap();
+        assert!(
+            matches!(&blocked, Outcome::Rejected(message) if message.contains(BACKPRESSURE_SENTINEL)),
+            "capture cap must be an explicit retryable sentinel, got {blocked:?}"
+        );
+
+        let through = max_sequence(&source.path(dir.path()), &tables).unwrap();
+        prune_replayed(
+            &manager,
+            source,
+            &tables,
+            &[(tables[0].log.clone(), through)],
+        )
+        .unwrap();
+        let retried = manager
+            .execute_one(
+                source,
+                Statement::new("INSERT INTO users VALUES ('c', 'retry')"),
+            )
+            .unwrap();
+        assert!(matches!(retried, Outcome::Ok(_)));
+    }
+
+    #[test]
+    fn rowid_identity_supports_blob_composite_keys_and_anchors_keyless_tables() {
+        let dir = TempDir::new().unwrap();
+        let source = ShardId(0);
+        {
+            let connection = Connection::open(source.path(dir.path())).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE events (
+                         tenant BLOB NOT NULL,
+                         sequence INTEGER NOT NULL,
+                         payload TEXT,
+                         PRIMARY KEY (tenant, sequence)
+                     ) STRICT;
+                     CREATE TABLE settings (name TEXT, value TEXT) STRICT;
+                     INSERT INTO events VALUES (X'01', 1, 'a'), (X'01', 2, 'b'),
+                                               (X'F0', 1, 'c');
+                     INSERT INTO settings VALUES ('mode', 'before');",
+                )
+                .unwrap();
+        }
+        let manager = ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 4,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap();
+        manager
+            .set_routing(Routing::LinearV1(LinearV1::ONE))
+            .unwrap();
+        manager.declare_shard_key("events", "tenant").unwrap();
+        let tables = inspect_tables(&source.path(dir.path()), 11, &manager.shard_keys()).unwrap();
+        assert_eq!(tables.len(), 2);
+        assert!(
+            tables
+                .iter()
+                .find(|table| table.name == "events")
+                .unwrap()
+                .identity_is_rowid
+        );
+        assert!(
+            tables
+                .iter()
+                .find(|table| table.name == "settings")
+                .unwrap()
+                .key
+                .is_none()
+        );
+        install_capture(&manager, source, &tables, 100).unwrap();
+
+        let paths = SplitPaths::new(dir.path(), 11);
+        fs::create_dir_all(&paths.dir).unwrap();
+        manager.snapshot(source, &paths.snapshot).unwrap();
+        let destination = ShardId(1);
+        let after = Routing::LinearV1(LinearV1::for_shard_count(2).unwrap());
+        build_shadows_resumable(&paths, &tables, source, destination, after, 1).unwrap();
+        ensure_outcomes(
+            manager
+                .execute_txn(
+                    source,
+                    vec![
+                        Statement::new(
+                            "UPDATE events SET payload = 'changed' \
+                             WHERE tenant = X'01' AND sequence = 2",
+                        ),
+                        Statement::new("DELETE FROM events WHERE tenant = X'F0'"),
+                        Statement::new("INSERT INTO events VALUES (X'AA', 7, 'new')"),
+                        Statement::new("UPDATE settings SET value = 'after' WHERE name = 'mode'"),
+                        Statement::new("INSERT INTO settings VALUES ('extra', 'kept-left')"),
+                    ],
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        replay_dirty(
+            &source.path(dir.path()),
+            &paths,
+            &tables,
+            source,
+            destination,
+            after,
+        )
+        .unwrap();
+
+        let live_events = event_rows(&source.path(dir.path()));
+        let left_events = event_rows(&paths.left);
+        let right_events = event_rows(&paths.right);
+        let mut union = left_events.clone();
+        for (key, value) in right_events {
+            assert!(union.insert(key, value).is_none());
+        }
+        assert_eq!(union, live_events);
+        assert_eq!(
+            settings_rows(&paths.left),
+            settings_rows(&source.path(dir.path()))
+        );
+        assert!(settings_rows(&paths.right).is_empty());
+    }
+
+    #[test]
+    fn backfill_resumes_from_a_durable_row_cursor_without_duplication() {
+        let dir = TempDir::new().unwrap();
+        let source = ShardId(0);
+        {
+            let connection = Connection::open(source.path(dir.path())).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE users (id TEXT PRIMARY KEY, payload BLOB) STRICT;
+                     INSERT INTO users VALUES ('a', X'61'), ('b', X'62'), ('c', X'63'), ('d', X'64');",
+                )
+                .unwrap();
+        }
+        let manager = ShardManager::open(
+            dir.path(),
+            ShardConfig {
+                shard_count: 2,
+                ..ShardConfig::floor()
+            },
+        )
+        .unwrap();
+        manager
+            .set_routing(Routing::LinearV1(LinearV1::ONE))
+            .unwrap();
+        manager.declare_shard_key("users", "id").unwrap();
+        let tables = inspect_tables(&source.path(dir.path()), 13, &manager.shard_keys()).unwrap();
+        let paths = SplitPaths::new(dir.path(), 13);
+        fs::create_dir_all(&paths.dir).unwrap();
+        manager.snapshot(source, &paths.snapshot).unwrap();
+        copy_shadow_source(&paths.snapshot, &paths.left, "left").unwrap();
+        copy_shadow_source(&paths.snapshot, &paths.right, "right").unwrap();
+        drop_all_triggers(&open_shadow(&paths.left).unwrap()).unwrap();
+        drop_all_triggers(&open_shadow(&paths.right).unwrap()).unwrap();
+
+        let after = Routing::LinearV1(LinearV1::for_shard_count(2).unwrap());
+        let first_target = after.route(b"a");
+        let opposite = if first_target == source {
+            &paths.right
+        } else {
+            &paths.left
+        };
+        let connection = open_shadow(opposite).unwrap();
+        connection
+            .execute("DELETE FROM users WHERE id = 'a'", [])
+            .unwrap();
+        drop(connection);
+        write_backfill_checkpoint(
+            &paths.backfill_checkpoint,
+            &BackfillCheckpoint {
+                table: 0,
+                after: Some(CheckpointKey::Text("a".into())),
+            },
+        )
+        .unwrap();
+
+        build_shadows_resumable(&paths, &tables, source, ShardId(1), after, 1).unwrap();
+        let left = rows(&paths.left);
+        let right = rows(&paths.right);
+        let mut union = left.clone();
+        for (key, value) in right {
+            assert!(union.insert(key, value).is_none());
+        }
+        assert_eq!(union.len(), 4);
+        assert_eq!(union["a"], b"a".to_vec());
+        assert_eq!(
+            read_backfill_checkpoint(&paths.backfill_checkpoint)
+                .unwrap()
+                .table,
+            1
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_shadow_files_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let paths = SplitPaths::new(dir.path(), 17);
+        fs::create_dir_all(&paths.dir).unwrap();
+        write_backfill_checkpoint(
+            &paths.backfill_checkpoint,
+            &BackfillCheckpoint {
+                table: 0,
+                after: None,
+            },
+        )
+        .unwrap();
+        let error = build_shadows_resumable(
+            &paths,
+            &[],
+            ShardId(0),
+            ShardId(1),
+            Routing::LinearV1(LinearV1::ONE),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no matching shadow files"));
+    }
+
+    fn event_rows(path: &Path) -> BTreeMap<(Vec<u8>, i64), String> {
+        let connection = open_readonly(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT tenant, sequence, payload FROM events ORDER BY tenant, sequence")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    fn settings_rows(path: &Path) -> BTreeMap<String, String> {
+        let connection = open_readonly(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT name, value FROM settings ORDER BY name")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
     }
 
     fn rows(path: &Path) -> BTreeMap<String, Vec<u8>> {

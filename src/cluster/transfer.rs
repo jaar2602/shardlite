@@ -145,6 +145,35 @@ impl TransferSupervisor {
 
         let local_epoch = self.manager.epoch();
         if self.node == source
+            && operation.phase == OperationPhase::Snapshotting
+            && self
+                .catalog
+                .snapshot()
+                .scaling_policy
+                .max_transfer_source_bytes
+                > 0
+        {
+            let limit = self
+                .catalog
+                .snapshot()
+                .scaling_policy
+                .max_transfer_source_bytes;
+            let bytes = std::fs::metadata(shard.path(self.manager.dir()))
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            if bytes > limit {
+                self.submit(CatalogCommand::Transfer {
+                    operation: operation.id,
+                    progress: TransferProgress::Abort {
+                        reason: format!(
+                            "transfer source is {bytes} bytes, above policy max_transfer_source_bytes {limit}"
+                        ),
+                    },
+                })?;
+                return Ok(());
+            }
+        }
+        if self.node == source
             && matches!(
                 operation.phase,
                 OperationPhase::CatchingUp | OperationPhase::Prepared

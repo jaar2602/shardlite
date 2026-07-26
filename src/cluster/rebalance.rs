@@ -88,8 +88,8 @@ pub fn next_rebalance(catalog: &Catalog) -> Result<RebalanceDecision> {
             .get(&placement.primary)
             .is_some_and(|member| member.state != MemberState::Active)
     }) {
-        let destination =
-            least_loaded(&eligible, &counts, Some(placement.primary)).ok_or_else(|| {
+        let destination = least_loaded(catalog, &eligible, &counts, Some(placement.primary))
+            .ok_or_else(|| {
                 Error::ClusterConfig(format!(
                     "cannot evacuate node {}: no other active storage member is available",
                     placement.primary
@@ -113,15 +113,37 @@ pub fn next_rebalance(catalog: &Catalog) -> Result<RebalanceDecision> {
     let (&source, &source_count) = eligible
         .iter()
         .map(|node| (node, counts.get(node).unwrap_or(&0)))
-        .max_by_key(|(node, count)| (**count, std::cmp::Reverse(**node)))
+        .max_by(|(left_node, left_count), (right_node, right_count)| {
+            normalized_load_cmp(
+                **left_count,
+                catalog.members[left_node].capacity_weight,
+                **right_count,
+                catalog.members[right_node].capacity_weight,
+            )
+            .then_with(|| right_node.cmp(left_node))
+        })
         .expect("eligible is non-empty");
     let (&destination, &destination_count) = eligible
         .iter()
         .map(|node| (node, counts.get(node).unwrap_or(&0)))
-        .min_by_key(|(node, count)| (**count, **node))
+        .min_by(|(left_node, left_count), (right_node, right_count)| {
+            normalized_load_cmp(
+                **left_count,
+                catalog.members[left_node].capacity_weight,
+                **right_count,
+                catalog.members[right_node].capacity_weight,
+            )
+            .then_with(|| left_node.cmp(right_node))
+        })
         .expect("eligible is non-empty");
 
-    if source_count <= destination_count + 1 {
+    // Moving one primary must put the destination below the source's current normalized load.
+    // This is the weighted equivalent of the ordinary "difference must exceed one" rule and
+    // prevents a transfer from immediately being reversed on the next planning pass.
+    let source_weight = catalog.members[&source].capacity_weight as u128;
+    let destination_weight = catalog.members[&destination].capacity_weight as u128;
+    if source_count as u128 * destination_weight <= (destination_count as u128 + 1) * source_weight
+    {
         return Ok(RebalanceDecision::Balanced);
     }
 
@@ -156,6 +178,7 @@ pub fn plan_next(catalog: &mut Catalog) -> Result<RebalanceDecision> {
 }
 
 fn least_loaded(
+    catalog: &Catalog,
     eligible: &[NodeId],
     counts: &BTreeMap<NodeId, usize>,
     exclude: Option<NodeId>,
@@ -164,7 +187,24 @@ fn least_loaded(
         .iter()
         .copied()
         .filter(|node| Some(*node) != exclude)
-        .min_by_key(|node| (counts.get(node).copied().unwrap_or_default(), *node))
+        .min_by(|left, right| {
+            normalized_load_cmp(
+                counts.get(left).copied().unwrap_or_default(),
+                catalog.members[left].capacity_weight,
+                counts.get(right).copied().unwrap_or_default(),
+                catalog.members[right].capacity_weight,
+            )
+            .then_with(|| left.cmp(right))
+        })
+}
+
+fn normalized_load_cmp(
+    left_count: usize,
+    left_weight: u32,
+    right_count: usize,
+    right_weight: u32,
+) -> std::cmp::Ordering {
+    (left_count as u128 * right_weight as u128).cmp(&(right_count as u128 * left_weight as u128))
 }
 
 #[cfg(test)]
@@ -235,6 +275,21 @@ mod tests {
             next_rebalance(&catalog).unwrap(),
             RebalanceDecision::Balanced
         );
+    }
+
+    #[test]
+    fn capacity_weight_changes_the_balance_target() {
+        let mut catalog = catalog(8, 2);
+        catalog.set_member_policy(1, 3, None).unwrap();
+        catalog.set_member_policy(2, 1, None).unwrap();
+        assert!(matches!(
+            next_rebalance(&catalog).unwrap(),
+            RebalanceDecision::Transfer {
+                source: 2,
+                destination: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

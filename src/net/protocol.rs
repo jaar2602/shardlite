@@ -16,7 +16,13 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SplitImageSide {
+    Source,
+    Destination,
+}
 
 /// Largest single message. Snapshot chunks are the biggest legitimate payload, so this sits
 /// comfortably above the chunk size while still refusing anything absurd.
@@ -110,6 +116,18 @@ pub enum Request {
     SnapshotRead { shard: u32, offset: u64, len: u32 },
     /// Release the freeze. Must be sent, or checkpointing stays suspended.
     SnapshotEnd { shard: u32 },
+    /// Describe one immutable finalized split image so a required replica can pull it.
+    SplitImageInfo {
+        operation: u64,
+        side: SplitImageSide,
+    },
+    /// Read bytes from one immutable finalized split image.
+    SplitImageRead {
+        operation: u64,
+        side: SplitImageSide,
+        offset: u64,
+        len: u32,
+    },
     /// Apply a schema change to one shard and return its new version.
     SchemaApply { shard: u32, ddl: Statement },
     /// Read the schema version of several shards **this node owns**, changing nothing.
@@ -242,6 +260,13 @@ pub enum Response {
     },
     SnapshotChunk {
         /// Empty when the snapshot has been fully read.
+        data: Vec<u8>,
+    },
+    SplitImageInfo {
+        total_bytes: u64,
+        digest: [u8; 32],
+    },
+    SplitImageChunk {
         data: Vec<u8>,
     },
     Ok,

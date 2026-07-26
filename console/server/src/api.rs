@@ -1750,7 +1750,8 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
             Some(Permission::Operate)
         }
         ("POST", ["cluster", "rebalance" | "voters"])
-        | ("POST", ["cluster", "members", _, "cordon" | "drain"])
+        | ("POST", ["cluster", "policy"])
+        | ("POST", ["cluster", "members", _, "cordon" | "drain" | "policy"])
         | ("DELETE", ["cluster", "members", _]) => Some(Permission::Operate),
         ("GET", ["frames", _]) => Some(Permission::Operate),
         ("GET" | "POST", ["users"]) | ("DELETE", ["users", _]) => Some(Permission::ManageMeshUsers),

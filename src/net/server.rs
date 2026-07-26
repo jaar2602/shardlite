@@ -1001,10 +1001,7 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                     if let Some(Outcome::Rejected(m)) =
                         outcomes.iter().find(|o| matches!(o, Outcome::Rejected(_)))
                     {
-                        Response::Error {
-                            message: m.clone(),
-                            retryable: false,
-                        }
+                        rejection_response(m.clone())
                     } else {
                         let rows: u64 = outcomes
                             .iter()
@@ -1041,7 +1038,7 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                     // is never told a batch succeeded when part of it did not.
                     for o in &outcomes {
                         if let Outcome::Rejected(m) = o {
-                            return Response::Rejected { message: m.clone() };
+                            return rejection_response(m.clone());
                         }
                     }
                     outcomes
@@ -1170,6 +1167,36 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                 retryable: true,
             },
             Err(e) => error_response(e),
+        },
+
+        Request::SplitImageInfo { operation, side } => {
+            match authorized_split_image(shards, services, operation, side).and_then(|path| {
+                let total_bytes = std::fs::metadata(&path)
+                    .map_err(|error| {
+                        Error::Protocol(format!("sizing split image {}: {error}", path.display()))
+                    })?
+                    .len();
+                let digest = digest_file(&path)?;
+                Ok((total_bytes, digest))
+            }) {
+                Ok((total_bytes, digest)) => Response::SplitImageInfo {
+                    total_bytes,
+                    digest,
+                },
+                Err(error) => error_response(error),
+            }
+        }
+
+        Request::SplitImageRead {
+            operation,
+            side,
+            offset,
+            len,
+        } => match authorized_split_image(shards, services, operation, side)
+            .and_then(|path| read_file_chunk(&path, offset, len as usize))
+        {
+            Ok(data) => Response::SplitImageChunk { data },
+            Err(error) => error_response(error),
         },
 
         // Read-only: the schema versions of shards this node owns, for a coordinator checking
@@ -1381,11 +1408,15 @@ fn read_snapshot_chunk(
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>> {
+    let path = shard.path(shards.dir());
+    read_file_chunk(&path, offset, len)
+}
+
+fn read_file_chunk(path: &std::path::Path, offset: u64, len: usize) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     // Bounded so one request cannot ask for a reply larger than the frame limit.
     let len = len.min(super::protocol::MAX_FRAME_BYTES / 2);
-    let path = shard.path(shards.dir());
     let mut f = std::fs::File::open(&path)
         .map_err(|e| Error::Protocol(format!("opening {}: {e}", path.display())))?;
     f.seek(SeekFrom::Start(offset))
@@ -1402,6 +1433,65 @@ fn read_snapshot_chunk(
     }
     buf.truncate(got);
     Ok(buf)
+}
+
+fn authorized_split_image(
+    shards: &ShardManager,
+    services: &NodeServices,
+    operation: u64,
+    side: super::protocol::SplitImageSide,
+) -> Result<std::path::PathBuf> {
+    let catalog = services
+        .catalog
+        .as_ref()
+        .ok_or_else(|| Error::ClusterConfig("this node has no cluster catalog".into()))?
+        .snapshot();
+    let split = catalog.operations.get(&operation).ok_or_else(|| {
+        Error::ClusterConfig(format!("split operation {operation} does not exist"))
+    })?;
+    if split.kind != crate::cluster::OperationKind::Split
+        || split.phase != crate::cluster::OperationPhase::Installing
+    {
+        return Err(Error::ClusterConfig(format!(
+            "split operation {operation} is not serving finalized images"
+        )));
+    }
+    let node = services
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.id())
+        .ok_or_else(|| Error::ClusterConfig("this node has no cluster identity".into()))?;
+    if split.source != Some(node) {
+        return Err(Error::ClusterConfig(format!(
+            "node {node} is not the image source for split operation {operation}"
+        )));
+    }
+    let path = crate::cluster::split::staged_image_path(shards.dir(), operation, side);
+    if !path.exists() {
+        return Err(Error::ClusterConfig(format!(
+            "finalized split image {} is not durable yet",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn digest_file(path: &std::path::Path) -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| Error::Protocol(format!("opening {}: {error}", path.display())))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::Protocol(format!("hashing {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Serve a follower asking for frames from a position.
@@ -1479,7 +1569,18 @@ fn outcome_to_response(o: Outcome) -> Response {
             rows_affected: w.rows_affected,
             last_insert_rowid: w.last_insert_rowid,
         },
-        Outcome::Rejected(m) => Response::Rejected { message: m },
+        Outcome::Rejected(m) => rejection_response(m),
+    }
+}
+
+fn rejection_response(message: String) -> Response {
+    if message.contains(crate::cluster::split::BACKPRESSURE_SENTINEL) {
+        Response::Error {
+            message,
+            retryable: true,
+        }
+    } else {
+        Response::Rejected { message }
     }
 }
 

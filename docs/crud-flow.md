@@ -436,14 +436,16 @@ Only the source shard is fenced for final convergence; unrelated shards remain w
 images are installed before the new routing epoch is quorum-committed, and staging markers make an
 interrupted install/cleanup roll forward.
 
-The current split preflight intentionally accepts only tables whose declared shard key is their
-single-column `PRIMARY KEY`, with text or integer values. It refuses virtual/keyless/composite-key
-tables and refuses a source placement with replicas until every replica can acknowledge both shadow
-installs. Phase-by-phase process-exit/restart qualification is implemented and verifies automatic
-roll-forward with complete row comparisons. Capture-log bounds/backpressure, partitions, disk
-faults, and continuous concurrent workload qualification remain production-hardening work; see
-[crash-recovery.md](crash-recovery.md) and
-[dynamic-scaling-plan.md](dynamic-scaling-plan.md).
+Split preflight accepts declared text/integer/BLOB shard keys whether they are a single primary key,
+part of a composite key, or backed by SQLite's rowid; keyless rowid tables remain anchored to shard
+0. Capture rows carry a stable row identity, so replay reads the committed source row and does not
+re-run user SQL. Virtual tables and `WITHOUT ROWID` tables still fail closed until their module and
+tuple-identity behavior has a differential proof. A source may have replicas: every current copy is
+required to durably acknowledge both shadow installs before the routing epoch commits. The capture
+log is bounded with an explicit retryable backpressure sentinel, and large scans fsync a resumable
+row cursor after each batch. Phase-by-phase process-exit/restart qualification verifies automatic
+roll-forward with complete row comparisons; continuous workload and disk-fault qualification
+remain production-hardening work (see [crash-recovery.md](crash-recovery.md)).
 
 ### Operator surfaces
 
@@ -471,7 +473,8 @@ than they deliver:
 - **Legacy shard count stays immutable.** Existing modulo directories cannot be converted in place.
 - **Dynamic growth currently stops at the local 256-file allocation ceiling.** Logical activation
   starts small, but raising that implementation ceiling still requires a format/runtime change.
-- **HA logical split is not enabled yet.** Whole-shard moves retain replica-count semantics, but a
-  split source with replicas is refused until per-replica shadow install acknowledgement exists.
-- **A split has schema limits.** Every table must use a declared single text/integer primary shard
-  key; virtual, keyless, and composite-key tables block it.
+- **HA logical split requires every current copy to acknowledge both shadow installs.** A lagging or
+  unavailable replica blocks the routing commit until it catches up or the operation is aborted.
+- **A split has schema limits.** Virtual tables and `WITHOUT ROWID` tables are refused until their
+  module/tuple identity behavior has a differential proof; keyless rowid and composite-key tables
+  are supported with stable row identities.

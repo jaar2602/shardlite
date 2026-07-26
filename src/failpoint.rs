@@ -21,6 +21,25 @@ pub fn hit(name: &'static str) {
     let _ = name;
 }
 
+/// Whether a deterministic, non-crashing fault is active.
+///
+/// Qualification builds read `SHARDLITE_FAULT` and, when set, the file named by
+/// `SHARDLITE_FAULT_FILE`. The file form lets a process-level harness introduce and heal a fault
+/// without restarting the server. Production builds always return `false`.
+#[inline]
+pub fn active(name: &str) -> bool {
+    #[cfg(feature = "failpoints")]
+    {
+        enabled::active(name)
+    }
+
+    #[cfg(not(feature = "failpoints"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 #[cfg(feature = "failpoints")]
 mod enabled {
     use std::fs::OpenOptions;
@@ -29,6 +48,8 @@ mod enabled {
 
     const SPEC_ENV: &str = "SHARDLITE_FAILPOINT";
     const MARKER_ENV: &str = "SHARDLITE_FAILPOINT_MARKER";
+    const FAULT_ENV: &str = "SHARDLITE_FAULT";
+    const FAULT_FILE_ENV: &str = "SHARDLITE_FAULT_FILE";
 
     pub(super) fn hit(name: &'static str) {
         let Ok(spec) = std::env::var(SPEC_ENV) else {
@@ -51,6 +72,16 @@ mod enabled {
         spec.split(',')
             .map(str::trim)
             .any(|candidate| candidate == "*" || candidate == name)
+    }
+
+    pub(super) fn active(name: &str) -> bool {
+        if std::env::var(FAULT_ENV).is_ok_and(|spec| matches(&spec, name)) {
+            return true;
+        }
+        std::env::var(FAULT_FILE_ENV)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|spec| matches(&spec, name))
     }
 
     fn claim_once(path: &Path, name: &str) -> bool {

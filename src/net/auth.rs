@@ -99,6 +99,8 @@ pub fn required(req: &Request) -> Requirement {
         | Request::SnapshotBegin { .. }
         | Request::SnapshotRead { .. }
         | Request::SnapshotEnd { .. }
+        | Request::SplitImageInfo { .. }
+        | Request::SplitImageRead { .. }
         | Request::Vote(_)
         | Request::Beat(_)
         | Request::CatalogGet

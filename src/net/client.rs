@@ -159,6 +159,11 @@ impl Client {
 
     /// Resolve, connect, and apply the timeouts and nodelay every connection needs.
     fn connect_tcp(addr: &str, connect: Duration, io: Duration) -> Result<TcpStream> {
+        if crate::failpoint::active("network.outbound") {
+            return Err(Error::Busy(format!(
+                "injected outbound network partition blocks {addr}"
+            )));
+        }
         let resolved = addr
             .to_socket_addrs()
             .map_err(|e| Error::Protocol(format!("resolving {addr}: {e}")))?
@@ -543,6 +548,42 @@ impl Client {
             Response::CatalogInstalled { version } if version == catalog.version => Ok(()),
             other => Err(Error::Protocol(format!(
                 "unexpected response to catalog install: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn split_image_info(
+        &mut self,
+        operation: u64,
+        side: super::protocol::SplitImageSide,
+    ) -> Result<(u64, [u8; 32])> {
+        match self.round_trip(Request::SplitImageInfo { operation, side })? {
+            Response::SplitImageInfo {
+                total_bytes,
+                digest,
+            } => Ok((total_bytes, digest)),
+            other => Err(Error::Protocol(format!(
+                "unexpected split image metadata response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn split_image_read(
+        &mut self,
+        operation: u64,
+        side: super::protocol::SplitImageSide,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>> {
+        match self.round_trip(Request::SplitImageRead {
+            operation,
+            side,
+            offset,
+            len,
+        })? {
+            Response::SplitImageChunk { data } => Ok(data),
+            other => Err(Error::Protocol(format!(
+                "unexpected split image chunk response: {other:?}"
             ))),
         }
     }

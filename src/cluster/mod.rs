@@ -27,7 +27,8 @@ pub mod transfer;
 
 pub use catalog::{
     Catalog, CatalogOperation, CatalogProposal, CatalogStore, ClusterId, Compatibility, Member,
-    MemberRole, MemberState, OperationKind, OperationPhase, ReplicaSet, VoterTransition,
+    MemberRole, MemberState, OperationKind, OperationPhase, ReplicaSet, ScalingPolicy,
+    VoterTransition,
 };
 pub use catalog_quorum::CatalogQuorum;
 pub use control::{

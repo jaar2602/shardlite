@@ -3,8 +3,10 @@
 > **Status: experimental vertical slice implemented; acceptance hardening remains.** Catalog
 > membership, `init`/`join`, exact whole-shard transfer, automatic rebalance, linear SQL routing,
 > joint voter consensus, first-schema logical split, HTTP mutations, and console controls are
-> wired. Replica-aware split install, bounded capture backpressure, policy/resource controls, and
+> wired. Replica-aware split install, bounded capture backpressure, and
 > partition/disk-fault and continuous-workload qualification remain before a production claim.
+> Capacity-weighted placement, failure-domain labels, and split/transfer source-size budgets are
+> now durable catalog policy and editable through the HTTP/console control surface.
 > Deterministic process-crash/restart qualification at the durable phase boundaries is implemented;
 > see [crash-recovery.md](crash-recovery.md).
 
