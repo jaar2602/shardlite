@@ -13,6 +13,8 @@ const USAGE: &str = "\
 shardlite — HA multi-write SQLite server (single-node)
 
 usage:
+  shardlite init <data-dir> [options]       create a dynamic cluster
+  shardlite join <data-dir> --seed ADDR [options]
   shardlite <data-dir> --shards N          create a new data directory
   shardlite <data-dir>                     interactive shell (existing directory)
   shardlite <data-dir> -c \"SQL\"            run one statement and exit
@@ -67,6 +69,8 @@ fn main() -> ExitCode {
     }
 
     match args[0].as_str() {
+        "init" => return init_cluster_cmd(&args),
+        "join" => return join_cluster_cmd(&args),
         "serve" => return serve_cmd(&args),
         "user" => return user_cmd(&args),
         "frames" => return frames_cmd(&args),
@@ -724,6 +728,11 @@ const SERVE_USAGE: &str = "usage: shardlite serve <data-dir> [options]
 Clustering (deploy across hosts):
   --node-id N        this node's id; turns on cluster mode
   --peers LIST       other members as id=addr,id=addr,... (their --listen addresses)
+  --cluster-user U   cluster-machine credential name
+  --cluster-secret S cluster-machine credential secret
+
+Dynamic clusters are created with `shardlite init` and extended with `shardlite join`.
+Their durable catalog supplies node identity, routing, and placement; --peers is legacy-only.
 
   Shards are spread across members automatically (placement round-robins by node
   id). A client connected to any node can run SQL against any shard: the server
@@ -756,6 +765,258 @@ Without --tls-cert connections are plaintext.";
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+const INIT_USAGE: &str = "usage:
+  shardlite init <data-dir> [--node-id N] [--listen ADDR]
+                 [--initial-shards N] [--capacity N]
+
+Creates a dynamic cluster. It starts with one logical shard by default and can activate more
+through linear splits. --capacity reserves the local shard-id ceiling (default 256); it does not
+create or open that many SQLite files.";
+
+fn init_cluster_cmd(args: &[String]) -> ExitCode {
+    let pos = positionals(&args[1..]);
+    let Some(dir) = pos.first().map(std::path::PathBuf::from) else {
+        eprintln!("{INIT_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let node = flag(args, "--node-id")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    let address = flag(args, "--listen")
+        .unwrap_or("127.0.0.1:4600")
+        .to_string();
+    let initial = flag(args, "--initial-shards")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let capacity = flag(args, "--capacity")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(shardlite::shard::ShardConfig::MAX_SHARDS);
+    if !(1..=shardlite::shard::ShardConfig::MAX_SHARDS).contains(&capacity)
+        || initial == 0
+        || initial > capacity
+    {
+        eprintln!(
+            "error: initial shards must be in 1..={capacity}, and capacity must be in 1..={}",
+            shardlite::shard::ShardConfig::MAX_SHARDS
+        );
+        return ExitCode::FAILURE;
+    }
+    if Manifest::path(&dir).exists() || shardlite::cluster::CatalogStore::exists(&dir) {
+        eprintln!(
+            "error: {} is already a shardlite data directory; refusing to replace it",
+            dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let routing = match shardlite::shard::LinearV1::for_shard_count(initial) {
+        Ok(routing) => shardlite::shard::Routing::LinearV1(routing),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = (|| -> shardlite::Result<shardlite::cluster::Catalog> {
+        Manifest::open_or_create(&dir, capacity)?;
+        let compatibility = shardlite::cluster::Compatibility::current(routing)?;
+        let mut catalog = shardlite::cluster::Catalog::bootstrap(
+            shardlite::cluster::ClusterId::generate(node),
+            node,
+            address.clone(),
+            routing,
+            compatibility,
+        )?;
+        catalog.initialize_placements(1)?;
+        shardlite::cluster::CatalogStore::create(&dir, catalog.clone())?;
+        persist_node_id(&dir, node)?;
+        Ok(catalog)
+    })();
+    match result {
+        Ok(catalog) => {
+            println!(
+                "initialized dynamic cluster {} at {} (node {}, {} active shard{}, capacity {})",
+                catalog.cluster_id,
+                dir.display(),
+                node,
+                initial,
+                if initial == 1 { "" } else { "s" },
+                capacity
+            );
+            println!("start it with: shardlite serve {}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+const JOIN_USAGE: &str = "usage:
+  shardlite join <data-dir> --seed ADDR --node-id N --listen ADDR [--capacity N]
+                 [--cluster-user NAME --cluster-secret SECRET]
+
+The joining node is recorded as a write-ineligible learner, fsyncs the returned catalog locally,
+then becomes a non-voting storage member. The seed must be the current catalog leader.";
+
+fn join_cluster_cmd(args: &[String]) -> ExitCode {
+    let pos = positionals(&args[1..]);
+    let (Some(dir), Some(seed), Some(node), Some(address)) = (
+        pos.first().map(std::path::PathBuf::from),
+        flag(args, "--seed"),
+        flag(args, "--node-id").and_then(|value| value.parse::<u64>().ok()),
+        flag(args, "--listen"),
+    ) else {
+        eprintln!("{JOIN_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let capacity = flag(args, "--capacity")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(shardlite::shard::ShardConfig::MAX_SHARDS);
+    if !(1..=shardlite::shard::ShardConfig::MAX_SHARDS).contains(&capacity) {
+        eprintln!(
+            "error: --capacity must be in 1..={}",
+            shardlite::shard::ShardConfig::MAX_SHARDS
+        );
+        return ExitCode::FAILURE;
+    }
+    let credentials = match (flag(args, "--cluster-user"), flag(args, "--cluster-secret")) {
+        (Some(name), Some(secret)) => {
+            Some((name.to_string(), shardlite::net::auth::derive_key(secret)))
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!("error: --cluster-user and --cluster-secret must be given together");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = (|| -> shardlite::Result<shardlite::cluster::Catalog> {
+        let mut client = shardlite::net::Client::connect_full(
+            seed,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
+            credentials,
+        )?;
+        let (remote, _) = client.catalog_state()?;
+        if remote.routing.shard_count() > capacity {
+            return Err(shardlite::Error::ShardConfig(format!(
+                "cluster has {} active shards, above this node's capacity {capacity}",
+                remote.routing.shard_count()
+            )));
+        }
+        let compatibility = shardlite::cluster::Compatibility::current(remote.routing)?;
+        let local = if shardlite::cluster::CatalogStore::exists(&dir) {
+            let store = shardlite::cluster::CatalogStore::open(&dir)?;
+            let snapshot = store.snapshot();
+            remote.validate_join(Some(snapshot.cluster_id), &compatibility)?;
+            Some(store)
+        } else {
+            if Manifest::path(&dir).exists() {
+                return Err(shardlite::Error::ClusterConfig(format!(
+                    "{} contains a legacy data directory without a cluster catalog",
+                    dir.display()
+                )));
+            }
+            remote.validate_join(None, &compatibility)?;
+            None
+        };
+
+        let joined = client.catalog_command(shardlite::cluster::CatalogCommand::Join {
+            local_cluster: local.as_ref().map(|store| store.snapshot().cluster_id),
+            compatibility,
+            node,
+            incarnation: 1,
+            address: address.to_string(),
+        })?;
+        let operation = joined.operation.ok_or_else(|| {
+            shardlite::Error::ClusterConfig("leader returned no join operation".into())
+        })?;
+
+        let store = match local {
+            Some(store) => {
+                store.install_committed(joined.catalog.clone())?;
+                store
+            }
+            None => {
+                Manifest::open_or_create(&dir, capacity)?;
+                persist_node_id(&dir, node)?;
+                shardlite::cluster::CatalogStore::create(&dir, joined.catalog.clone())?
+            }
+        };
+        let durable_version = store.snapshot().version;
+        let completed =
+            client.catalog_command(shardlite::cluster::CatalogCommand::CompleteJoin {
+                operation,
+                durable_catalog_version: durable_version,
+            })?;
+        store.install_committed(completed.catalog.clone())?;
+        Ok(completed.catalog)
+    })();
+
+    match result {
+        Ok(catalog) => {
+            println!(
+                "joined cluster {} as non-voting storage node {} at {}",
+                catalog.cluster_id,
+                node,
+                dir.display()
+            );
+            println!("start it with: shardlite serve {}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn node_id_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("cluster").join("node-id")
+}
+
+fn persist_node_id(dir: &std::path::Path, node: u64) -> shardlite::Result<()> {
+    let path = node_id_path(dir);
+    let parent = path.parent().expect("node id path has parent");
+    std::fs::create_dir_all(parent).map_err(|error| {
+        shardlite::Error::Manifest(format!("creating cluster directory: {error}"))
+    })?;
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp).map_err(|error| {
+            shardlite::Error::Manifest(format!("creating {}: {error}", tmp.display()))
+        })?;
+        writeln!(file, "{node}")
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                shardlite::Error::Manifest(format!("persisting {}: {error}", tmp.display()))
+            })?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|error| {
+        shardlite::Error::Manifest(format!("installing {}: {error}", path.display()))
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            shardlite::Error::Manifest(format!("fsyncing {}: {error}", parent.display()))
+        })
+}
+
+fn read_node_id(dir: &std::path::Path) -> shardlite::Result<u64> {
+    let path = node_id_path(dir);
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        shardlite::Error::Manifest(format!("reading {}: {error}", path.display()))
+    })?;
+    text.trim().parse::<u64>().map_err(|error| {
+        shardlite::Error::Manifest(format!(
+            "{} has an invalid node id: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(feature = "http")]
@@ -826,10 +1087,40 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         eprintln!("{SERVE_USAGE}");
         return ExitCode::FAILURE;
     };
+    let dynamic_catalog = if shardlite::cluster::CatalogStore::exists(&dir) {
+        match shardlite::cluster::CatalogStore::open(&dir) {
+            Ok(store) => Some(std::sync::Arc::new(store)),
+            Err(error) => {
+                eprintln!("error: opening cluster catalog: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let persisted_node = read_node_id(&dir).ok();
+    let catalog_address = dynamic_catalog.as_ref().and_then(|catalog| {
+        let node = flag(args, "--node-id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(persisted_node)?;
+        catalog
+            .snapshot()
+            .members
+            .get(&node)
+            .map(|member| member.address.clone())
+    });
     let listen = flag(args, "--listen")
-        .unwrap_or("127.0.0.1:4600")
-        .to_string();
+        .map(str::to_string)
+        .or(catalog_address)
+        .unwrap_or_else(|| "127.0.0.1:4600".to_string());
     let requested = flag(args, "--shards").and_then(|v| v.parse::<u32>().ok());
+
+    if dynamic_catalog.is_some() && requested.is_some() {
+        eprintln!(
+            "error: --shards is not used by a dynamic cluster; routing comes from its catalog"
+        );
+        return ExitCode::FAILURE;
+    }
 
     let shards = match resolve_shards(&dir, requested) {
         Ok(n) => n,
@@ -850,7 +1141,9 @@ fn serve_cmd(args: &[String]) -> ExitCode {
 
     // --node-id turns this into a cluster member; without it the node is standalone. --peers gives
     // the other members as `id=addr` pairs, which are also the addresses this node forwards to.
-    let node_id = flag(args, "--node-id").and_then(|v| v.parse::<u64>().ok());
+    let node_id = flag(args, "--node-id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(persisted_node);
     let peers = match flag(args, "--peers") {
         Some(s) => match parse_peers(s) {
             Ok(p) => p,
@@ -865,6 +1158,19 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         eprintln!("error: --peers requires --node-id");
         return ExitCode::FAILURE;
     }
+    if dynamic_catalog.is_some() && !peers.is_empty() {
+        eprintln!("error: --peers is legacy-only; this directory uses catalog membership");
+        return ExitCode::FAILURE;
+    }
+
+    let cluster_credentials = match (flag(args, "--cluster-user"), flag(args, "--cluster-secret")) {
+        (Some(name), Some(secret)) => Some((name.to_string(), secret.to_string())),
+        (None, None) => None,
+        _ => {
+            eprintln!("error: --cluster-user and --cluster-secret must be given together");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // S3 archival for HA (opt-in via --s3-bucket). Requires an `s3`-featured build.
     #[cfg(not(feature = "s3"))]
@@ -881,15 +1187,24 @@ fn serve_cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    let (manager, services, cluster) = match node_id {
-        Some(id) => match build_cluster(&dir, shards, id, peers, auth) {
+    let (manager, services, cluster) = match (node_id, dynamic_catalog) {
+        (Some(id), Some(catalog)) => {
+            match build_dynamic_cluster(&dir, shards, id, catalog, auth, cluster_credentials) {
+                Ok((m, svc, c)) => (m, svc, Some(c)),
+                Err(e) => {
+                    eprintln!("error: forming dynamic cluster: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        (Some(id), None) => match build_cluster(&dir, shards, id, peers, auth) {
             Ok((m, svc, c)) => (m, svc, Some(c)),
             Err(e) => {
                 eprintln!("error: forming cluster: {e}");
                 return ExitCode::FAILURE;
             }
         },
-        None => {
+        (None, None) => {
             #[allow(unused_mut)]
             let mut cfg = shardlite::shard::ShardConfig {
                 shard_count: shards,
@@ -917,7 +1232,34 @@ fn serve_cmd(args: &[String]) -> ExitCode {
             };
             (m, services, None)
         }
+        (None, Some(_)) => {
+            eprintln!("error: dynamic cluster directory has no persisted node identity");
+            return ExitCode::FAILURE;
+        }
     };
+
+    // Catalog commits are intentionally outside the CRUD path. Refresh the manager's immutable
+    // routing snapshot between requests; a value beyond this directory's capacity is logged and
+    // refused by `set_catalog_routing`, never partially activated.
+    if let (Some(catalog), Some(cluster_node)) = (&services.catalog, &cluster) {
+        let routing_manager = std::sync::Arc::clone(&manager);
+        let routing_catalog = std::sync::Arc::clone(catalog);
+        let routing_cluster = std::sync::Arc::clone(cluster_node);
+        std::thread::Builder::new()
+            .name("shardlite-catalog-routing".into())
+            .spawn(move || {
+                while !routing_cluster.is_stopped() {
+                    let catalog = routing_catalog.snapshot();
+                    if let Err(error) =
+                        routing_manager.set_catalog_routing(catalog.routing, catalog.routing_epoch)
+                    {
+                        tracing::error!(%error, "refusing committed routing");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            })
+            .expect("spawning catalog routing refresh");
+    }
 
     // Attach a startup-configured S3 sink to the live writer fleet AND the runtime handle, for both
     // standalone and clustered nodes, so committed frames archive to S3 and the status/snapshot
@@ -926,9 +1268,8 @@ fn serve_cmd(args: &[String]) -> ExitCode {
     #[cfg(feature = "s3")]
     if let Some((sink, summary)) = &s3_sink {
         if manager.capture_enabled() {
-            manager
-                .set_sink(Some(std::sync::Arc::clone(sink)
-                    as std::sync::Arc<dyn shardlite::replication::FrameSink>));
+            manager.set_sink(Some(std::sync::Arc::clone(sink)
+                as std::sync::Arc<dyn shardlite::replication::FrameSink>));
             services
                 .s3
                 .attach(std::sync::Arc::clone(sink), summary.clone());
@@ -1073,7 +1414,10 @@ fn parse_peers(s: &str) -> std::result::Result<std::collections::BTreeMap<u64, S
 /// `--s3-bucket` is absent. `--s3-endpoint` makes it work against any S3-compatible store (MinIO,
 /// Cloudflare R2, …), not just AWS; without it the AWS regional endpoint is derived.
 #[cfg(feature = "s3")]
-type S3Archival = (std::sync::Arc<shardlite::s3::S3Sink>, shardlite::s3::S3Summary);
+type S3Archival = (
+    std::sync::Arc<shardlite::s3::S3Sink>,
+    shardlite::s3::S3Summary,
+);
 
 #[cfg(feature = "s3")]
 fn s3_archival(args: &[String]) -> std::result::Result<Option<S3Archival>, String> {
@@ -1271,6 +1615,151 @@ fn build_cluster(
         auth,
         frames: Some(frames),
         cluster: Some(Arc::clone(&cluster)),
+        router: Some(router),
+        ..Default::default()
+    };
+    Ok((manager, services, cluster))
+}
+
+fn build_dynamic_cluster(
+    dir: &std::path::Path,
+    capacity: u32,
+    id: u64,
+    catalog: std::sync::Arc<shardlite::cluster::CatalogStore>,
+    auth: Option<std::sync::Arc<shardlite::net::AuthConfig>>,
+    credentials: Option<(String, String)>,
+) -> std::result::Result<
+    (
+        std::sync::Arc<shardlite::shard::ShardManager>,
+        shardlite::net::NodeServices,
+        std::sync::Arc<shardlite::cluster::ClusterNode>,
+    ),
+    String,
+> {
+    use shardlite::cluster::{
+        CatalogControl, CatalogQuorum, ClusterNode, DurabilitySource, Election, ElectionConfig,
+        Fence, MemberRole, TermStore,
+    };
+    use shardlite::replication::{FrameLog, FrameLogConfig};
+    use shardlite::shard::{PeerRouter, ShardConfig, ShardId, ShardManager, WriteGate};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let snapshot = catalog.snapshot();
+    let local = snapshot.members.get(&id).ok_or_else(|| {
+        format!(
+            "node id {id} is not a member of cluster {}; use the identity written by `shardlite \
+             init` or `shardlite join`",
+            snapshot.cluster_id
+        )
+    })?;
+    if snapshot.routing.shard_count() > capacity {
+        return Err(format!(
+            "catalog activates {} shards but this directory has capacity {capacity}",
+            snapshot.routing.shard_count()
+        ));
+    }
+
+    let frames = Arc::new(FrameLog::new(FrameLogConfig {
+        total_bytes: 8 * 1024 * 1024,
+        shard_count: capacity,
+    }));
+    let fence = Arc::new(Fence::new(id, 0));
+    let manager = Arc::new(
+        ShardManager::open_clustered(
+            dir,
+            ShardConfig {
+                shard_count: capacity,
+                capture: true,
+                ..ShardConfig::floor()
+            },
+            Some(frames.clone()),
+            None,
+            Some(Arc::clone(&fence) as Arc<dyn WriteGate>),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    manager
+        .set_catalog_routing(snapshot.routing, snapshot.routing_epoch)
+        .map_err(|error| error.to_string())?;
+
+    let voter_peers: BTreeMap<u64, String> = snapshot
+        .members
+        .values()
+        .filter(|member| member.role == MemberRole::Voter && member.node != id)
+        .map(|member| (member.node, member.address.clone()))
+        .collect();
+    let terms = TermStore::open(&dir.join("cluster")).map_err(|error| error.to_string())?;
+    let election = Election::new(
+        ElectionConfig {
+            node: id,
+            peers: voter_peers.keys().copied().collect(),
+            election_timeout: Duration::from_millis(1500),
+            heartbeat_interval: Duration::from_millis(300),
+        },
+        terms,
+        Instant::now(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut node = ClusterNode::new(
+        id,
+        election,
+        Arc::clone(&fence),
+        voter_peers,
+        Arc::clone(&manager) as Arc<dyn DurabilitySource>,
+        (0..snapshot.routing.shard_count()).map(ShardId).collect(),
+    )
+    .with_catalog(Arc::clone(&catalog))
+    .with_modes(Arc::clone(manager.modes()));
+    if local.role != MemberRole::Voter {
+        node = node.as_storage_member();
+    }
+    if let Some((name, secret)) = &credentials {
+        node = node.with_cluster_credentials(name, secret);
+    }
+    let cluster = Arc::new(node);
+
+    let mut quorum = CatalogQuorum::new(Arc::clone(&cluster), Arc::clone(&catalog));
+    if let Some((name, secret)) = &credentials {
+        quorum = quorum.with_credentials(name, secret);
+    }
+    let quorum = Arc::new(quorum);
+    let control = Arc::new(CatalogControl::new(Arc::clone(&quorum)));
+
+    let router = Arc::new(shardlite::net::Router::new(Arc::clone(&cluster)));
+    manager.set_peer_router(Arc::clone(&router) as Arc<dyn PeerRouter>);
+    let supervisor = Arc::new(shardlite::cluster::TransferSupervisor::new(
+        id,
+        Arc::clone(&manager),
+        Arc::clone(&catalog),
+        Arc::clone(&cluster),
+        Arc::clone(&control),
+        credentials.clone(),
+    ));
+    std::thread::Builder::new()
+        .name("shardlite-transfer".into())
+        .spawn(move || supervisor.run(Duration::from_millis(200)))
+        .map_err(|error| format!("spawning transfer supervisor: {error}"))?;
+    let split_supervisor = Arc::new(shardlite::cluster::SplitSupervisor::new(
+        id,
+        Arc::clone(&manager),
+        Arc::clone(&catalog),
+        Arc::clone(&cluster),
+        Arc::clone(&control),
+        credentials,
+    ));
+    std::thread::Builder::new()
+        .name("shardlite-split".into())
+        .spawn(move || split_supervisor.run(Duration::from_millis(200)))
+        .map_err(|error| format!("spawning split supervisor: {error}"))?;
+    let services = shardlite::net::NodeServices {
+        auth,
+        frames: Some(frames),
+        cluster: Some(Arc::clone(&cluster)),
+        catalog: Some(catalog),
+        catalog_control: Some(control),
         router: Some(router),
         ..Default::default()
     };

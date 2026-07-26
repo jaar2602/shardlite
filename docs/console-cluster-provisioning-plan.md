@@ -24,12 +24,13 @@ this adds a capability rather than reworking the core.
    `--peers 1=host:4600,…`. In k8s, stable identity comes from a *headless Service*
    (`shardlite-<id>-0.svc`, `-1`, …); node-id/peers must be **derived from the pod ordinal** by a small
    entrypoint shim in the image. That shim does not exist — it is slice 0.
-2. **Scale-out / rebalance is gated on unbuilt shardlite core.** Bumping a StatefulSet's replicas adds
-   pods, but shardlite places shards by node-id **at creation** and has **no live shard-move** (shardlite
-   plan step 11, "not designed beyond the mechanism"). So a new pod holds **no shards and takes no
-   writes** until shardlite can move whole shards to it. Create/start/stop/destroy are deliverable now;
-   **true scaling is not** — build the k8s mechanism, label it honestly, and wait on shardlite for the
-   data rebalance.
+2. **Scale-out / rebalance is gated on the shardlite dynamic-scaling core.** Bumping a StatefulSet's
+   replicas adds pods, but the current deployment path has no safe dynamic join, replica bootstrap,
+   or durable live-transfer lifecycle. So a new pod must hold **no primaries and take no writes**
+   until the membership-through-rebalance slices in
+   [dynamic-scaling-plan.md](dynamic-scaling-plan.md) are complete. Create/start/stop/destroy are
+   deliverable now; **true scaling is not** — build the k8s mechanism, label it honestly, and wait on
+   shardlite for data bootstrap and rebalance.
 3. **The console must run in-cluster with RBAC.** Creating StatefulSets needs a ServiceAccount + a
    namespace-scoped Role. Safer than the Docker-socket alternative (namespaced, not root-on-host),
    but it means "deploy the console to k8s" becomes part of the plan.
@@ -57,8 +58,10 @@ New console pieces:
 - **`k8s.rs`** — in-cluster client: apply/get/delete/scale for `StatefulSet`, `Service`,
   `PersistentVolumeClaim`, `Pod` (list/status). Just enough typed JSON over `ureq`.
 - **Cluster registry** (`clusters.rs`) — persisted store of clusters the console created (id, name,
-  namespace, nodes, **shards — immutable**, phase). A created cluster auto-creates a **connection**,
-  so it flows into the existing observe/query/assistant surface unchanged.
+  namespace, desired nodes, routing mode, mutable split policy, phase). Current legacy clusters
+  retain their immutable shard count; new linear-routing clusters begin small and grow internally.
+  A created cluster auto-creates a **connection**, so it flows into the existing
+  observe/query/assistant surface unchanged.
 - **REST** — `POST/GET/DELETE /api/clusters`, `POST /api/clusters/<id>/{stop,start,scale}`.
   **Admin-only** (new `ManageClusters` permission, or reuse `ManageConnections`), audited, delete via
   **typed confirm** (matches the console's delete-always-confirms rule). License check gates create.
@@ -74,11 +77,12 @@ New console pieces:
 
 | Console action | k8s | Notes |
 |---|---|---|
-| **Create** | apply Service + StatefulSet(replicas=N, shards=S) → poll Ready + leader → register connection | shard count fixed here, forever |
+| **Create** | apply Service + StatefulSet(replicas=N) → initialize/join → poll data ready + leader → register connection | New linear-routing clusters have no permanent shard-count choice |
 | **Stop** | scale replicas → 0 | keeps PVCs (data safe) |
 | **Start** | scale replicas → N | data intact from PVCs |
 | **Destroy** | delete StatefulSet + Service + PVCs, drop connection | typed confirm |
-| **Scale-out** | bump replicas (+ placement call) | **mechanism only** — no data moves until shardlite shard-move exists (blocker 2) |
+| **Scale-out** | bump replicas → learner join → bootstrap → rebalance/split | complete only when capacity is active, not merely when the pod is Ready |
+| **Scale-in** | cordon/drain highest ordinal → verify empty → remove member → lower replicas | never delete a pod that still owns a primary or required replica |
 
 ---
 
@@ -95,9 +99,10 @@ New console pieces:
   destroy removes everything + the connection.
 - **4 — Clusters UI.** Wizard + lifecycle + status, end-to-end from the browser.
 - **5 — Console-on-k8s.** RBAC + Deployment + Helm chart; console provisions from inside the cluster.
-- **6 — Scale-out + rebalance *(blocked on shardlite step 11)*.** Ship only when shardlite can move shards;
-  until then "add node" is exposed as standby/read replicas, explicitly labeled as *not* rebalancing
-  existing shards.
+- **6 — Scale-out/in + rebalance *(blocked on the dynamic scaling plan)*.** Ship only when
+  shardlite can dynamically join a node, bootstrap replicas, move/split shards through fenced
+  cutover, and durably drain before removal. Until then "add node" is exposed as standby/read
+  replicas, explicitly labeled as *not* rebalancing existing shards.
 - **L — Licensing gate.** Enterprise-only: create/scale endpoints require a valid license;
   individual/Docker deployments never see the Clusters UI. (Design the license mechanism separately.)
 

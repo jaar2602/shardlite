@@ -2,6 +2,50 @@
 
 Deferred work, with enough context to pick up cold.
 
+## Dynamic scaling — membership, live movement, and linear shard splits
+
+**In progress (experimental end-to-end path implemented; production hardening remains).** Let a cluster start
+with one shard, admit storage nodes
+without restarting existing members, move whole shards through snapshot/WAL catch-up and fenced
+cutover, and create additional shards incrementally with linear hashing when existing shards cannot
+use the new capacity. This replaces the permanent creation-time capacity choice without adding an
+arbitrary token-range map.
+
+The work is deliberately staged: cluster catalog and dynamic membership → exact replica bootstrap →
+whole-shard transfer/rebalance → linear routing → durable logical row capture → two-shadow online
+split and crash recovery. Full architecture, invariants, failure matrix, compatibility rules, and
+acceptance gates are in [dynamic-scaling-plan.md](dynamic-scaling-plan.md).
+
+Implemented:
+
+- versioned legacy modulo and linear-hash routing, with exhaustive growth invariants;
+- checksummed/fsynced cluster catalog, identity and compatibility validation;
+- learner/storage/voter lifecycle, durable join/drain/transfer operation records;
+- quorum prepare/commit wire primitives and catalog-aware election eligibility;
+- exact snapshot/catch-up/final-LSN transfer guards and per-shard fence/drain barrier;
+- resumable destination transfer worker, late-member catalog repair, and automatic stable
+  one-shard-at-a-time rebalance;
+- active linear routing in SQL/fan-out, routing-epoch forwarding checks, lazy shard activation, and
+  global shard-key update refusal;
+- transactional dirty-key capture, two-shadow backfill/replay, affected-shard fence, crash-resumable
+  install, routing commit, and cleanup for the first supported split schema;
+- seed `init`/`join`, joint voter consensus, quorum-backed lifecycle HTTP mutations, and console
+  status/actions;
+- deterministic process-exit failpoints and restart qualification across catalog/join, voter,
+  whole-shard transfer, fenced transfer repair, and online split boundaries, with automatic
+  prepared-value, membership, voter-transition, and operation recovery.
+
+Still required before calling dynamic mode production-ready:
+
+- network-partition, disk-full/corruption, checksum, and stale-owner/router fault injection;
+- continuous concurrent read/write differential workloads during move/split and coordinator
+  failover, including repeated crashes and replica loss;
+- bounded split-log backpressure and resumable large-table scan checkpoints;
+- per-replica split shadow/install acknowledgements (the current split refuses replicated sources);
+- broader split schema support after differential proof for keyless/virtual/composite-key cases;
+- capacity weights, failure-domain placement rules, resource budgets, and policy thresholds;
+- console join-token/provisioning workflow and build/deployment verification in the packaged stack.
+
 ## Console cluster provisioning — Kubernetes (enterprise, licensed)
 
 **Future upgrade, not scheduled.** Let the console *create and manage* shardlite clusters (StatefulSet +
@@ -9,8 +53,10 @@ headless Service + per-pod PVC), not just connect to existing ones — a **licen
 capability. Individual/self-host users stay on the Docker path (`deploy/stack/shardlite-stack`). Full
 design, blockers, and slice plan in [console-cluster-provisioning-plan.md](console-cluster-provisioning-plan.md).
 
-**Hard dependency:** full-lifecycle *scaling* needs live shard-move (shardlite plan step 11), which is
-unbuilt — create/start/stop/destroy are deliverable without it, rebalance is not.
+**Hard dependency:** full-lifecycle *scaling* builds on the dynamic membership, bootstrap, transfer,
+and rebalance slices in the [dynamic scaling plan](dynamic-scaling-plan.md). Those core paths now
+exist; the remaining provisioning work is provider orchestration, join-token delivery, resource
+preflight, audit/approval UX, and production failure qualification.
 
 ## Owner-aware S3 archive (correct stale-local-file recovery)
 

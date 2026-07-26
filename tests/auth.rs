@@ -186,7 +186,9 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
     // The property that makes challenge–response worth its round trip: a captured handshake
     // is useless against any other connection. Driven by hand, because the property is the
     // protocol's, not the client wrapper's.
-    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{
+        PROTOCOL_VERSION, Request, Response, read_message, write_message,
+    };
     use std::net::TcpStream;
 
     let n = serve(Some(full_auth()));
@@ -236,8 +238,10 @@ fn every_connection_gets_a_fresh_challenge_and_a_replayed_proof_fails() {
     else {
         panic!("expected a challenge");
     };
-    let captured_proof =
-        shardlite::net::auth::prove(&shardlite::net::auth::derive_key("write-secret"), &first_nonce);
+    let captured_proof = shardlite::net::auth::prove(
+        &shardlite::net::auth::derive_key("write-secret"),
+        &first_nonce,
+    );
 
     // A new connection gets a different nonce, and the captured proof fails against it.
     let (second_nonce, replay_outcome) = handshake(Some(captured_proof));

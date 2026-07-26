@@ -66,6 +66,38 @@ cargo build --release --features tls,http,json-tcp
 The shard count is fixed at creation and cannot be changed later (it determines how every key
 routes), so you choose it up front. 16–64 is typical.
 
+This is the legacy routing model and remains compatible. New clusters can instead start with one
+active shard and grow through the experimental dynamic path:
+
+```sh
+# Node 1: one active shard; unused local files are created lazily.
+shardlite init ./node-1 --listen 10.0.0.1:4600 --initial-shards 1
+shardlite serve ./node-1
+
+# Another host: join as non-voting storage, then serve.
+shardlite join ./node-2 --seed 10.0.0.1:4600 \
+  --node-id 2 --listen 10.0.0.2:4600
+shardlite serve ./node-2
+```
+
+The leader then splits or transfers one shard at a time to use the new capacity. Dynamic mode is
+experimental: online splits currently require every table's declared shard key to be its single
+text/integer primary key, and refuse a source with replicas until replica shadow-install
+acknowledgements are implemented. See the [dynamic scaling plan](docs/dynamic-scaling-plan.md) and
+[backlog status](docs/backlog.md).
+
+Dynamic topology crash recovery has a deterministic, process-level qualification suite. It kills
+real server processes without running destructors, restarts the same data directories, waits for
+automatic catalog/operation repair, and compares complete rows:
+
+```sh
+cargo test --features failpoints --test dynamic_crash -- --ignored --nocapture --test-threads=1
+```
+
+The failpoint feature is excluded from normal production builds. See
+[crash recovery qualification](docs/crash-recovery.md) for the coverage and remaining production
+fault matrix.
+
 ```sh
 # create a data directory with 16 shards and run one statement
 shardlite ./data --shards 16 -c "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) STRICT"

@@ -191,6 +191,28 @@ impl Promotion {
     pub fn shards(&self) -> &[ShardId] {
         &self.shards
     }
+
+    /// Fence one source shard, drain its writer queue, and return its exact final `(epoch, LSN)`.
+    ///
+    /// The gate closes before the queue barrier. Anything already inside SQLite finishes; queued
+    /// work that has not started observes the closed gate. Once `drain_writes` returns no later
+    /// commit can advance this position.
+    pub fn fence_for_transfer(&self, shard: ShardId) -> Result<(u64, u64)> {
+        if !self.shards.contains(&shard) || !self.fence.is_open(shard) {
+            return Err(Error::ClusterConfig(format!(
+                "cannot fence {shard} for transfer: this node is not its writable source"
+            )));
+        }
+        self.fence
+            .close_shard(shard, "catalog transfer reached its fencing barrier");
+        self.manager.drain_writes(shard)?;
+        let epoch = self.manager.epoch().ok_or_else(|| {
+            Error::ClusterConfig(format!(
+                "cannot transfer {shard} without frame capture and a stream epoch"
+            ))
+        })?;
+        Ok((epoch, self.manager.last_lsn(shard)))
+    }
 }
 
 impl std::fmt::Debug for Promotion {

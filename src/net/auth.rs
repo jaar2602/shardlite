@@ -101,9 +101,17 @@ pub fn required(req: &Request) -> Requirement {
         | Request::SnapshotEnd { .. }
         | Request::Vote(_)
         | Request::Beat(_)
-        // A batched fan-out is coordinator-to-owner, on the cluster's own authority.
+        | Request::CatalogGet
+        | Request::CatalogPrepare { .. }
+        | Request::CatalogCommit { .. }
+        | Request::CatalogCommand(_)
+        | Request::CatalogInstall { .. }
+        // A batched fan-out is coordinator-to-owner, on the cluster's own authority. Reading a
+        // shard's schema version is the same shape and changes nothing.
         | Request::ShardBatch { .. }
+        | Request::SchemaVersions { .. }
         | Request::Direct(_) => Requirement::Cluster,
+        Request::RoutedDirect { .. } => Requirement::Cluster,
     }
 }
 

@@ -96,6 +96,11 @@ pub struct ClusterNode {
     fence: Arc<Fence>,
     /// Peer id to address.
     peers: BTreeMap<NodeId, String>,
+    /// Durable membership and placement, when this node was started in dynamic-cluster mode.
+    /// Legacy `--peers` clusters leave it absent and retain their derived placement behavior.
+    catalog: Option<Arc<super::catalog::CatalogStore>>,
+    /// Storage members receive topology and serve shards but do not campaign or vote.
+    voting: bool,
     /// Cached connections, rebuilt on failure.
     links: Mutex<BTreeMap<NodeId, Client>>,
     durability: Arc<dyn DurabilitySource>,
@@ -169,6 +174,8 @@ impl ClusterNode {
             election: Mutex::new(election),
             fence,
             peers,
+            catalog: None,
+            voting: true,
             links: Mutex::new(BTreeMap::new()),
             durability,
             shards,
@@ -243,7 +250,7 @@ impl ClusterNode {
         };
         match action {
             Some(action) => {
-                let durability = self.durability.durability();
+                let durability = self.current_durability();
                 self.perform(action, &durability, now)?;
                 Ok(true)
             }
@@ -287,13 +294,34 @@ impl ClusterNode {
         self
     }
 
+    /// Use committed catalog membership and placement rather than deriving them from static peers.
+    pub fn with_catalog(mut self, catalog: Arc<super::catalog::CatalogStore>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Run as a storage-only member: accept coordinator heartbeats, but never campaign or vote.
+    pub fn as_storage_member(mut self) -> Self {
+        self.voting = false;
+        self
+    }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
 
     /// Where a peer listens, for forwarding work to the node that owns a shard.
-    pub fn peer_addr(&self, node: NodeId) -> Option<&str> {
-        self.peers.get(&node).map(|s| s.as_str())
+    pub fn peer_addr(&self, node: NodeId) -> Option<String> {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .snapshot()
+                    .members
+                    .get(&node)
+                    .map(|member| member.address.clone())
+            })
+            .or_else(|| self.peers.get(&node).cloned())
     }
 
     /// Configured voting peers and their native shardlite addresses, sorted by node ID.
@@ -302,10 +330,7 @@ impl ClusterNode {
     /// configured; callers that need liveness must combine it with [`Self::live_members`] and
     /// must remember that only the current leader has a meaningful heartbeat view.
     pub fn peers(&self) -> Vec<(NodeId, String)> {
-        self.peers
-            .iter()
-            .map(|(&node, addr)| (node, addr.clone()))
-            .collect()
+        self.voter_peers().into_iter().collect()
     }
 
     /// Peers that answered the leader's latest heartbeat round.
@@ -342,6 +367,82 @@ impl ClusterNode {
         self.election.lock().expect("election mutex").leader()
     }
 
+    /// Verify that a catalog RPC came from the leader this voter currently recognises.
+    pub fn authorize_catalog_leader(&self, leader: NodeId, term: u64) -> Result<()> {
+        self.check_participating()?;
+        let election = self.election.lock().expect("election mutex");
+        if election.term() != term || election.leader() != Some(leader) {
+            return Err(crate::error::Error::ClusterConfig(format!(
+                "catalog command claims node {leader} in term {term}, but this node recognises \
+                 leader {:?} in term {}; refusing stale or unauthorised metadata",
+                election.leader(),
+                election.term()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn catalog_position(&self) -> Option<super::durability::CatalogPosition> {
+        self.catalog
+            .as_ref()
+            .map(|catalog| catalog.durability_position())
+    }
+
+    pub fn catalog_routing_epoch(&self) -> Option<u64> {
+        self.catalog
+            .as_ref()
+            .map(|catalog| catalog.snapshot().routing_epoch)
+    }
+
+    /// Refresh the election's voter sets from committed catalog state.
+    ///
+    /// If a finalized change removes this node while it leads, its write gate closes in the same
+    /// call that observes the catalog—not on a later lease timeout.
+    pub fn refresh_catalog_voters(&self) -> Result<bool> {
+        let Some(catalog) = &self.catalog else {
+            return Ok(self.voting);
+        };
+        let catalog = catalog.snapshot();
+        let (current, next) = catalog.voter_sets();
+        let participating = catalog.is_voter(self.id);
+        let action = {
+            let mut election = self.election.lock().expect("election mutex");
+            election.set_voter_configuration(current, next)?;
+            (!participating && election.is_leader())
+                .then(|| election.request_step_down(Instant::now()))
+                .flatten()
+        };
+        if let Some(action) = action {
+            let durability = self.current_durability();
+            self.perform(action, &durability, Instant::now())?;
+        }
+        Ok(participating)
+    }
+
+    fn voter_peers(&self) -> BTreeMap<NodeId, String> {
+        match &self.catalog {
+            Some(catalog) => {
+                let catalog = catalog.snapshot();
+                let (current, next) = catalog.voter_sets();
+                let mut voters = current;
+                if let Some(next) = next {
+                    voters.extend(next);
+                }
+                voters
+                    .into_iter()
+                    .filter(|node| *node != self.id)
+                    .filter_map(|node| {
+                        catalog
+                            .members
+                            .get(&node)
+                            .map(|member| (node, member.address.clone()))
+                    })
+                    .collect()
+            }
+            None => self.peers.clone(),
+        }
+    }
+
     pub fn stats(&self) -> ClusterStats {
         ClusterStats {
             elections_started: self.counters.elections_started.load(Ordering::Relaxed),
@@ -355,6 +456,14 @@ impl ClusterNode {
             placement_changes: self.counters.placement_changes.load(Ordering::Relaxed),
             last_change_ms: self.counters.last_change_ms.load(Ordering::Relaxed),
         }
+    }
+
+    fn current_durability(&self) -> Durability {
+        let mut durability = self.durability.durability();
+        if let Some(catalog) = &self.catalog {
+            durability.catalog = catalog.durability_position();
+        }
+        durability
     }
 
     /// The assignment this node is currently acting on.
@@ -468,6 +577,17 @@ impl ClusterNode {
 
     /// Compute the assignment this node would publish as coordinator.
     fn plan(&self, term: u64) -> Placement {
+        if let Some(catalog) = &self.catalog {
+            let catalog = catalog.snapshot();
+            return Placement {
+                term,
+                assignments: catalog
+                    .placements
+                    .into_iter()
+                    .map(|(shard, replicas)| (shard, replicas.primary))
+                    .collect(),
+            };
+        }
         let mut members: Vec<NodeId> = self
             .live
             .lock()
@@ -517,7 +637,10 @@ impl ClusterNode {
 
     /// One turn of the state machine. Separate from [`Self::run`] so tests can step it.
     pub fn tick_once(&self, now: Instant) -> Result<()> {
-        let durability = self.durability.durability();
+        if !self.refresh_catalog_voters()? {
+            return Ok(());
+        }
+        let durability = self.current_durability();
         let action = {
             let mut e = self.election.lock().expect("election mutex");
             e.tick(now, &durability)?
@@ -585,8 +708,8 @@ impl ClusterNode {
             candidate: self.id,
             durability: durability.clone(),
         };
-        for (&peer, addr) in &self.peers {
-            let reply: Option<VoteReply> = self.ask(peer, addr, |c| c.request_vote(&req));
+        for (peer, addr) in self.voter_peers() {
+            let reply: Option<VoteReply> = self.ask(peer, &addr, |c| c.request_vote(&req));
             let Some(reply) = reply else { continue };
 
             let action = {
@@ -627,31 +750,47 @@ impl ClusterNode {
                 preferences.entry(s).or_insert(self.id);
             }
         }
-        for (&peer, addr) in &self.peers {
+        let mut peers = self.peers.clone();
+        if let Some(catalog) = &self.catalog {
+            for member in catalog.snapshot().members.into_values() {
+                if member.node != self.id {
+                    peers.insert(member.node, member.address);
+                }
+            }
+        }
+        for (peer, addr) in &peers {
             self.counters
                 .heartbeats_sent
                 .fetch_add(1, Ordering::Relaxed);
-            let reply: Option<HeartbeatReply> = self.ask(peer, addr, |c| c.heartbeat(&hb));
+            let reply: Option<HeartbeatReply> = self.ask(*peer, addr, |c| c.heartbeat(&hb));
             let Some(reply) = reply else { continue };
             if reply.ok {
-                answered.insert(peer);
+                answered.insert(*peer);
             }
             if reply.cordoned {
-                cordoned.insert(peer);
+                cordoned.insert(*peer);
             } else {
                 for &s in &reply.prefers {
-                    preferences.entry(crate::shard::ShardId(s)).or_insert(peer);
+                    preferences.entry(crate::shard::ShardId(s)).or_insert(*peer);
                 }
             }
 
-            let action = {
-                let mut e = self.election.lock().expect("election mutex");
-                e.on_heartbeat_reply(peer, &reply, now)?
-            };
-            if let Some(action) = action {
-                let durability = self.durability.durability();
-                self.perform(action, &durability, now)?;
-                return Ok(());
+            // Storage-only catalog members acknowledge liveness and placement, not the voting
+            // lease. Only the static voter set may renew leadership until joint consensus is
+            // implemented.
+            if self.catalog.as_ref().map_or_else(
+                || self.peers.contains_key(peer),
+                |catalog| catalog.snapshot().is_voter(*peer),
+            ) {
+                let action = {
+                    let mut e = self.election.lock().expect("election mutex");
+                    e.on_heartbeat_reply(*peer, &reply, now)?
+                };
+                if let Some(action) = action {
+                    let durability = self.current_durability();
+                    self.perform(action, &durability, now)?;
+                    return Ok(());
+                }
             }
         }
         *self.live.lock().expect("live mutex") = answered;
@@ -723,7 +862,14 @@ impl ClusterNode {
     /// A peer is standing for election. Called by the server.
     pub fn handle_vote_request(&self, req: &VoteRequest) -> Result<VoteReply> {
         self.check_participating()?;
-        let mine = self.durability.durability();
+        if !self.refresh_catalog_voters()? {
+            return Ok(VoteReply {
+                term: self.term(),
+                granted: false,
+                reason: "this node is a storage member, not a catalog voter".into(),
+            });
+        }
+        let mine = self.current_durability();
         let (reply, action) = {
             let mut e = self.election.lock().expect("election mutex");
             let was_leader = e.is_leader();
@@ -768,7 +914,7 @@ impl ClusterNode {
         reply.cordoned = self.is_cordoned();
         reply.prefers = self.preferred_shards().iter().map(|s| s.0).collect();
         if deposed {
-            let durability = self.durability.durability();
+            let durability = self.current_durability();
             self.perform(
                 Action::SteppedDown {
                     term: hb.term,

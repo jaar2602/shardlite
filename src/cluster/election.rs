@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::durability::Durability;
 use super::term::{NodeId, Term, TermStore};
@@ -168,11 +168,16 @@ pub struct Election {
     /// it only *delays* this node, and if no peer steps up the delay lapses and it campaigns again
     /// (better a leader late than none).
     stepdown_backoff: Option<Instant>,
+    /// Full voter IDs. During joint consensus, elections and leases require a majority of both.
+    current_voters: BTreeSet<NodeId>,
+    next_voters: Option<BTreeSet<NodeId>>,
 }
 
 impl Election {
     pub fn new(cfg: ElectionConfig, terms: TermStore, now: Instant) -> Result<Self> {
         cfg.validate()?;
+        let mut current_voters: BTreeSet<NodeId> = cfg.peers.iter().copied().collect();
+        current_voters.insert(cfg.node);
         Ok(Self {
             cfg,
             terms,
@@ -184,7 +189,38 @@ impl Election {
             acks: BTreeSet::new(),
             lease_start: now,
             stepdown_backoff: None,
+            current_voters,
+            next_voters: None,
         })
+    }
+
+    pub fn set_voter_configuration(
+        &mut self,
+        current: BTreeSet<NodeId>,
+        next: Option<BTreeSet<NodeId>>,
+    ) -> Result<()> {
+        if current.is_empty() || next.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Err(Error::ClusterConfig(
+                "election voter configurations cannot be empty".into(),
+            ));
+        }
+        self.current_voters = current;
+        self.next_voters = next;
+        let mut configured = self.current_voters.clone();
+        if let Some(next) = &self.next_voters {
+            configured.extend(next);
+        }
+        self.votes.retain(|node| configured.contains(node));
+        self.acks.retain(|node| configured.contains(node));
+        Ok(())
+    }
+
+    pub fn is_configured_voter(&self, node: NodeId) -> bool {
+        self.current_voters.contains(&node)
+            || self
+                .next_voters
+                .as_ref()
+                .is_some_and(|voters| voters.contains(&node))
     }
 
     pub fn role(&self) -> Role {
@@ -207,15 +243,11 @@ impl Election {
         self.role == Role::Leader
     }
 
-    /// Members that must agree for a decision to carry: a strict majority of the cluster,
-    /// this node included.
-    ///
-    /// Not `div_ceil`, despite the shape — clippy's suggestion is a different function. A
-    /// majority of N is `N / 2 + 1`, which for N = 6 is 4; `5.div_ceil(2)` is 3, and a
-    /// "quorum" of 3 in a 6-node cluster would let two halves both elect a leader.
-    #[allow(clippy::manual_div_ceil)]
-    fn quorum(&self) -> usize {
-        (self.cfg.peers.len() + 1) / 2 + 1
+    fn has_quorum(&self, acknowledgements: &BTreeSet<NodeId>) -> bool {
+        let majority = |voters: &BTreeSet<NodeId>| {
+            acknowledgements.intersection(voters).count() >= voters.len() / 2 + 1
+        };
+        majority(&self.current_voters) && self.next_voters.as_ref().is_none_or(majority)
     }
 
     /// This node's election timeout, jittered deterministically.
@@ -255,14 +287,18 @@ impl Election {
                 // has no evidence it still leads, and must stop before it writes anything
                 // else. This is what makes a partitioned leader safe rather than merely
                 // unlikely.
-                if now.duration_since(self.lease_start) >= self.cfg.election_timeout
-                    && self.acks.len() + 1 < self.quorum()
-                {
+                if now.duration_since(self.lease_start) >= self.cfg.election_timeout && {
+                    let mut acknowledged = self.acks.clone();
+                    acknowledged.insert(self.cfg.node);
+                    !self.has_quorum(&acknowledged)
+                } {
                     let why = format!(
                         "lease expired: only {} of {} members acknowledged this leader within \
                          {:?}; stepping down rather than writing without a quorum",
                         self.acks.len() + 1,
-                        self.cfg.peers.len() + 1,
+                        self.current_voters
+                            .union(self.next_voters.as_ref().unwrap_or(&self.current_voters))
+                            .count(),
                         self.cfg.election_timeout
                     );
                     return Ok(Some(self.step_down(why, now)));
@@ -310,7 +346,7 @@ impl Election {
         tracing::info!(node = self.cfg.node, term = next, "standing for election");
 
         // A single-node cluster is its own quorum and wins immediately.
-        if self.votes.len() >= self.quorum() {
+        if self.has_quorum(&self.votes) {
             return Ok(Some(self.become_leader(now)));
         }
         Ok(Some(Action::RequestVotes(next)))
@@ -333,6 +369,16 @@ impl Election {
         }
 
         let current = self.terms.term();
+        if !self.is_configured_voter(req.candidate) {
+            return Ok(VoteReply {
+                term: current,
+                granted: false,
+                reason: format!(
+                    "candidate {} is not in the voter configuration",
+                    req.candidate
+                ),
+            });
+        }
         if req.term < current {
             return Ok(VoteReply {
                 term: current,
@@ -404,8 +450,10 @@ impl Election {
             return Ok(None);
         }
 
-        self.votes.insert(from);
-        if self.votes.len() >= self.quorum() {
+        if self.is_configured_voter(from) {
+            self.votes.insert(from);
+        }
+        if self.has_quorum(&self.votes) {
             return Ok(Some(self.become_leader(now)));
         }
         Ok(None)
@@ -464,9 +512,13 @@ impl Election {
             return Ok(None);
         }
 
-        self.acks.insert(from);
+        if self.is_configured_voter(from) {
+            self.acks.insert(from);
+        }
         // A quorum has confirmed this leader, so the lease restarts from now.
-        if self.acks.len() + 1 >= self.quorum() {
+        let mut acknowledged = self.acks.clone();
+        acknowledged.insert(self.cfg.node);
+        if self.has_quorum(&acknowledged) {
             self.lease_start = now;
             self.last_contact = now;
             self.acks.clear();
@@ -595,6 +647,46 @@ mod tests {
         assert_eq!(n.e.on_vote_reply(2, &granted, t0).unwrap(), None);
         assert_eq!(n.e.role(), Role::Candidate);
         assert!(!n.e.is_leader());
+    }
+
+    #[test]
+    fn joint_consensus_requires_a_majority_of_both_voter_sets() {
+        let t0 = Instant::now();
+        let mut node = node(1, vec![2, 3, 4, 5], t0);
+        node.e
+            .set_voter_configuration(BTreeSet::from([1, 2, 3]), Some(BTreeSet::from([1, 4, 5])))
+            .unwrap();
+        let durability = Durability::new(1);
+        node.e.tick(t0 + past_timeout(), &durability).unwrap();
+        let term = node.e.term();
+
+        let action = node
+            .e
+            .on_vote_reply(
+                2,
+                &VoteReply {
+                    term,
+                    granted: true,
+                    reason: String::new(),
+                },
+                t0 + past_timeout(),
+            )
+            .unwrap();
+        assert_eq!(action, None, "old majority alone is not enough");
+
+        let action = node
+            .e
+            .on_vote_reply(
+                4,
+                &VoteReply {
+                    term,
+                    granted: true,
+                    reason: String::new(),
+                },
+                t0 + past_timeout(),
+            )
+            .unwrap();
+        assert!(matches!(action, Some(Action::BecameLeader(_))));
     }
 
     #[test]

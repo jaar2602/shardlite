@@ -98,3 +98,7 @@ json-tcp = ["dep:serde_json"]
 # Replicate shards to S3 object storage for HA (snapshot + change-log), and read them back on
 # failover. Blocking client; no async runtime.
 s3 = ["dep:ureq", "dep:sha2", "dep:hmac"]
+# Deterministic process-crash injection for the restart qualification suite. This is deliberately
+# not a default feature: a normal production binary does not read failpoint environment variables
+# and cannot be made to exit through this mechanism.
+failpoints = []

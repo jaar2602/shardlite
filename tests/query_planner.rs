@@ -181,11 +181,19 @@ fn explain_describes_the_strategy_and_flags_central_execution() {
     let combinable = plan("SELECT n % 10, SUM(n) FROM t GROUP BY n % 10")
         .unwrap()
         .describe();
-    assert!(!combinable.heavy, "a plain grouped SUM combines from partials");
+    assert!(
+        !combinable.heavy,
+        "a plain grouped SUM combines from partials"
+    );
     assert!(combinable.strategy.contains("grouped"));
 
     // A DISTINCT aggregate also falls to central execution.
-    assert!(plan("SELECT count(DISTINCT n) FROM t").unwrap().describe().heavy);
+    assert!(
+        plan("SELECT count(DISTINCT n) FROM t")
+            .unwrap()
+            .describe()
+            .heavy
+    );
     // A plain scan fans out without a heavy merge.
     assert!(!plan("SELECT k FROM t").unwrap().describe().heavy);
 }

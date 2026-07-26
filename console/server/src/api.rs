@@ -1733,6 +1733,7 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
     match (method, rest) {
         ("GET", ["info" | "meta" | "health" | "cluster" | "topology" | "shards" | "stats"])
         | ("GET", ["replication" | "config"])
+        | ("GET", ["cluster", "catalog"])
         | ("GET", ["s3", "status"])
         | ("GET", ["schema", _]) => Some(Permission::Observe),
         ("POST", ["query" | "query_all" | "route" | "explain"]) => Some(Permission::Query),
@@ -1748,6 +1749,9 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("POST", ["cluster", "drain" | "cordon" | "step-down" | "prefer"]) => {
             Some(Permission::Operate)
         }
+        ("POST", ["cluster", "rebalance" | "voters"])
+        | ("POST", ["cluster", "members", _, "cordon" | "drain"])
+        | ("DELETE", ["cluster", "members", _]) => Some(Permission::Operate),
         ("GET", ["frames", _]) => Some(Permission::Operate),
         ("GET" | "POST", ["users"]) | ("DELETE", ["users", _]) => Some(Permission::ManageMeshUsers),
         _ => None,

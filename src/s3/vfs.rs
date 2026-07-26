@@ -55,7 +55,10 @@ pub fn open_readonly(client: Arc<S3Client>, key: &str) -> crate::Result<rusqlite
     let pager = Arc::new(S3Pager::open(client, key).map_err(to_err)?);
 
     // A unique token that identifies this open to `xOpen`. It is not a filesystem path.
-    let token = format!("shardlite-s3-{}", NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
+    let token = format!(
+        "shardlite-s3-{}",
+        NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+    );
     state()
         .registry
         .lock()

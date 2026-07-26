@@ -467,6 +467,86 @@ impl Client {
         }
     }
 
+    pub fn catalog_state(
+        &mut self,
+    ) -> Result<(
+        crate::cluster::Catalog,
+        Option<crate::cluster::CatalogProposal>,
+    )> {
+        match self.round_trip(Request::CatalogGet)? {
+            Response::CatalogState {
+                committed,
+                prepared,
+            } => Ok((committed, prepared)),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to a catalog read: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn catalog_prepare(
+        &mut self,
+        leader: u64,
+        proposal: &crate::cluster::CatalogProposal,
+    ) -> Result<()> {
+        match self.round_trip(Request::CatalogPrepare {
+            leader,
+            proposal: proposal.clone(),
+        })? {
+            Response::CatalogPrepared { term, version }
+                if term == proposal.term && version == proposal.catalog.version =>
+            {
+                Ok(())
+            }
+            other => Err(Error::Protocol(format!(
+                "unexpected response to catalog prepare: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn catalog_commit(&mut self, leader: u64, term: u64, version: u64) -> Result<()> {
+        match self.round_trip(Request::CatalogCommit {
+            leader,
+            term,
+            version,
+        })? {
+            Response::CatalogCommitted { version: committed } if committed == version => Ok(()),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to catalog commit: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn catalog_command(
+        &mut self,
+        command: crate::cluster::CatalogCommand,
+    ) -> Result<crate::cluster::CatalogCommandResult> {
+        match self.round_trip(Request::CatalogCommand(command))? {
+            Response::CatalogChanged(result) => Ok(result),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to catalog command: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn catalog_install(
+        &mut self,
+        leader: u64,
+        term: u64,
+        catalog: &crate::cluster::Catalog,
+    ) -> Result<()> {
+        match self.round_trip(Request::CatalogInstall {
+            leader,
+            term,
+            catalog: catalog.clone(),
+        })? {
+            Response::CatalogInstalled { version } if version == catalog.version => Ok(()),
+            other => Err(Error::Protocol(format!(
+                "unexpected response to catalog install: {other:?}"
+            ))),
+        }
+    }
+
     fn round_trip(&mut self, req: Request) -> Result<Response> {
         // Write straight through the buffer to the stream; read back through the buffer.
         write_message(self.conn.get_mut(), &req)?;

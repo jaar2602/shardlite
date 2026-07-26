@@ -538,6 +538,7 @@ export function conn(name: string) {
   return {
     info: () => req<NodeInfo>("GET", `${b}/info`),
     cluster: () => req<ClusterInfo>("GET", `${b}/cluster`),
+    catalog: () => req<ClusterCatalog>("GET", `${b}/cluster/catalog`),
     stats: () => req<NodeStats>("GET", `${b}/stats`),
     schema: (shard: number) => req<{ shard: number; schema_version: number }>("GET", `${b}/schema/${shard}`),
     frames: (shard: number) => req<Record<string, unknown>>("GET", `${b}/frames/${shard}`),
@@ -615,6 +616,17 @@ export function conn(name: string) {
       req<{ applied: string[]; failures: string[] }>("POST", `${b}/shardkey`, { table, column }),
     // Gracefully remove this node from the cluster for maintenance; its shards move to survivors.
     drain: () => req<{ ok: boolean; draining: boolean; was_leader: boolean }>("POST", `${b}/cluster/drain`, {}),
+    rebalance: () => req<CatalogMutation>("POST", `${b}/cluster/rebalance`, {}),
+    cordonMember: (node: number, cordoned: boolean) =>
+      req<CatalogMutation>("POST", `${b}/cluster/members/${node}/cordon`, { cordoned }),
+    drainMember: (node: number) =>
+      req<CatalogMutation>("POST", `${b}/cluster/members/${node}/drain`, {}),
+    removeMember: (node: number) =>
+      req<CatalogMutation>("DELETE", `${b}/cluster/members/${node}`),
+    changeVoters: (voters: number[]) =>
+      req<CatalogMutation>("POST", `${b}/cluster/voters`, { voters }),
+    finalizeVoters: () =>
+      req<CatalogMutation>("POST", `${b}/cluster/voters`, { finalize: true }),
     // One turn of the AI assistant over this connection: send the conversation, get back either an
     // answer or a `pending` change awaiting confirmation (with an opaque `resume`).
     assistant: (messages: AssistantMessage[]) =>
@@ -623,6 +635,46 @@ export function conn(name: string) {
     assistantConfirm: (action: AssistantPending, resume: unknown) =>
       req<AssistantReply>("POST", `${b}/assistant`, { confirm: { action, resume } }),
   };
+}
+
+export interface CatalogMember {
+  node: number;
+  address: string;
+  role: "learner" | "storage" | "voter";
+  state: "active" | "cordoned" | "draining";
+}
+
+export interface CatalogOperation {
+  id: number;
+  kind: "join" | "transfer" | "split" | "drain" | "remove";
+  phase: string;
+  shard?: number | null;
+  source?: number | null;
+  destination?: number | null;
+  durable_lsn?: number | null;
+  final_lsn?: number | null;
+  last_error?: string | null;
+}
+
+export interface ClusterCatalog {
+  enabled: boolean;
+  cluster_id?: string;
+  version?: number;
+  routing_epoch?: number;
+  active_shards?: number;
+  local_shard_capacity?: number;
+  routing?: Record<string, unknown>;
+  voter_transition?: { old: number[]; new: number[] } | null;
+  members?: CatalogMember[];
+  placements?: Array<Record<string, unknown>>;
+  operations?: CatalogOperation[];
+  prepared?: unknown;
+}
+
+export interface CatalogMutation {
+  catalog: Record<string, unknown>;
+  operation?: number | null;
+  rebalance?: Record<string, unknown> | string | null;
 }
 
 export interface ReplicationStatus {

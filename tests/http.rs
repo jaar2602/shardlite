@@ -400,6 +400,11 @@ fn stats_schema_route_and_execute_all_endpoints() {
             .iter()
             .all(|s| s["ok"] == true)
     );
+    assert_eq!(
+        g.manager.shard_key("t").as_deref(),
+        Some("id"),
+        "the cluster DDL path must publish the adopted key before an automatic split can start"
+    );
 
     // stats
     let stats: serde_json::Value = serde_json::from_str(

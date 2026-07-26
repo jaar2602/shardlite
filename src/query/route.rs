@@ -19,15 +19,15 @@
 use std::collections::BTreeMap;
 
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, Delete, Expr, FromTable, ObjectName, Query, SetExpr,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    AssignmentTarget, BinaryOperator, ColumnOption, Delete, Expr, FromTable, ObjectName, Query,
+    SetExpr, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
     UnaryOperator, Value as SqlValue, ValueWithSpan,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
 use crate::query::ShardKeys;
-use crate::shard::shard_of;
+use crate::shard::{ModuloV1, Routing};
 use crate::storage::exec::Value;
 
 /// Where a client statement should run.
@@ -89,6 +89,17 @@ pub fn primary_key_of(sql: &str) -> Option<(String, String)> {
 
 /// Decide where a single statement should run, given the declared shard keys.
 pub fn route_statement(sql: &str, keys: &ShardKeys, shard_count: u32) -> Route {
+    let routing = Routing::ModuloV1(
+        ModuloV1::new(shard_count).expect("route_statement requires at least one shard"),
+    );
+    route_statement_with(sql, keys, routing)
+}
+
+/// Decide where a statement should run using the committed routing scheme.
+///
+/// Kept separate from [`route_statement`] so existing modulo callers retain their API while a
+/// dynamic cluster can advance `LinearV1` without teaching clients about shard IDs.
+pub fn route_statement_with(sql: &str, keys: &ShardKeys, routing: Routing) -> Route {
     let mut stmts = match Parser::parse_sql(&SQLiteDialect {}, sql) {
         Ok(s) => s,
         // Not our job to report parse errors — let the normal execution path surface them.
@@ -98,7 +109,7 @@ pub fn route_statement(sql: &str, keys: &ShardKeys, shard_count: u32) -> Route {
         return Route::Passthrough;
     }
     match stmts.pop().unwrap() {
-        SqlStatement::Insert(insert) => route_insert(insert, keys, shard_count),
+        SqlStatement::Insert(insert) => route_insert(insert, keys, routing),
         SqlStatement::Update(u) => {
             // An UPDATE ... FROM joins other tables; the target's key no longer proves all matched
             // rows are co-located, so leave it to the default path.
@@ -107,25 +118,71 @@ pub fn route_statement(sql: &str, keys: &ShardKeys, shard_count: u32) -> Route {
             } else {
                 table_of(&u.table)
             };
-            route_point(table, u.selection.as_ref(), keys, shard_count, Route::All)
+            if let Some(key) = updated_shard_key(&u, table.as_deref(), keys) {
+                return Route::Refuse(format!(
+                    "the shard key column `{key}` cannot be updated; changing it would move a row \
+                     between SQLite files outside one transaction"
+                ));
+            }
+            route_point(table, u.selection.as_ref(), keys, routing, Route::All)
         }
         SqlStatement::Delete(d) => route_point(
             delete_table(&d),
             d.selection.as_ref(),
             keys,
-            shard_count,
+            routing,
             Route::All,
         ),
         SqlStatement::Query(q) => {
             let (table, selection) = select_target(&q);
-            route_point(table, selection, keys, shard_count, Route::Passthrough)
+            route_point(table, selection, keys, routing, Route::Passthrough)
         }
         _ => Route::Passthrough,
     }
 }
 
+/// The declared shard key changed by this statement, if any.
+///
+/// This guard is also used by explicitly-sharded write APIs: naming a physical shard must not make
+/// a row-key move possible outside the router.
+pub fn shard_key_update(sql: &str, keys: &ShardKeys) -> Option<String> {
+    let mut statements = Parser::parse_sql(&SQLiteDialect {}, sql).ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+    let SqlStatement::Update(update) = statements.pop()? else {
+        return None;
+    };
+    let table = table_of(&update.table);
+    updated_shard_key(&update, table.as_deref(), keys)
+}
+
+fn updated_shard_key(
+    update: &sqlparser::ast::Update,
+    table: Option<&str>,
+    keys: &ShardKeys,
+) -> Option<String> {
+    let key = shard_key_column(table?, keys)?;
+    update
+        .assignments
+        .iter()
+        .any(|assignment| {
+            assignment_target_columns(&assignment.target)
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(&key))
+        })
+        .then_some(key)
+}
+
+fn assignment_target_columns(target: &AssignmentTarget) -> Vec<String> {
+    match target {
+        AssignmentTarget::ColumnName(column) => vec![last_ident(column)],
+        AssignmentTarget::Tuple(columns) => columns.iter().map(last_ident).collect(),
+    }
+}
+
 /// Route an `INSERT ... VALUES` by the shard-key value of each row.
-fn route_insert(insert: sqlparser::ast::Insert, keys: &ShardKeys, shard_count: u32) -> Route {
+fn route_insert(insert: sqlparser::ast::Insert, keys: &ShardKeys, routing: Routing) -> Route {
     let TableObject::TableName(name) = &insert.table else {
         return Route::Passthrough;
     };
@@ -173,7 +230,7 @@ fn route_insert(insert: sqlparser::ast::Insert, keys: &ShardKeys, shard_count: u
                 "an INSERT row has no value for the shard key `{key_col}`"
             ));
         };
-        let Some(shard) = shard_for_expr(expr, shard_count) else {
+        let Some(shard) = shard_for_expr(expr, routing) else {
             return Route::Refuse(format!(
                 "the shard key `{key_col}` must be a literal text or integer to route; got `{expr}`"
             ));
@@ -210,7 +267,7 @@ fn route_point(
     table: Option<String>,
     selection: Option<&Expr>,
     keys: &ShardKeys,
-    shard_count: u32,
+    routing: Routing,
     when_unpinned: Route,
 ) -> Route {
     let Some(table) = table else {
@@ -221,7 +278,7 @@ fn route_point(
     };
     match selection.and_then(|w| pin_value(w, &key_col)) {
         Some(val) => match route_key_bytes(&val) {
-            Some(bytes) => Route::One(shard_of(&bytes, shard_count).0),
+            Some(bytes) => Route::One(routing.route(&bytes).0),
             // A pinned but non-routable literal type (real / NULL): fall back safely.
             None => when_unpinned,
         },
@@ -304,9 +361,9 @@ fn route_key_bytes(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-fn shard_for_expr(expr: &Expr, shard_count: u32) -> Option<u32> {
+fn shard_for_expr(expr: &Expr, routing: Routing) -> Option<u32> {
     let bytes = route_key_bytes(&literal_of(expr)?)?;
-    Some(shard_of(&bytes, shard_count).0)
+    Some(routing.route(&bytes).0)
 }
 
 /// The shard-key column declared for `table`, if any. Declarations are keyed by lowercased table

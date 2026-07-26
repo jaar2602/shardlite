@@ -16,6 +16,7 @@
 //! crash, which is undetectable corruption.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -218,6 +219,9 @@ impl Follower {
         let tmp = dest.with_extension("db.installing");
         std::fs::copy(snapshot, &tmp)
             .map_err(|e| Error::Manifest(format!("copying snapshot to {}: {e}", tmp.display())))?;
+        std::fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| Error::Manifest(format!("fsyncing snapshot {}: {e}", tmp.display())))?;
 
         // The rename and the WAL removal are an apply: a reader holding a connection across
         // the rename keeps the *deleted inode* and serves a database frozen at this instant,
@@ -228,6 +232,7 @@ impl Follower {
                 .map_err(|e| Error::Manifest(format!("installing {}: {e}", dest.display())))?;
             // Any WAL left from a previous life describes a database that no longer exists.
             let _ = std::fs::remove_file(crate::storage::checkpoint::wal_path_for(&dest));
+            sync_parent(&dest)?;
             Ok(())
         })?;
 
@@ -247,11 +252,17 @@ impl Follower {
 
     fn set_position(&self, shard: ShardId, pos: Position) -> Result<()> {
         let path = self.position_path(shard);
-        std::fs::write(
-            &path,
-            format!("epoch={}\nlsn={}\n", pos.epoch, pos.applied_lsn),
-        )
-        .map_err(|e| Error::Manifest(format!("writing {}: {e}", path.display())))?;
+        let tmp = path.with_extension("position.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| Error::Manifest(format!("creating {}: {e}", tmp.display())))?;
+            write!(file, "epoch={}\nlsn={}\n", pos.epoch, pos.applied_lsn)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| Error::Manifest(format!("persisting {}: {e}", tmp.display())))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Manifest(format!("installing {}: {e}", path.display())))?;
+        sync_parent(&path)?;
         self.positions
             .lock()
             .expect("follower mutex")
@@ -291,4 +302,14 @@ impl Follower {
         *self.positions.lock().expect("follower mutex") = map;
         Ok(())
     }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().expect("replica path has parent");
+    if let Ok(directory) = std::fs::File::open(parent) {
+        directory
+            .sync_all()
+            .map_err(|e| Error::Manifest(format!("fsyncing {}: {e}", parent.display())))?;
+    }
+    Ok(())
 }

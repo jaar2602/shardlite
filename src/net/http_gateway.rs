@@ -222,6 +222,20 @@ impl HttpGateway {
             (Method::Post, "/v1/cluster/drain") => {
                 return self.handle_drain(req, role);
             }
+            (Method::Post, "/v1/cluster/rebalance") => {
+                return self.handle_catalog_rebalance(req, role);
+            }
+            (Method::Post, "/v1/cluster/voters") => {
+                return self.handle_catalog_voters(req, role);
+            }
+            (Method::Post, p) if p.starts_with("/v1/cluster/members/") => {
+                let suffix = p.trim_start_matches("/v1/cluster/members/").to_string();
+                return self.handle_catalog_member(req, role, suffix, false);
+            }
+            (Method::Delete, p) if p.starts_with("/v1/cluster/members/") => {
+                let suffix = p.trim_start_matches("/v1/cluster/members/").to_string();
+                return self.handle_catalog_member(req, role, suffix, true);
+            }
             (Method::Post, "/v1/cluster/cordon") => {
                 return self.handle_cordon(req, role);
             }
@@ -243,6 +257,9 @@ impl HttpGateway {
             }
             (Method::Get, "/v1/cluster") => {
                 self.route(&req, role, Requirement::Read, || self.cluster_json())
+            }
+            (Method::Get, "/v1/cluster/catalog") => {
+                self.route(&req, role, Requirement::Read, || self.catalog_json())
             }
             (Method::Get, "/v1/schema/agreement") => self.schema_agreement_route(role),
             (Method::Get, p) if p.starts_with("/v1/schema/") => {
@@ -361,6 +378,7 @@ impl HttpGateway {
                 "topology": true,
                 "shards": true,
                 "metrics": true,
+                "dynamic_scaling": self.services.catalog.is_some(),
             },
         })
     }
@@ -1001,6 +1019,19 @@ impl HttpGateway {
             }
             let b: Body = serde_json::from_slice(&body)
                 .map_err(|e| HttpError::new(400, &format!("bad JSON: {e}")))?;
+            if self.services.catalog_control.is_some() {
+                let node = self
+                    .services
+                    .cluster
+                    .as_ref()
+                    .ok_or_else(|| HttpError::new(409, "catalog has no cluster runtime"))?
+                    .id();
+                let result = self.catalog_command(crate::cluster::CatalogCommand::Cordon {
+                    node,
+                    cordoned: b.cordoned,
+                })?;
+                return Ok((200, result));
+            }
             match self.services.cluster.as_ref() {
                 Some(cluster) => {
                     cluster.set_cordoned(b.cordoned);
@@ -1025,6 +1056,17 @@ impl HttpGateway {
     fn handle_drain(&self, req: Request, role: Option<Role>) {
         let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
             self.check(role, Requirement::Admin)?;
+            if self.services.catalog_control.is_some() {
+                let node = self
+                    .services
+                    .cluster
+                    .as_ref()
+                    .ok_or_else(|| HttpError::new(409, "catalog has no cluster runtime"))?
+                    .id();
+                let result =
+                    self.catalog_command(crate::cluster::CatalogCommand::Drain { node })?;
+                return Ok((202, result));
+            }
             match self.services.cluster.as_ref() {
                 Some(cluster) => {
                     let was_leader = cluster.is_leader();
@@ -1044,6 +1086,119 @@ impl HttpGateway {
             }
         })();
         respond_json(req, out);
+    }
+
+    fn handle_catalog_rebalance(&self, req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let result = self.catalog_command(crate::cluster::CatalogCommand::Rebalance)?;
+            Ok((202, result))
+        })();
+        respond_json(req, out);
+    }
+
+    fn handle_catalog_voters(&self, mut req: Request, role: Option<Role>) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            #[derive(serde::Deserialize)]
+            struct Body {
+                #[serde(default)]
+                voters: std::collections::BTreeSet<u64>,
+                #[serde(default)]
+                finalize: bool,
+            }
+            let body = read_body(&mut req)?;
+            let body: Body = serde_json::from_slice(&body)
+                .map_err(|error| HttpError::new(400, &format!("bad JSON: {error}")))?;
+            let command = if body.finalize {
+                crate::cluster::CatalogCommand::FinalizeVoterChange
+            } else {
+                crate::cluster::CatalogCommand::BeginVoterChange {
+                    voters: body.voters,
+                }
+            };
+            let result = self.catalog_command(command)?;
+            Ok((202, result))
+        })();
+        respond_json(req, out);
+    }
+
+    fn handle_catalog_member(
+        &self,
+        mut req: Request,
+        role: Option<Role>,
+        suffix: String,
+        remove: bool,
+    ) {
+        let out = (|| -> std::result::Result<(u16, serde_json::Value), HttpError> {
+            self.check(role, Requirement::Admin)?;
+            let mut parts = suffix.split('/');
+            let node = parts
+                .next()
+                .unwrap_or("")
+                .parse::<u64>()
+                .map_err(|_| HttpError::new(400, "member id must be a number"))?;
+            let operation = parts.next().unwrap_or("");
+            let command = if remove && operation.is_empty() {
+                crate::cluster::CatalogCommand::Remove { node }
+            } else {
+                match operation {
+                    "cordon" => {
+                        #[derive(serde::Deserialize)]
+                        struct Body {
+                            cordoned: bool,
+                        }
+                        let body = read_body(&mut req)?;
+                        let body: Body = if body.is_empty() {
+                            Body { cordoned: true }
+                        } else {
+                            serde_json::from_slice(&body).map_err(|error| {
+                                HttpError::new(400, &format!("bad JSON: {error}"))
+                            })?
+                        };
+                        crate::cluster::CatalogCommand::Cordon {
+                            node,
+                            cordoned: body.cordoned,
+                        }
+                    }
+                    "drain" if !remove => crate::cluster::CatalogCommand::Drain { node },
+                    _ => return Err(HttpError::new(404, "no such member operation")),
+                }
+            };
+            let result = self.catalog_command(command)?;
+            Ok((if remove { 200 } else { 202 }, result))
+        })();
+        respond_json(req, out);
+    }
+
+    fn catalog_command(
+        &self,
+        command: crate::cluster::CatalogCommand,
+    ) -> std::result::Result<serde_json::Value, HttpError> {
+        let cluster = self
+            .services
+            .cluster
+            .as_ref()
+            .ok_or_else(|| HttpError::new(409, "this is not a cluster member"))?;
+        if !cluster.is_leader() {
+            return Err(HttpError::new(
+                409,
+                &format!(
+                    "catalog mutations must be sent to the leader; this node sees leader {:?}",
+                    cluster.leader()
+                ),
+            ));
+        }
+        let control = self
+            .services
+            .catalog_control
+            .as_ref()
+            .ok_or_else(|| HttpError::new(409, "dynamic catalog mode is not enabled"))?;
+        let result = control
+            .apply(command)
+            .map_err(|error| error_to_http(&error))?;
+        serde_json::to_value(result)
+            .map_err(|error| HttpError::new(500, &format!("encoding catalog result: {error}")))
     }
 
     /// `POST /v1/shards/{n}/vacuum` and `.../checkpoint` (Admin) — operator maintenance on one
@@ -1495,6 +1650,85 @@ impl HttpGateway {
                 })
             }
         }
+    }
+
+    /// Durable cluster-owned scaling state for the console. Mutations use the same quorum-backed
+    /// catalog commands as native join and reconciliation; this view is their observable state.
+    fn catalog_json(&self) -> serde_json::Value {
+        let Some(store) = self.services.catalog.as_ref() else {
+            return serde_json::json!({
+                "enabled": false,
+                "reason": "this node is using legacy static cluster configuration",
+            });
+        };
+        let catalog = store.snapshot();
+        let members = catalog
+            .members
+            .values()
+            .map(|member| {
+                serde_json::json!({
+                    "node": member.node,
+                    "incarnation": member.incarnation,
+                    "address": member.address,
+                    "role": format!("{:?}", member.role).to_lowercase(),
+                    "state": format!("{:?}", member.state).to_lowercase(),
+                    "placement_eligible": member.may_receive_placement(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let placements = catalog
+            .placements
+            .iter()
+            .map(|(shard, placement)| {
+                serde_json::json!({
+                    "shard": shard.0,
+                    "generation": placement.generation,
+                    "primary": placement.primary,
+                    "replicas": placement.replicas,
+                })
+            })
+            .collect::<Vec<_>>();
+        let operations = catalog
+            .operations
+            .values()
+            .map(|operation| {
+                serde_json::json!({
+                    "id": operation.id,
+                    "kind": format!("{:?}", operation.kind).to_lowercase(),
+                    "phase": format!("{:?}", operation.phase).to_lowercase(),
+                    "shard": operation.shard.map(|shard| shard.0),
+                    "source": operation.source,
+                    "destination": operation.destination,
+                    "expected_generation": operation.expected_generation,
+                    "stream_epoch": operation.stream_epoch,
+                    "snapshot_lsn": operation.snapshot_lsn,
+                    "durable_lsn": operation.durable_lsn,
+                    "final_lsn": operation.final_lsn,
+                    "routing_before": operation.routing_before,
+                    "routing_after": operation.routing_after,
+                    "created_version": operation.created_version,
+                    "last_error": operation.last_error,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "enabled": true,
+            "cluster_id": catalog.cluster_id.to_string(),
+            "version": catalog.version,
+            "routing_epoch": catalog.routing_epoch,
+            "routing": catalog.routing,
+            "active_shards": catalog.routing.shard_count(),
+            "local_shard_capacity": self.shards.config().shard_count,
+            "voter_transition": catalog.voter_transition,
+            "members": members,
+            "placements": placements,
+            "operations": operations,
+            "prepared": store.prepared_snapshot().map(|proposal| serde_json::json!({
+                "term": proposal.term,
+                "expected_version": proposal.expected_version,
+                "version": proposal.catalog.version,
+            })),
+        })
     }
 }
 

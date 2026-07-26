@@ -16,7 +16,7 @@ use crate::storage::exec::{Statement, Value};
 
 /// Bumped when the wire format changes incompatibly. Checked at handshake so a mismatched
 /// peer is told exactly that, rather than failing later as a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Largest single message. Snapshot chunks are the biggest legitimate payload, so this sits
 /// comfortably above the chunk size while still refusing anything absurd.
@@ -112,12 +112,26 @@ pub enum Request {
     SnapshotEnd { shard: u32 },
     /// Apply a schema change to one shard and return its new version.
     SchemaApply { shard: u32, ddl: Statement },
+    /// Read the schema version of several shards **this node owns**, changing nothing.
+    ///
+    /// A coordinator checking cluster-wide schema agreement groups the shards it does not own by
+    /// owner and sends one of these per owner, so the check costs one request per node rather
+    /// than one per shard. Read-only and distinct from `SchemaApply`, which requires a `ddl`:
+    /// without this the only way to learn a remote version would be to change it.
+    /// Cluster-internal.
+    SchemaVersions { shards: Vec<u32> },
     /// Handle this request here, without forwarding it on.
     ///
     /// How a forwarded request is distinguished from a fresh one. Without it, two nodes with
     /// briefly different placement maps could forward the same request back and forth
     /// forever; with it, the second node refuses instead of bouncing it.
     Direct(Box<Request>),
+    /// A forwarded request whose coordinator routed under this committed epoch. Dynamic owners
+    /// refuse a stale epoch instead of executing against a key range that has since split.
+    RoutedDirect {
+        routing_epoch: u64,
+        request: Box<Request>,
+    },
     /// The answer to a [`Response::Challenge`]: `proof = blake3::keyed_hash(key, nonce)`.
     /// The secret itself never crosses the wire.
     Auth { name: String, proof: [u8; 32] },
@@ -137,6 +151,29 @@ pub enum Request {
     Vote(crate::cluster::VoteRequest),
     /// A peer claims leadership and is renewing its lease.
     Beat(crate::cluster::Heartbeat),
+    /// Read the committed catalog and any locally prepared next value. Cluster-internal.
+    CatalogGet,
+    /// Fsync a leader's exact next catalog value before acknowledging it.
+    CatalogPrepare {
+        leader: u64,
+        proposal: crate::cluster::CatalogProposal,
+    },
+    /// Publish a catalog value previously prepared by this voter.
+    CatalogCommit {
+        leader: u64,
+        term: u64,
+        version: u64,
+    },
+    /// Submit one idempotent topology command to the catalog leader. Cluster-internal; human
+    /// operators use the separately authenticated HTTP management surface.
+    CatalogCommand(crate::cluster::CatalogCommand),
+    /// Install an already-committed catalog snapshot on a lagging member. Choosing a new value
+    /// still requires prepare/commit; this only repairs a value authorized by the current leader.
+    CatalogInstall {
+        leader: u64,
+        term: u64,
+        catalog: crate::cluster::Catalog,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -226,8 +263,27 @@ pub enum Response {
         shard: u32,
         version: i64,
     },
+    /// Per-shard schema versions for a [`Request::SchemaVersions`], in the order asked.
+    SchemaVersions {
+        versions: Vec<i64>,
+    },
     Voted(crate::cluster::VoteReply),
     Beat(crate::cluster::HeartbeatReply),
+    CatalogState {
+        committed: crate::cluster::Catalog,
+        prepared: Option<crate::cluster::CatalogProposal>,
+    },
+    CatalogPrepared {
+        term: u64,
+        version: u64,
+    },
+    CatalogCommitted {
+        version: u64,
+    },
+    CatalogChanged(crate::cluster::CatalogCommandResult),
+    CatalogInstalled {
+        version: u64,
+    },
     /// The statement was rejected deterministically — bad SQL, constraint violation. A
     /// result, not a transport failure.
     Rejected {

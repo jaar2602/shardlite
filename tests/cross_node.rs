@@ -43,6 +43,16 @@ impl PeerRouter for Split {
     fn execute_remote(&self, shard: ShardId, stmt: Statement) -> shardlite::Result<Outcome> {
         self.other.execute_one(shard, stmt)
     }
+    fn apply_ddl_remote(&self, shard: ShardId, stmt: Statement) -> shardlite::Result<i64> {
+        self.other.apply_ddl_to(shard, stmt)
+    }
+    fn schema_versions(&self, shards: &[ShardId]) -> Vec<shardlite::Result<i64>> {
+        shards
+            .iter()
+            .map(|&id| self.other.schema_version(id))
+            .collect()
+    }
+
     fn fan_out(
         &self,
         shards: &[ShardId],
@@ -266,5 +276,81 @@ fn a_fan_out_batches_remote_shards_into_one_call_per_owner() {
         a_remote.load(Ordering::SeqCst),
         (N / 2) as usize,
         "the single batch should carry all of the peer's shards"
+    );
+}
+
+#[test]
+fn cross_node_schema_skew_is_detected_before_a_fan_out_read() {
+    // Defect 2 of the schema-migration plan. `schema_agreement` used to read versions only for
+    // shards this node *leads*, so the check saw half a cluster: node A found perfect agreement
+    // among its own four shards while node B's four carried a different schema entirely.
+    //
+    // A is nonetheless the node answering the cross-shard read, and it merges B's rows into the
+    // result. Before the fix this test produced a *ragged* result — two declared columns with a
+    // three-value row in it:
+    //
+    //     columns: ["id", "name"]
+    //     rows:    [Text("a"), Text("on A")]
+    //              [Text("b"), Text("on B"), Null]
+    //
+    // Not merely a half-migrated answer: a result set whose rows disagree about their own arity,
+    // which a driver either mis-decodes or chokes on.
+    let TwoNodes { a, b, _dirs, .. } = two_nodes();
+
+    // Ownership as a real cluster expresses it: each node leads its own shards and follows the
+    // rest. This is what used to make `schema_agreement` skip the other node's half.
+    for s in (0..N).filter(|s| s % 2 == 1) {
+        a.follow(ShardId(s)).unwrap();
+    }
+    for s in (0..N).filter(|s| s % 2 == 0) {
+        b.follow(ShardId(s)).unwrap();
+    }
+
+    // Each node rolls the shards it leads, which is how a cluster-wide DDL actually lands:
+    // every owner applies its own, and `apply_ddl` is the path that advances `user_version`.
+    let create = "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT) STRICT";
+    a.apply_ddl(Statement::new(create)).unwrap();
+    b.apply_ddl(Statement::new(create)).unwrap();
+    a.execute_one(
+        ShardId(0),
+        Statement::new("INSERT INTO users VALUES ('a', 'on A')"),
+    )
+    .unwrap();
+    b.execute_one(
+        ShardId(1),
+        Statement::new("INSERT INTO users VALUES ('b', 'on B')"),
+    )
+    .unwrap();
+
+    // An interrupted roll: the change reached node B's shards and never reached node A's.
+    b.apply_ddl(Statement::new("ALTER TABLE users ADD COLUMN note TEXT"))
+        .unwrap();
+    // Both nodes must see it, not just the one that fell behind. Either can be the node a
+    // client connects to, and whichever it is answers the fan-out — so a check that only the
+    // straggler failed would still let the other serve the ragged result.
+    for (who, m) in [("A", &a), ("B", &b)] {
+        match m.schema_agreement().unwrap() {
+            shardlite::storage::schema::Agreement::Disagreed {
+                lowest, highest, ..
+            } => assert_eq!(
+                (lowest, highest),
+                (1, 2),
+                "node {who} should see both versions present in the cluster"
+            ),
+            other => panic!(
+                "node {who} must see the cross-node skew, got {other:?} — its own shards agree \
+                 with each other, which is exactly the blind spot this covers"
+            ),
+        }
+    }
+
+    // The property under test: the node answering the read must refuse it.
+    let err = a
+        .query_all_shards("SELECT * FROM users")
+        .expect_err("a fan-out read must be refused while two nodes disagree on the schema");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("shard_"),
+        "the refusal must name a shard so an operator knows where to look: {msg}"
     );
 }

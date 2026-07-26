@@ -723,3 +723,75 @@ fn a_stale_read_is_answered_by_the_replica_and_a_strong_one_is_not() {
         Ok(_) => {}
     }
 }
+
+#[test]
+fn a_schema_change_during_catch_up_reaches_the_destination_before_cutover() {
+    // The other half of the transfer window. `fence_for_transfer` stops the source writing so
+    // that its `last_lsn` is final, and the destination catches up to exactly that position
+    // before taking over. A DDL applied *before* that barrier must therefore arrive the way
+    // every other write does — as frames — or the destination takes over holding an older
+    // schema than the rows it just received, and `user_version` records that mismatch forever.
+    //
+    // Nothing replays DDL to the destination here, and nothing may: its shard is followed, so
+    // `check_may_open` refuses a writer connection outright. The frames are the only path, and
+    // this test is what says they are enough.
+    let p = primary(2);
+    let r = replicant(&p);
+    r.promotion.follow().unwrap();
+
+    let stop = r.replica.stop_handle();
+    let r2 = Arc::clone(&r.replica);
+    std::thread::spawn(move || {
+        let _ = r2.run();
+    });
+
+    let mut c = Client::connect(&p.addr).unwrap();
+    c.execute_all("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    for i in 1..=10 {
+        p.manager
+            .execute_one(S0, Statement::new(format!("INSERT INTO t VALUES ({i})")))
+            .unwrap();
+    }
+    assert!(
+        await_caught_up(&p, &r, S0, Duration::from_secs(10)),
+        "the replica never caught up to the first schema"
+    );
+
+    // The schema change lands on the source while the destination is still following — the
+    // window a transfer runs in.
+    p.manager
+        .apply_ddl_to(S0, Statement::new("ALTER TABLE t ADD COLUMN note TEXT"))
+        .unwrap();
+    assert_eq!(p.manager.schema_version(S0).unwrap(), 2);
+    p.manager
+        .execute_one(
+            S0,
+            Statement::new("INSERT INTO t (id, note) VALUES (11, 'after')"),
+        )
+        .unwrap();
+
+    assert!(
+        await_caught_up(&p, &r, S0, Duration::from_secs(10)),
+        "the replica never caught up past the schema change"
+    );
+    stop.store(true, Ordering::Relaxed);
+    assert!(r.replica.wait_idle(Duration::from_secs(5)));
+
+    // Cutover.
+    r.promotion.promote(1).unwrap();
+
+    // The destination took over at the source's schema version, holding a column no DDL was
+    // ever applied to it for. The header page carried the version and the frames carried the
+    // column, together, in the same stream as the rows.
+    assert_eq!(
+        r.manager.schema_version(S0).unwrap(),
+        2,
+        "the destination must take over at the source's schema version"
+    );
+    let read = r
+        .manager
+        .query(S0, Statement::new("SELECT note FROM t WHERE id = 11"))
+        .expect("the destination must hold the post-change schema");
+    assert_eq!(scalar(read), Value::Text("after".into()));
+}

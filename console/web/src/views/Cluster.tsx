@@ -11,6 +11,7 @@ interface Snapshot {
   connection?: api.Connection;
   sampledAt: number;
   observation: api.ClusterObservation;
+  catalog: api.ClusterCatalog | null;
 }
 
 function asId(value: string | number | null | undefined): string | null {
@@ -115,6 +116,8 @@ export default function Cluster({ name }: { name: string }) {
   const [refreshing, setRefreshing] = useState(false);
   const [draining, setDraining] = useState(false);
   const [drainMessage, setDrainMessage] = useState<string | null>(null);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [catalogMessage, setCatalogMessage] = useState<string | null>(null);
   const sequence = useRef(0);
   const inFlight = useRef<{ id: number; name: string } | null>(null);
 
@@ -126,7 +129,11 @@ export default function Cluster({ name }: { name: string }) {
     setRefreshing(true);
     try {
       const c = api.conn(name);
-      const [observation, connectionList] = await Promise.all([c.observation(), api.connections.list()]);
+      const [observation, connectionList, catalog] = await Promise.all([
+        c.observation(),
+        api.connections.list(),
+        c.catalog().catch(() => null),
+      ]);
       const candidates = observation.nodes
         .filter((node) => node.meta && node.topology)
         .sort((left, right) => (right.last_success_ms ?? 0) - (left.last_success_ms ?? 0));
@@ -140,6 +147,7 @@ export default function Cluster({ name }: { name: string }) {
         connection: connectionList.find((item) => item.name === name),
         sampledAt: source.last_success_ms ?? Date.now(),
         observation,
+        catalog,
       });
       setError(null);
     } catch (e) {
@@ -179,6 +187,28 @@ export default function Cluster({ name }: { name: string }) {
     }
   };
 
+  const catalogAction = async (
+    confirmation: string,
+    action: (client: ReturnType<typeof api.conn>) => Promise<api.CatalogMutation>,
+  ) => {
+    if (!confirm(confirmation)) return;
+    setCatalogBusy(true);
+    setCatalogMessage(null);
+    try {
+      const result = await action(api.conn(name));
+      setCatalogMessage(
+        result.operation
+          ? `Operation ${result.operation} accepted. Progress is durable and resumes after restart.`
+          : "Catalog change committed.",
+      );
+      await load();
+    } catch (e) {
+      setCatalogMessage(e instanceof Error ? e.message : "catalog operation failed");
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
   const nodes = useMemo(() => (snapshot ? topologyNodes(snapshot) : []), [snapshot]);
   const activeId =
     selectedId && nodes.some((node) => node.id === selectedId)
@@ -204,7 +234,7 @@ export default function Cluster({ name }: { name: string }) {
     );
   }
 
-  const { info, cluster, stats, connection, sampledAt, observation } = snapshot;
+  const { info, cluster, stats, connection, sampledAt, observation, catalog } = snapshot;
   const placementTerm = cluster.placement?.term;
   const primaryTotal = Object.keys(cluster.placement?.assignments ?? {}).length;
   const currentNode = nodes.find((node) => node.isCurrent);
@@ -231,6 +261,20 @@ export default function Cluster({ name }: { name: string }) {
           <Button variant="ghost" onClick={() => void load()} disabled={refreshing}>
             {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
+          {canOperate && catalog?.enabled && (
+            <Button
+              variant="secondary"
+              disabled={catalogBusy}
+              onClick={() =>
+                void catalogAction(
+                  "Plan one stable rebalance movement now?",
+                  (client) => client.rebalance(),
+                )
+              }
+            >
+              Rebalance one shard
+            </Button>
+          )}
         </div>
       </header>
 
@@ -326,6 +370,69 @@ export default function Cluster({ name }: { name: string }) {
             </div>
           </section>
 
+          {catalog?.enabled && (
+            <section className="border border-carbon-border bg-carbon-layer">
+              <div className="border-b border-carbon-border px-4 py-4">
+                <h2 className="text-base font-semibold text-carbon-text">Dynamic scaling</h2>
+                <p className="mt-1 text-xs text-carbon-text-3">
+                  Catalog v{catalog.version ?? "—"} · routing epoch {catalog.routing_epoch ?? "—"} ·{" "}
+                  {catalog.active_shards ?? "—"} active / {catalog.local_shard_capacity ?? "—"} local capacity
+                </p>
+              </div>
+              <div className="space-y-3 px-4 py-4">
+                {(catalog.operations ?? []).filter((operation) => !["complete", "aborted"].includes(operation.phase)).map((operation) => (
+                  <div key={operation.id} className="border border-carbon-border bg-carbon-bg px-3 py-2 text-xs">
+                    <span className="font-mono text-carbon-blue">#{operation.id}</span>
+                    <span className="ml-2 text-carbon-text">{operation.kind} · {operation.phase}</span>
+                    {operation.shard !== null && operation.shard !== undefined && (
+                      <span className="ml-2 text-carbon-text-3">shard {operation.shard}</span>
+                    )}
+                  </div>
+                ))}
+                {(catalog.operations ?? []).every((operation) => ["complete", "aborted"].includes(operation.phase)) && (
+                  <p className="text-xs text-carbon-text-3">No topology operation is currently active.</p>
+                )}
+                {catalog.voter_transition && (
+                  <p className="border border-carbon-yellow/40 bg-carbon-yellow/10 px-3 py-2 text-xs text-carbon-text">
+                    Joint consensus: [{catalog.voter_transition.old.join(", ")}] → [{catalog.voter_transition.new.join(", ")}]
+                  </p>
+                )}
+                {canOperate && (
+                  <div className="flex flex-wrap gap-2 pt-2">
+                    <Button
+                      variant="secondary"
+                      disabled={catalogBusy}
+                      onClick={() => {
+                        const value = prompt("New voter node IDs, comma separated");
+                        if (!value) return;
+                        const voters = value.split(",").map((item) => Number(item.trim())).filter(Number.isFinite);
+                        void catalogAction(
+                          `Enter joint consensus with voters ${voters.join(", ")}?`,
+                          (client) => client.changeVoters(voters),
+                        );
+                      }}
+                    >
+                      Change voters
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      disabled={catalogBusy}
+                      onClick={() =>
+                        void catalogAction(
+                          "Finalize the current joint voter configuration?",
+                          (client) => client.finalizeVoters(),
+                        )
+                      }
+                    >
+                      Finalize voters
+                    </Button>
+                  </div>
+                )}
+                {catalogMessage && <Banner tone="info">{catalogMessage}</Banner>}
+              </div>
+            </section>
+          )}
+
           <section className="border border-carbon-border bg-carbon-layer">
             <div className="border-b border-carbon-border px-4 py-4">
               <h2 className="text-base font-semibold text-carbon-text">Effective configuration</h2>
@@ -407,12 +514,60 @@ export default function Cluster({ name }: { name: string }) {
                     </>
                   )}
 
-                  {canOperate && selected.isCurrent && (
+                  {canOperate && selected.isCurrent && !catalog?.enabled && (
                     <>
                       <div className="my-3 border-t border-carbon-border" />
                       <div className="mb-2 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">Node maintenance</div>
                       <Button variant="danger" disabled={draining} onClick={() => void drain()}>{draining ? "Draining…" : "Drain node"}</Button>
                       {drainMessage && <p className="mt-2 text-xs leading-5 text-carbon-text-2">{drainMessage}</p>}
+                    </>
+                  )}
+                  {canOperate && catalog?.enabled && selected && (
+                    <>
+                      <div className="my-3 border-t border-carbon-border" />
+                      <div className="mb-2 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">Catalog membership</div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="secondary"
+                          disabled={catalogBusy}
+                          onClick={() => {
+                            const member = catalog.members?.find((item) => String(item.node) === selected.id);
+                            const cordoned = member?.state !== "cordoned";
+                            void catalogAction(
+                              `${cordoned ? "Cordon" : "Uncordon"} node ${selected.id}?`,
+                              (client) => client.cordonMember(Number(selected.id), cordoned),
+                            );
+                          }}
+                        >
+                          {catalog.members?.find((item) => String(item.node) === selected.id)?.state === "cordoned"
+                            ? "Uncordon"
+                            : "Cordon"}
+                        </Button>
+                        <Button
+                          variant="danger"
+                          disabled={catalogBusy}
+                          onClick={() =>
+                            void catalogAction(
+                              `Drain node ${selected.id}? Primaries move one shard at a time.`,
+                              (client) => client.drainMember(Number(selected.id)),
+                            )
+                          }
+                        >
+                          Drain
+                        </Button>
+                        <Button
+                          variant="danger"
+                          disabled={catalogBusy}
+                          onClick={() =>
+                            void catalogAction(
+                              `Remove node ${selected.id}? This is refused until drain and voter removal are complete.`,
+                              (client) => client.removeMember(Number(selected.id)),
+                            )
+                          }
+                        >
+                          Remove
+                        </Button>
+                      </div>
                     </>
                   )}
                 </>

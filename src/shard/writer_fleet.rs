@@ -864,6 +864,20 @@ fn schema_op(
         return crate::storage::schema::version_of(&entry.conn);
     };
 
+    // DDL is a write, and takes the same gate the ordinary write path takes. It commits pages
+    // and advances the header version, and both replicate physically — so a schema change that
+    // lands after a transfer's fencing barrier is one the destination catches up past and never
+    // receives, and the two copies diverge with no error on either side.
+    //
+    // Checked *after* the read-only early return above: reading a version must stay ungated,
+    // because `schema_agreement` reads versions to detect skew and a fenced shard is exactly
+    // when that answer is needed. And *before* the transaction opens, for the reason the batch
+    // path gives — a writer that discovers it may not write only after committing has already
+    // written to a file another node may now own.
+    if let Some(gate) = &ctx.gate {
+        gate.check_may_write(shard)?;
+    }
+
     let next = crate::storage::schema::version_of(&entry.conn)? + 1;
     let tx = entry
         .conn

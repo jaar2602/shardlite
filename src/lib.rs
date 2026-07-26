@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod failpoint;
 pub mod net;
 pub mod query;
 pub mod replication;

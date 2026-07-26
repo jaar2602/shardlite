@@ -100,15 +100,22 @@ impl Router {
                 shard: shard.to_string(),
             });
         };
-        let Some(addr) = self.cluster.peer_addr(owner).map(str::to_owned) else {
+        let Some(addr) = self.cluster.peer_addr(owner) else {
             self.failed.fetch_add(1, Ordering::Relaxed);
             return Err(Error::NoOwner {
                 shard: format!("{shard} (owner is node {owner}, whose address is unknown)"),
             });
         };
 
-        // Wrapped so the far side answers rather than forwarding again.
-        let wrapped = Request::Direct(Box::new(req));
+        // Wrapped so the far side answers rather than forwarding again. Dynamic clusters also
+        // carry the routing epoch, making a stale coordinator fail retryably at the owner.
+        let wrapped = match self.cluster.catalog_routing_epoch() {
+            Some(routing_epoch) => Request::RoutedDirect {
+                routing_epoch,
+                request: Box::new(req),
+            },
+            None => Request::Direct(Box::new(req)),
+        };
         self.forwarded.fetch_add(1, Ordering::Relaxed);
 
         // Take the connection *out* of the map before using it, so the lock is never held
@@ -214,6 +221,33 @@ impl crate::shard::PeerRouter for Router {
         response_to_outcome(resp)
     }
 
+    fn apply_ddl_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> Result<i64> {
+        match self.forward(
+            shard,
+            Request::SchemaApply {
+                shard: shard.0,
+                ddl: statement,
+            },
+        )? {
+            Response::SchemaVersion {
+                shard: returned,
+                version,
+            } if returned == shard.0 => Ok(version),
+            Response::Error { message, .. } => Err(Error::Protocol(message)),
+            other => Err(Error::Protocol(format!(
+                "expected schema version for {shard}, got {other:?}"
+            ))),
+        }
+    }
+
+    fn schema_versions(&self, shards: &[ShardId]) -> Vec<Result<i64>> {
+        self.remote_schema_versions(shards)
+    }
+
     fn fan_out(
         &self,
         shards: &[ShardId],
@@ -291,6 +325,67 @@ impl crate::shard::PeerRouter for Router {
                 results
                     .remove(&s.0)
                     .unwrap_or_else(|| Err(Error::Protocol(format!("no result for {s}"))))
+            })
+            .collect()
+    }
+}
+
+impl Router {
+    /// Ask each owner for the schema versions of the shards it holds, one request per owner.
+    fn remote_schema_versions(&self, shards: &[ShardId]) -> Vec<Result<i64>> {
+        use std::collections::BTreeMap;
+
+        let mut by_owner: BTreeMap<u64, Vec<ShardId>> = BTreeMap::new();
+        let mut results: std::collections::HashMap<u32, Result<i64>> =
+            std::collections::HashMap::new();
+        for &s in shards {
+            match self.owner(s) {
+                Some(node) => by_owner.entry(node).or_default().push(s),
+                None => {
+                    results.insert(
+                        s.0,
+                        Err(Error::NoOwner {
+                            shard: s.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+
+        for group in by_owner.into_values() {
+            let req = Request::SchemaVersions {
+                shards: group.iter().map(|s| s.0).collect(),
+            };
+            // All shards in a group share an owner, so forwarding by the first reaches the node.
+            let answer = match self.forward(group[0], req) {
+                Ok(Response::SchemaVersions { versions }) if versions.len() == group.len() => {
+                    for (s, v) in group.iter().zip(versions) {
+                        results.insert(s.0, Ok(v));
+                    }
+                    continue;
+                }
+                Ok(Response::SchemaVersions { versions }) => Error::Protocol(format!(
+                    "schema-version batch returned {} versions for {} shards",
+                    versions.len(),
+                    group.len()
+                )),
+                Ok(Response::Error { message, .. }) => Error::Protocol(message),
+                Ok(other) => Error::Protocol(format!(
+                    "unexpected response to a schema-version batch: {other:?}"
+                )),
+                Err(e) => Error::Protocol(e.to_string()),
+            };
+            for s in &group {
+                results.insert(s.0, Err(answer.clone_shallow()));
+            }
+        }
+
+        shards
+            .iter()
+            .map(|s| {
+                results
+                    .remove(&s.0)
+                    .unwrap_or_else(|| Err(Error::Protocol(format!("no version for {s}"))))
             })
             .collect()
     }

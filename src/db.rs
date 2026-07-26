@@ -208,8 +208,7 @@ pub(crate) fn reject_unsupported(sql: &str) -> Result<()> {
     )))
 }
 
-const ALTER_LIMITATION: &str =
-    "SQLite's ALTER TABLE supports only RENAME TO, RENAME COLUMN, ADD COLUMN and DROP COLUMN — not \
+const ALTER_LIMITATION: &str = "SQLite's ALTER TABLE supports only RENAME TO, RENAME COLUMN, ADD COLUMN and DROP COLUMN — not \
      MODIFY/CHANGE/ALTER COLUMN, and not ADD CONSTRAINT/PRIMARY KEY/FOREIGN KEY/UNIQUE/CHECK/INDEX. \
      To change a column's type or default, or add/drop a constraint or the primary key, recreate \
      the table: CREATE a new table with the schema you want, INSERT ... SELECT the rows across, DROP \
@@ -305,7 +304,10 @@ mod alter_tests {
             // A table named after a keyword is fine.
             "ALTER TABLE modify ADD COLUMN x INT",
         ] {
-            assert!(alter_unsupported_reason(sql).is_none(), "should be supported: {sql}");
+            assert!(
+                alter_unsupported_reason(sql).is_none(),
+                "should be supported: {sql}"
+            );
             assert!(reject_unsupported(sql).is_ok(), "should be allowed: {sql}");
         }
     }
@@ -322,9 +324,15 @@ mod alter_tests {
             "ALTER TABLE t ADD UNIQUE (a)",
             "ALTER TABLE t ADD INDEX idx (a)",
         ] {
-            assert!(alter_unsupported_reason(sql).is_some(), "should be refused: {sql}");
+            assert!(
+                alter_unsupported_reason(sql).is_some(),
+                "should be refused: {sql}"
+            );
             let err = reject_unsupported(sql).unwrap_err().to_string();
-            assert!(err.contains("recreate the table"), "message should guide the fix: {err}");
+            assert!(
+                err.contains("recreate the table"),
+                "message should guide the fix: {err}"
+            );
         }
     }
 }

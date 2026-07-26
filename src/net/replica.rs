@@ -199,6 +199,28 @@ impl Replica {
         Ok(())
     }
 
+    /// Install a current snapshot for one followed shard before ordinary WAL catch-up.
+    ///
+    /// A fresh transfer destination must use this path even when the primary still retains frames
+    /// from LSN 1: a logical split can replace the source image while its old physical frame
+    /// history remains in the bounded log. Replaying that history would reconstruct the pre-split
+    /// file. An established replica with a durable nonzero position can continue through
+    /// [`Self::sync_once`].
+    pub fn bootstrap_once(&self, shard: ShardId) -> Result<()> {
+        if !self.following().contains(&shard) {
+            return Err(Error::Protocol(format!(
+                "{shard} is not in this replica's followed set"
+            )));
+        }
+        let mut client = match &self.cfg.credentials {
+            Some((name, secret)) => Client::connect_as(&self.cfg.primary_addr, name, secret)?,
+            None => Client::connect(&self.cfg.primary_addr)?,
+        };
+        self.bootstrap(&mut client, shard)?;
+        self.counters.bootstraps.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Follow until stopped.
     /// Whether the pull loop is currently running.
     pub fn is_running(&self) -> bool {

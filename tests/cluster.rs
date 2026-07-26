@@ -560,7 +560,9 @@ fn a_candidate_that_is_behind_cannot_win() {
         .manager
         .execute_one(
             shard,
-            shardlite::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+            shardlite::storage::exec::Statement::new(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+            ),
         )
         .unwrap();
     for i in 1..=20 {
@@ -706,7 +708,9 @@ fn a_deposed_leader_stops_writing() {
         .manager
         .execute_one(
             shard,
-            shardlite::storage::exec::Statement::new("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT"),
+            shardlite::storage::exec::Statement::new(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT",
+            ),
         )
         .unwrap();
     assert!(leader.cluster.fence().is_open(shard));
@@ -1238,7 +1242,9 @@ fn what_the_router_puts_on_the_wire_is_direct_wrapped() {
     // failure it prevents — two nodes bouncing a request forever — only shows up when their
     // placement maps disagree, which is precisely the state that is hard to arrange on
     // purpose and certain to happen eventually.
-    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{
+        PROTOCOL_VERSION, Request, Response, read_message, write_message,
+    };
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -1442,7 +1448,9 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     // owner that accepted connections and answered nothing would then block every forward on
     // the node — any shard, any owner — for the full timeout. Same disease that froze the
     // election loop, sitting in the write path.
-    use shardlite::net::protocol::{PROTOCOL_VERSION, Request, Response, read_message, write_message};
+    use shardlite::net::protocol::{
+        PROTOCOL_VERSION, Request, Response, read_message, write_message,
+    };
     use std::net::TcpListener;
 
     // Owner of shard 0: accepts, says hello, then never answers anything again.
@@ -1532,8 +1540,9 @@ fn a_hung_shard_owner_does_not_block_forwards_to_healthy_owners() {
     })
     .unwrap();
 
-    let router =
-        Arc::new(shardlite::net::Router::new(Arc::clone(&node)).with_timeout(Duration::from_secs(2)));
+    let router = Arc::new(
+        shardlite::net::Router::new(Arc::clone(&node)).with_timeout(Duration::from_secs(2)),
+    );
 
     // Thread A forwards into the hung owner and will sit there until its timeout.
     let ra = Arc::clone(&router);

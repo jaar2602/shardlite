@@ -650,8 +650,8 @@ fn a_survivor_serves_a_shard_from_its_latest_s3_snapshot() {
 
     // Node B takes over shard 3: opens it from S3, no download, and serves it.
     let scratch = tempfile::tempdir().unwrap();
-    let conn =
-        shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+    let conn = shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path())
+        .unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -797,8 +797,8 @@ fn a_failover_replays_the_change_log_since_the_snapshot() {
     // Node B takes over shard 3. Without replay it would see 200 rows as of the snapshot; with
     // replay it is current — 210 rows, and id 11 carries the post-snapshot update.
     let scratch = tempfile::tempdir().unwrap();
-    let conn =
-        shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path()).unwrap();
+    let conn = shardlite::s3::open_from_s3(Arc::clone(&client), "arch", ShardId(3), scratch.path())
+        .unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -858,7 +858,8 @@ fn a_failover_refuses_a_change_log_with_a_gap() {
         )
         .unwrap();
 
-    let err = shardlite::s3::failover::build_overlay(&client, "arch", ShardId(1), 4, 5).unwrap_err();
+    let err =
+        shardlite::s3::failover::build_overlay(&client, "arch", ShardId(1), 4, 5).unwrap_err();
     assert!(
         err.to_string().contains("gap"),
         "expected a gap refusal, got: {err}"

@@ -14,4 +14,4 @@ pub use plan::{
     PostProcess, SetKind, SetOp, SetTree, ShardKeys, SortKey, Unsupported, plan, plan_with,
     substitute_subqueries,
 };
-pub use route::{Route, route_statement};
+pub use route::{Route, route_statement, route_statement_with};

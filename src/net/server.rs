@@ -87,6 +87,10 @@ pub struct NodeServices {
     pub frames: Option<Arc<FrameLog>>,
     /// Election participation.
     pub cluster: Option<Arc<ClusterNode>>,
+    /// Durable committed and prepared cluster catalog state.
+    pub catalog: Option<Arc<crate::cluster::CatalogStore>>,
+    /// Leader-only typed catalog mutations used by join/rebalance workers and HTTP management.
+    pub catalog_control: Option<Arc<crate::cluster::CatalogControl>>,
     /// Quorum confirmation. Independent of `cluster` because a follower's subscription is
     /// what reports its position, and that works whether or not elections are running.
     pub acks: Option<Arc<crate::replication::AckTracker>>,
@@ -533,6 +537,27 @@ pub(crate) fn handle(req: Request, shards: &ShardManager, services: &NodeService
     if let Request::Direct(inner) = req {
         return handle_local(*inner, shards, services);
     }
+    if let Request::RoutedDirect {
+        routing_epoch,
+        request,
+    } = req
+    {
+        let current = services
+            .catalog
+            .as_ref()
+            .map(|catalog| catalog.snapshot().routing_epoch)
+            .unwrap_or(routing_epoch);
+        if routing_epoch != current {
+            return Response::Error {
+                message: format!(
+                    "request was routed under epoch {routing_epoch}, but this node has committed \
+                     epoch {current}; refresh routing and retry"
+                ),
+                retryable: true,
+            };
+        }
+        return handle_local(*request, shards, services);
+    }
 
     // A read may be answerable here even though another node owns the shard — that is the
     // whole point of the weaker levels. Decided before the generic ownership rule.
@@ -843,7 +868,7 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             tracing::debug!(client, "client connected");
             Response::Welcome {
                 version: PROTOCOL_VERSION,
-                shard_count: shards.config().shard_count,
+                shard_count: shards.shard_count(),
                 epoch: shards.epoch(),
             }
         }
@@ -851,7 +876,7 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
         Request::Info => {
             let wc = crate::storage::wal_conversion_stats();
             Response::Info {
-                shard_count: shards.config().shard_count,
+                shard_count: shards.shard_count(),
                 epoch: shards.epoch(),
                 wal_retries: wc.retries,
                 contended_opens: wc.contended_opens,
@@ -896,6 +921,19 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
         // client names no shard. Same bound parameters limitation as QueryAll: the router reads the
         // shard key from the SQL text, so a routed statement cannot carry parameters yet.
         Request::Run { statement } => {
+            if let Some(catalog) = &services.catalog {
+                let committed = catalog.snapshot().routing_epoch;
+                if shards.routing_epoch() != committed {
+                    return Response::Error {
+                        message: format!(
+                            "local SQL router is on epoch {}, behind committed epoch {committed}; \
+                             retry after routing refresh",
+                            shards.routing_epoch()
+                        ),
+                        retryable: true,
+                    };
+                }
+            }
             if !statement.params.is_empty() {
                 return Response::Error {
                     message: "a routed statement cannot carry bound parameters yet; the router \
@@ -903,6 +941,9 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                         .into(),
                     retryable: false,
                 };
+            }
+            if split_blocks_ddl(services, std::slice::from_ref(&statement)) {
+                return split_ddl_error();
             }
             match shards.run_routed(statement) {
                 Ok(o) => outcome_to_response(o),
@@ -918,11 +959,20 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             statement,
             write,
         } => {
+            if write && split_blocks_ddl(services, std::slice::from_ref(&statement)) {
+                return split_ddl_error();
+            }
             let results = batch_shards
                 .iter()
                 .map(|&s| {
                     let id = ShardId(s);
-                    let outcome = if write {
+                    let outcome = if write && crate::db::Db::is_ddl(&statement.sql) {
+                        shards.apply_ddl_to(id, statement.clone()).map(|_| {
+                            Outcome::Ok(Executed::Changed(
+                                crate::storage::exec::WriteOutcome::default(),
+                            ))
+                        })
+                    } else if write {
                         shards.execute_one(id, statement.clone())
                     } else {
                         shards.query(id, statement.clone())
@@ -941,6 +991,9 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
 
         // The COMMIT of a client transaction: all-or-nothing, and durable before it returns.
         Request::Transaction { shard, statements } => {
+            if split_blocks_ddl(services, &statements) {
+                return split_ddl_error();
+            }
             match shards.execute_txn(ShardId(shard), statements) {
                 Ok(outcomes) => {
                     // A single rejection voids the whole transaction — report it as an error,
@@ -979,6 +1032,9 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
         }
 
         Request::Execute { shard, statements } => {
+            if split_blocks_ddl(services, &statements) {
+                return split_ddl_error();
+            }
             match shards.execute(ShardId(shard), statements) {
                 Ok(outcomes) => {
                     // Report the first rejection rather than the last success, so a caller
@@ -1006,6 +1062,9 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
         // and its per-shard results are reported individually, because there is no atomicity
         // across shards and pretending otherwise would hide a partial application.
         Request::ExecuteAll { statement } => {
+            if split_blocks_ddl(services, std::slice::from_ref(&statement)) {
+                return split_ddl_error();
+            }
             // Fail the whole roll fast, with a clear message, on a form no shard could honour (e.g.
             // an unsupported ALTER) rather than letting each shard return a bare SQLite syntax error.
             if let Err(e) = crate::db::reject_unsupported(&statement.sql) {
@@ -1020,7 +1079,10 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                 let local = services.router.as_ref().is_none_or(|r| r.is_mine(shard));
                 let outcome = if local {
                     match shards.apply_ddl_to(shard, statement.clone()) {
-                        Ok(_) => ShardOutcome::Ok,
+                        Ok(_) => match shards.adopt_shard_key_from_ddl(&statement.sql) {
+                            Ok(()) => ShardOutcome::Ok,
+                            Err(error) => ShardOutcome::Rejected(error.to_string()),
+                        },
                         Err(e) => ShardOutcome::Rejected(e.to_string()),
                     }
                 } else {
@@ -1043,6 +1105,7 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                 };
                 outcomes.push((s, outcome));
             }
+            let _ = shards.adopt_shard_key_from_ddl(&statement.sql);
             Response::AllShards { outcomes }
         }
 
@@ -1109,13 +1172,41 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
             Err(e) => error_response(e),
         },
 
-        Request::SchemaApply { shard, ddl } => match shards.apply_ddl_to(ShardId(shard), ddl) {
-            Ok(version) => Response::SchemaVersion { shard, version },
-            Err(e) => error_response(e),
-        },
+        // Read-only: the schema versions of shards this node owns, for a coordinator checking
+        // cluster-wide agreement. One request covers every shard this node holds of the fan-out,
+        // so the check costs a round trip per node rather than per shard.
+        Request::SchemaVersions {
+            shards: batch_shards,
+        } => {
+            let mut versions = Vec::with_capacity(batch_shards.len());
+            for s in batch_shards {
+                match shards.schema_version(ShardId(s)) {
+                    Ok(v) => versions.push(v),
+                    Err(e) => return error_response(e),
+                }
+            }
+            Response::SchemaVersions { versions }
+        }
+
+        Request::SchemaApply { shard, ddl } => {
+            if split_blocks_ddl(services, std::slice::from_ref(&ddl)) {
+                return split_ddl_error();
+            }
+            match shards.apply_ddl_to(ShardId(shard), ddl.clone()) {
+                Ok(version) => match shards.adopt_shard_key_from_ddl(&ddl.sql) {
+                    Ok(()) => Response::SchemaVersion { shard, version },
+                    Err(error) => error_response(error),
+                },
+                Err(e) => error_response(e),
+            }
+        }
 
         // Unwrapped above; reaching here would mean a nested wrapper, which nothing sends.
         Request::Direct(inner) => handle_local(*inner, shards, services),
+        Request::RoutedDirect { .. } => Response::Error {
+            message: "a routed direct request must pass through the forwarding epoch check".into(),
+            retryable: true,
+        },
 
         // Answered inside the connection's handshake when authentication is configured;
         // reaching here means it is not.
@@ -1190,6 +1281,81 @@ fn handle_local(req: Request, shards: &ShardManager, services: &NodeServices) ->
                 Err(e) => error_response(e),
             },
             None => not_a_member("a heartbeat"),
+        },
+
+        Request::CatalogGet => match &services.catalog {
+            Some(catalog) => Response::CatalogState {
+                committed: catalog.snapshot(),
+                prepared: catalog.prepared_snapshot(),
+            },
+            None => not_a_member("a catalog read"),
+        },
+
+        Request::CatalogPrepare { leader, proposal } => match (cluster, &services.catalog) {
+            (Some(cluster), Some(catalog)) => {
+                if let Err(error) = cluster.authorize_catalog_leader(leader, proposal.term) {
+                    error_response(error)
+                } else {
+                    let term = proposal.term;
+                    let version = proposal.catalog.version;
+                    match catalog.prepare(proposal) {
+                        Ok(()) => Response::CatalogPrepared { term, version },
+                        Err(error) => error_response(error),
+                    }
+                }
+            }
+            _ => not_a_member("a catalog prepare"),
+        },
+
+        Request::CatalogCommit {
+            leader,
+            term,
+            version,
+        } => match (cluster, &services.catalog) {
+            (Some(cluster), Some(catalog)) => {
+                if let Err(error) = cluster.authorize_catalog_leader(leader, term) {
+                    error_response(error)
+                } else {
+                    match catalog.commit_prepared(term, version) {
+                        Ok(()) => Response::CatalogCommitted { version },
+                        Err(error) => error_response(error),
+                    }
+                }
+            }
+            _ => not_a_member("a catalog commit"),
+        },
+
+        Request::CatalogCommand(command) => match &services.catalog_control {
+            Some(control) => match control.apply(command) {
+                Ok(result) => Response::CatalogChanged(result),
+                Err(error) => error_response(error),
+            },
+            None => not_a_member("a catalog command"),
+        },
+
+        Request::CatalogInstall {
+            leader,
+            term,
+            catalog: committed,
+        } => match (cluster, &services.catalog) {
+            (Some(cluster), Some(catalog)) => {
+                if let Err(error) = cluster.authorize_catalog_leader(leader, term) {
+                    error_response(error)
+                } else {
+                    // This is the metadata equivalent of installing a Raft snapshot. The request
+                    // is accepted only from the currently-authorized leader and the store itself
+                    // enforces cluster identity, monotonic versioning, exact same-version content,
+                    // and absence of a prepared value. Prepare/commit remains the path that
+                    // *chooses* values; snapshot install only repairs an already chosen value on a
+                    // member that was offline for multiple catalog versions.
+                    let version = committed.version;
+                    match catalog.install_committed(committed) {
+                        Ok(()) => Response::CatalogInstalled { version },
+                        Err(error) => error_response(error),
+                    }
+                }
+            }
+            _ => not_a_member("a catalog snapshot install"),
         },
     }
 }
@@ -1338,6 +1504,31 @@ fn outcome_to_batch(o: crate::Result<Outcome>) -> super::protocol::BatchResult {
 }
 
 /// Distinguish backpressure from a real fault, so a client knows whether retrying helps.
+fn split_blocks_ddl(
+    services: &NodeServices,
+    statements: &[crate::storage::exec::Statement],
+) -> bool {
+    let active = services.catalog.as_ref().is_some_and(|catalog| {
+        catalog.snapshot().operations.values().any(|operation| {
+            operation.kind == crate::cluster::OperationKind::Split && !operation.phase.terminal()
+        })
+    });
+    active
+        && statements
+            .iter()
+            .any(|statement| crate::db::Db::is_ddl(&statement.sql))
+}
+
+fn split_ddl_error() -> Response {
+    Response::Error {
+        message:
+            "schema changes are paused while a logical split is active; retry after the split \
+                  reaches Complete"
+                .into(),
+        retryable: true,
+    }
+}
+
 fn error_response(e: Error) -> Response {
     let retryable = matches!(
         e,

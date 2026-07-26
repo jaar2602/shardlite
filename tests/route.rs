@@ -73,6 +73,20 @@ fn a_point_read_update_delete_reaches_the_same_shard_as_the_insert() {
 }
 
 #[test]
+fn a_shard_key_update_is_refused_instead_of_moving_half_a_row() {
+    let keys = keys_for("users", "id");
+    for sql in [
+        "UPDATE users SET id = 'new' WHERE id = 'old'",
+        "UPDATE users SET (name, id) = ('n', 'new') WHERE id = 'old'",
+    ] {
+        match route_statement(sql, &keys, SHARDS) {
+            Route::Refuse(message) => assert!(message.contains("cannot be updated"), "{message}"),
+            other => panic!("expected shard-key update refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn writes_actually_spread_across_shards() {
     // The whole point: many inserts with distinct keys must not all land on one shard.
     let keys = keys_for("users", "id");
@@ -307,7 +321,10 @@ fn routed_writes_survive_a_round_trip_through_the_store() {
 
     // Every inserted row is visible via a fan-out — none were routed into the void.
     let total = m.query_all_shards("SELECT count(*) FROM users").unwrap();
-    assert_eq!(total.rows, vec![vec![shardlite::storage::Value::Integer(n)]]);
+    assert_eq!(
+        total.rows,
+        vec![vec![shardlite::storage::Value::Integer(n)]]
+    );
 
     // And a point lookup finds its row on the one shard the insert chose.
     let s = text_shard("user-7");

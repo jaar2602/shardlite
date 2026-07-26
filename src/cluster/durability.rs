@@ -21,8 +21,13 @@
 //! The tempting approximation is to order by `(epoch, lsn)` and move on. That silently
 //! elects a node whose epoch happens to be higher but which holds *less* data, losing
 //! acknowledged writes. So mismatched epochs are [`Comparison::Incomparable`] and a vote is
-//! refused. This can stall an election that a human could see was safe — which is the
-//! correct trade. A stalled election is visible and recoverable; a lost write is neither.
+//! refused when the voter has a positive shard position to protect. A metadata-only voter
+//! holds no acknowledged user write for an epoch comparison to protect, so catalog freshness
+//! alone can establish that a candidate is safe.
+//!
+//! An epoch mismatch against a voter that does hold data can stall an election that a human
+//! could see was safe — which is the correct trade. A stalled election is visible and
+//! recoverable; a lost write is neither.
 //!
 //! # Domination is per shard, not in aggregate
 //!
@@ -37,9 +42,19 @@ use serde::{Deserialize, Serialize};
 use crate::replication::Lsn;
 use crate::shard::ShardId;
 
+/// Durable catalog prefix a candidate can prove it holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogPosition {
+    pub version: u64,
+    pub digest: [u8; 32],
+}
+
 /// How far a node has durably progressed through each shard's stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Durability {
+    /// Latest committed or prepared catalog value. A voter refuses a candidate behind this
+    /// position, preserving a quorum-chosen membership/ownership entry across elections.
+    pub catalog: CatalogPosition,
     /// The stream this node's positions belong to. Positions from different epochs cannot be
     /// compared.
     pub epoch: u64,
@@ -60,12 +75,23 @@ pub enum Comparison {
         ours: Lsn,
     },
     /// Positions belong to different streams and cannot be ordered.
-    Incomparable { theirs: u64, ours: u64 },
+    Incomparable {
+        theirs: u64,
+        ours: u64,
+    },
+    CatalogBehind {
+        theirs: u64,
+        ours: u64,
+    },
+    CatalogConflict {
+        version: u64,
+    },
 }
 
 impl Durability {
     pub fn new(epoch: u64) -> Self {
         Self {
+            catalog: CatalogPosition::default(),
             epoch,
             shards: BTreeMap::new(),
         }
@@ -87,7 +113,26 @@ impl Durability {
     /// it and loses, which is correct — it cannot lead a shard whose history it does not
     /// hold. Iterating the candidate's shards instead would let it win by knowing less.
     pub fn compare_to(&self, voter: &Durability) -> Comparison {
-        if self.epoch != voter.epoch {
+        if self.catalog.version < voter.catalog.version {
+            return Comparison::CatalogBehind {
+                theirs: self.catalog.version,
+                ours: voter.catalog.version,
+            };
+        }
+        if self.catalog.version == voter.catalog.version
+            && self.catalog.version != 0
+            && self.catalog.digest != voter.catalog.digest
+        {
+            return Comparison::CatalogConflict {
+                version: self.catalog.version,
+            };
+        }
+        // Requiring an otherwise-unused stream epoch to match would deadlock a joint voter
+        // transition as soon as either metadata-only voter restarted. Catalog position is
+        // still compared above, so this exception cannot elect a node missing committed
+        // membership or ownership metadata.
+        let voter_holds_data = voter.shards.values().any(|&lsn| lsn > 0);
+        if self.epoch != voter.epoch && voter_holds_data {
             return Comparison::Incomparable {
                 theirs: self.epoch,
                 ours: voter.epoch,
@@ -130,6 +175,14 @@ impl Comparison {
                 "candidate is on epoch {theirs} and this node on {ours}; positions from \
                  different streams cannot be ordered, so the candidate cannot be shown to \
                  hold this node's writes"
+            ),
+            Comparison::CatalogBehind { theirs, ours } => format!(
+                "behind on cluster catalog: candidate has version {theirs}, this voter has \
+                 version {ours}; electing it could lose committed membership or ownership"
+            ),
+            Comparison::CatalogConflict { version } => format!(
+                "catalog version {version} has a different digest on the candidate and voter; \
+                 refusing inconsistent metadata histories"
             ),
         }
     }
@@ -220,10 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn a_voter_holding_nothing_accepts_anyone_in_its_epoch() {
-        let candidate = d(1, &[(0, 10)]);
+    fn a_voter_holding_nothing_accepts_a_candidate_from_another_epoch() {
+        let candidate = d(2, &[(0, 10)]);
         let voter = Durability::new(1);
         assert!(candidate.may_lead(&voter));
+
+        let voter_with_only_zero_positions = d(3, &[(0, 0), (1, 0)]);
+        assert!(candidate.may_lead(&voter_with_only_zero_positions));
     }
 
     #[test]
@@ -234,7 +290,37 @@ mod tests {
         assert!(why.contains("shard_0"), "{why}");
         assert!(why.contains('1') && why.contains('9'), "{why}");
 
-        let why = d(2, &[]).compare_to(&d(3, &[])).why();
+        let why = d(2, &[(0, 1)]).compare_to(&d(3, &[(0, 1)])).why();
         assert!(why.contains("epoch"), "{why}");
+    }
+
+    #[test]
+    fn a_candidate_behind_the_catalog_cannot_lead() {
+        let mut candidate = d(1, &[]);
+        candidate.catalog.version = 4;
+        let mut voter = d(1, &[]);
+        voter.catalog.version = 5;
+        assert!(matches!(
+            candidate.compare_to(&voter),
+            Comparison::CatalogBehind { theirs: 4, ours: 5 }
+        ));
+    }
+
+    #[test]
+    fn conflicting_catalog_digests_at_one_version_are_incomparable() {
+        let mut candidate = d(1, &[]);
+        candidate.catalog = CatalogPosition {
+            version: 5,
+            digest: [1; 32],
+        };
+        let mut voter = d(1, &[]);
+        voter.catalog = CatalogPosition {
+            version: 5,
+            digest: [2; 32],
+        };
+        assert!(matches!(
+            candidate.compare_to(&voter),
+            Comparison::CatalogConflict { version: 5 }
+        ));
     }
 }

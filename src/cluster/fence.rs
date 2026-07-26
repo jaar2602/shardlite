@@ -213,6 +213,20 @@ impl Fence {
         }
     }
 
+    /// Close one shard without disturbing write ownership of unrelated shards.
+    pub fn close_shard(&self, shard: ShardId, why: &str) -> bool {
+        let removed = self
+            .led
+            .lock()
+            .expect("fence mutex")
+            .remove(&shard)
+            .is_some();
+        if removed {
+            tracing::warn!(%shard, why, "write gate closed for transfer");
+        }
+        removed
+    }
+
     /// Whether this node may write `shard`.
     pub fn is_open(&self, shard: ShardId) -> bool {
         self.led.lock().expect("fence mutex").contains_key(&shard)
@@ -357,6 +371,16 @@ mod tests {
         );
         assert!(f.is_open(S1));
         assert_eq!(f.open_term(S1), Some(5), "and the new term applies");
+    }
+
+    #[test]
+    fn closing_one_shard_leaves_unrelated_write_lanes_open() {
+        let f = Fence::new(1, 0);
+        f.open_for(&[S0, S1], 3);
+        assert!(f.close_shard(S0, "moving it"));
+        assert!(!f.is_open(S0));
+        assert!(f.is_open(S1));
+        assert!(!f.close_shard(S0, "duplicate command"));
     }
 
     #[test]

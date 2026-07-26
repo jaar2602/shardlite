@@ -9,14 +9,13 @@
 //! the copy began. Per-shard, bootstrap, checkpointing, verification, and backup all stay
 //! minutes-scale no matter how large the total.
 //!
-//! # Virtual shards, fixed at creation
+//! # Legacy fixed routing and dynamic linear routing
 //!
-//! Shards are over-provisioned up front and never split. Rebalancing moves whole shards
-//! between nodes, so data is never rehashed — that is what lets a deployment start at
-//! 100 MB and grow to a few hundred GB without a resharding event.
-//!
-//! **The shard count is immutable.** Changing it re-routes every key. It is stored in the
-//! cluster manifest at creation and refused if it disagrees later.
+//! Legacy modulo directories record an immutable active shard count; changing it would re-route
+//! every key and is refused. Dynamic directories use the manifest count as a local allocation
+//! ceiling and keep the active `LinearV1` state in the quorum catalog. They grow one shard at a
+//! time by splitting exactly one linear-hash bucket; whole-shard rebalancing moves the resulting
+//! files between nodes without changing key routes.
 //!
 //! # Memory: an LRU multiplies caches
 //!
@@ -30,12 +29,14 @@ pub mod lru;
 pub mod manifest;
 pub mod mode;
 pub mod reader_fleet;
+pub mod routing;
 pub mod writer_fleet;
 
 use std::path::{Path, PathBuf};
 
 pub use manifest::Manifest;
 pub use reader_fleet::ReaderFleet;
+pub use routing::{LinearV1, ModuloV1, Routing, hash_key};
 pub use writer_fleet::{WriterFleet, WriterFleetStats};
 
 /// Permission to write, checked before every batch commits.
@@ -88,15 +89,9 @@ impl std::fmt::Display for ShardId {
 ///
 /// This function must never change. If it must, that is a migration, not an edit.
 pub fn shard_of(key: &[u8], shard_count: u32) -> ShardId {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut h = OFFSET;
-    for b in key {
-        h ^= *b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    ShardId((h % shard_count as u64) as u32)
+    ModuloV1::new(shard_count)
+        .expect("shard_count must be at least one")
+        .route(key)
 }
 
 /// Create a table in the coordinator connection carrying `result`'s columns (dynamically typed,
@@ -216,7 +211,8 @@ fn persist_shard_keys(dir: &Path, keys: &crate::query::ShardKeys) -> crate::Resu
 /// Sizing for a sharded database.
 #[derive(Debug, Clone)]
 pub struct ShardConfig {
-    /// Immutable after creation; caps ultimate scale. 64 covers roughly 100 MB to 1 TB.
+    /// Local shard-ID allocation ceiling, immutable in the manifest. It is also the active count
+    /// for legacy modulo directories; dynamic catalog mode may activate any prefix up to it.
     pub shard_count: u32,
 
     /// Writer threads. Shards are assigned to threads by `id % writer_threads`, so each
@@ -374,6 +370,17 @@ pub trait PeerRouter: Send + Sync {
         statement: crate::storage::exec::Statement,
     ) -> crate::Result<crate::storage::exec::Outcome>;
 
+    /// Apply versioned DDL on one remote shard and return its new schema version.
+    ///
+    /// This is deliberately separate from an ordinary remote write. SQLite would accept DDL
+    /// through that path, but it would not advance shardlite's per-shard schema version and a
+    /// partial roll would become invisible to the cross-shard agreement guard.
+    fn apply_ddl_remote(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> crate::Result<i64>;
+
     /// Run `statement` on each of `shards` (none owned locally), **batched one request per owner
     /// node** rather than one per shard, and return the results aligned with `shards`. This is what
     /// keeps a wide fan-out to one round trip per node instead of one per shard.
@@ -383,6 +390,15 @@ pub trait PeerRouter: Send + Sync {
         statement: &crate::storage::exec::Statement,
         write: bool,
     ) -> Vec<crate::Result<crate::storage::exec::Outcome>>;
+
+    /// Read the schema version of each of `shards` (none owned locally) from its owner, batched
+    /// one request per owner node, aligned with `shards`.
+    ///
+    /// Required rather than defaulted. A default would have to either invent a version — which
+    /// makes a cross-node skew look like agreement, the exact failure this exists to catch — or
+    /// error, which would break every fan-out on any implementor that forgot it. Both are worse
+    /// than a compile error.
+    fn schema_versions(&self, shards: &[ShardId]) -> Vec<crate::Result<i64>>;
 }
 
 pub struct ShardManager {
@@ -391,6 +407,9 @@ pub struct ShardManager {
     cfg: ShardConfig,
     dir: PathBuf,
     manifest: Manifest,
+    /// Active logical routing. The writer fleet may be provisioned for more shard IDs than are
+    /// currently visible; only this committed routing decides which shards CRUD may address.
+    routing: std::sync::RwLock<ActiveRouting>,
     modes: std::sync::Arc<mode::ShardModes>,
     /// Declared co-partitioning: table → shard-key column. Loaded from `shard_keys.json` and used
     /// to allow co-located joins in cross-shard reads.
@@ -398,6 +417,12 @@ pub struct ShardManager {
     /// Set once by the networking layer to forward work for shards owned by other nodes. Absent on
     /// a standalone node or the embedded CLI, where every shard is local.
     peer: std::sync::OnceLock<std::sync::Arc<dyn PeerRouter>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveRouting {
+    routing: Routing,
+    epoch: u64,
 }
 
 impl ShardManager {
@@ -497,12 +522,15 @@ impl ShardManager {
             std::sync::Arc::clone(&modes),
         )?;
         let shard_keys = std::sync::RwLock::new(load_shard_keys(dir));
+        let routing =
+            Routing::ModuloV1(ModuloV1::new(cfg.shard_count).expect("validated shard count"));
         Ok(Self {
             writers,
             readers,
             cfg,
             dir: dir.to_path_buf(),
             manifest,
+            routing: std::sync::RwLock::new(ActiveRouting { routing, epoch: 0 }),
             modes,
             shard_keys,
             peer: std::sync::OnceLock::new(),
@@ -629,8 +657,6 @@ impl ShardManager {
             .unwrap_or(0)
     }
 
-    /// The primary's stream epoch, if capture is on.
-    /// How many shards this manager owns. Fixed at creation.
     /// Attach, replace, or detach (`None`) the frame sink at runtime — e.g. an operator turning S3
     /// archival on from the console. Requires the node to have been opened capture-ready
     /// ([`Self::capture_enabled`]); with capture off there are no frames for a sink to receive.
@@ -648,10 +674,68 @@ impl ShardManager {
         self.writers.has_sink()
     }
 
+    /// Number of active logical shards, which may be below the local writer fleet's capacity.
     pub fn shard_count(&self) -> u32 {
-        self.cfg.shard_count
+        self.routing().shard_count()
     }
 
+    pub fn routing(&self) -> Routing {
+        self.routing.read().expect("routing lock").routing
+    }
+
+    pub fn routing_epoch(&self) -> u64 {
+        self.routing.read().expect("routing lock").epoch
+    }
+
+    /// Install a committed routing state.
+    ///
+    /// The local manifest remains the allocation ceiling for this process. Publishing routing
+    /// beyond it is refused before any request can reach an unsupported shard ID.
+    pub fn set_routing(&self, routing: Routing) -> crate::Result<()> {
+        if routing.shard_count() > self.cfg.shard_count {
+            return Err(crate::Error::ShardConfig(format!(
+                "routing activates {} shards but this directory was provisioned for at most {}",
+                routing.shard_count(),
+                self.cfg.shard_count
+            )));
+        }
+        self.routing.write().expect("routing lock").routing = routing;
+        Ok(())
+    }
+
+    /// Install one committed catalog routing snapshot. Epoch and routing move under one lock so a
+    /// request cannot observe a new route carrying an old epoch (or the reverse).
+    pub fn set_catalog_routing(&self, routing: Routing, epoch: u64) -> crate::Result<()> {
+        if epoch == 0 {
+            return Err(crate::Error::ShardConfig(
+                "catalog routing epoch must be at least one".into(),
+            ));
+        }
+        if routing.shard_count() > self.cfg.shard_count {
+            return Err(crate::Error::ShardConfig(format!(
+                "routing activates {} shards but this directory was provisioned for at most {}",
+                routing.shard_count(),
+                self.cfg.shard_count
+            )));
+        }
+        let mut current = self.routing.write().expect("routing lock");
+        if epoch < current.epoch {
+            return Err(crate::Error::ShardConfig(format!(
+                "routing epoch regressed from {} to {epoch}",
+                current.epoch
+            )));
+        }
+        if epoch == current.epoch && routing != current.routing {
+            return Err(crate::Error::ShardConfig(format!(
+                "routing epoch {epoch} has conflicting routing state"
+            )));
+        }
+        current.routing = routing;
+        current.epoch = epoch;
+        Ok(())
+    }
+
+    /// The primary's stream epoch, if capture is on.
     pub fn epoch(&self) -> Option<u64> {
         self.writers.positions().map(|p| p.epoch())
     }
@@ -659,6 +743,14 @@ impl ShardManager {
     /// Bring a shard's file into existence if it does not yet exist.
     pub fn ensure_open(&self, shard: ShardId) -> crate::Result<()> {
         self.writers.ensure_open(shard)
+    }
+
+    /// Wait behind all already queued writes for `shard`, then close its writer handles.
+    ///
+    /// Used after a transfer fence closes the gate: requests already committing finish, requests
+    /// that have not begun fail the gate, and completion of this barrier makes `last_lsn` final.
+    pub(crate) fn drain_writes(&self, shard: ShardId) -> crate::Result<()> {
+        self.writers.quiesce(shard).map(|_| ())
     }
 
     pub fn checkpoint_stats(&self) -> crate::storage::CheckpointStats {
@@ -683,7 +775,7 @@ impl ShardManager {
 
     /// Route a key to its shard.
     pub fn route(&self, key: &[u8]) -> ShardId {
-        shard_of(key, self.cfg.shard_count)
+        self.routing().route(key)
     }
 
     pub fn execute(
@@ -691,6 +783,7 @@ impl ShardManager {
         shard: ShardId,
         statements: Vec<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<crate::storage::exec::Outcome>> {
+        self.reject_shard_key_updates(&statements)?;
         self.writers.execute(shard, statements)
     }
 
@@ -701,6 +794,7 @@ impl ShardManager {
         shard: ShardId,
         statements: Vec<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<crate::storage::exec::Outcome>> {
+        self.reject_shard_key_updates(&statements)?;
         self.writers.execute_atomic(shard, statements)
     }
 
@@ -724,6 +818,7 @@ impl ShardManager {
         sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<crate::storage::exec::Outcome> {
         let statement = sql.into();
+        self.reject_shard_key_updates(std::slice::from_ref(&statement))?;
         // A shard this node does not own is run on its owner. This one seam makes every fan-out
         // built on execute_one (execute_all_shards, run_routed) work across hosts.
         if let Some(peer) = self.peer.get()
@@ -732,6 +827,22 @@ impl ShardManager {
             return peer.execute_remote(shard, statement);
         }
         self.writers.execute_one(shard, statement)
+    }
+
+    fn reject_shard_key_updates(
+        &self,
+        statements: &[crate::storage::exec::Statement],
+    ) -> crate::Result<()> {
+        let keys = self.shard_keys();
+        for statement in statements {
+            if let Some(key) = crate::query::route::shard_key_update(&statement.sql, &keys) {
+                return Err(crate::Error::Unsupported(format!(
+                    "the shard key column `{key}` cannot be updated; changing it would move a row \
+                     between SQLite files outside one transaction"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn query(
@@ -809,7 +920,7 @@ impl ShardManager {
         // Fan out the (identical) shard SQL to every shard — remote shards batched one request per
         // owner node — then apply the same per-shard handling to the results in shard order.
         let stmt = crate::storage::exec::Statement::new(shard_sql);
-        let mut parts = Vec::with_capacity(self.cfg.shard_count as usize);
+        let mut parts = Vec::with_capacity(self.shard_count() as usize);
         let mut grouped_rows = 0usize;
         for (s, outcome) in self.fan_out_shards(&stmt, false).into_iter().enumerate() {
             match outcome? {
@@ -858,7 +969,7 @@ impl ShardManager {
         statement: &crate::storage::exec::Statement,
         write: bool,
     ) -> Vec<crate::Result<crate::storage::exec::Outcome>> {
-        let n = self.cfg.shard_count;
+        let n = self.shard_count();
         let run_local = |id: ShardId| {
             if write {
                 self.writers.execute_one(id, statement.clone())
@@ -984,16 +1095,43 @@ impl ShardManager {
     /// must be reported, not swallowed.
     /// What every shard on this node says its schema version is.
     pub fn schema_agreement(&self) -> crate::Result<crate::storage::schema::Agreement> {
-        let mut versions = Vec::with_capacity(self.cfg.shard_count as usize);
-        for s in 0..self.cfg.shard_count {
+        let peer = self.peer.get();
+        let is_remote = |id: ShardId| peer.is_some_and(|p| !p.is_local(id));
+
+        let mut versions = Vec::with_capacity(self.shard_count() as usize);
+        for s in 0..self.shard_count() {
             let id = ShardId(s);
-            // A shard this node does not own cannot be asked, and its version is not this
-            // node's business — the owner enforces its own agreement.
+            // Owned by another node: asked of that node below, in one batched call.
+            if is_remote(id) {
+                continue;
+            }
+            // Neither led here nor owned elsewhere — a replica copy this node holds. Its
+            // owner enforces its own agreement, and a follower's version is whatever the
+            // frames have delivered so far, which is not an opinion about the schema.
             if self.modes.mode(id) != mode::ShardMode::Led {
                 continue;
             }
             versions.push((id, self.writers.schema(id, None)?));
         }
+
+        // The other half of the cluster. Without this the check sees only the shards this node
+        // leads, finds them in perfect agreement with each other, and lets a fan-out merge rows
+        // from a node whose schema has moved on — producing a result whose rows do not even
+        // agree on their own arity.
+        let remote: Vec<ShardId> = (0..self.shard_count())
+            .map(ShardId)
+            .filter(|&id| is_remote(id))
+            .collect();
+        if let Some(p) = peer
+            && !remote.is_empty()
+        {
+            for (id, version) in remote.iter().zip(p.schema_versions(&remote)) {
+                versions.push((*id, version?));
+            }
+        }
+
+        // `Agreement::of` takes the min and max, so the order shards were collected in does not
+        // matter.
         Ok(crate::storage::schema::Agreement::of(&versions))
     }
 
@@ -1049,7 +1187,7 @@ impl ShardManager {
     ) -> crate::Result<Vec<(ShardId, i64)>> {
         let ddl = ddl.into();
         let mut applied = Vec::new();
-        for s in 0..self.cfg.shard_count {
+        for s in 0..self.shard_count() {
             let id = ShardId(s);
             if self.modes.mode(id) != mode::ShardMode::Led {
                 continue;
@@ -1086,9 +1224,35 @@ impl ShardManager {
         sql: impl Into<crate::storage::exec::Statement>,
     ) -> crate::Result<Vec<(ShardId, crate::storage::exec::Outcome)>> {
         let statement = sql.into();
-        // Batched fan-out (one request per owner node) so DDL reaches every shard across hosts
-        // without one forward per shard.
-        let mut out = Vec::with_capacity(self.cfg.shard_count as usize);
+        if crate::db::Db::is_ddl(&statement.sql) {
+            // Do not send DDL through the ordinary write fan-out: schema_op is what advances
+            // each shard's durable version and makes an interrupted roll observable. This is
+            // one request per shard today; schema changes are infrequent and correctness is more
+            // important than disguising them as a generic batched write.
+            let peer = self.peer.get();
+            let mut out = Vec::with_capacity(self.shard_count() as usize);
+            for s in 0..self.shard_count() {
+                let id = ShardId(s);
+                if let Some(peer) = peer
+                    && !peer.is_local(id)
+                {
+                    peer.apply_ddl_remote(id, statement.clone())?;
+                } else {
+                    self.apply_ddl_to(id, statement.clone())?;
+                }
+                out.push((
+                    id,
+                    crate::storage::exec::Outcome::Ok(crate::storage::exec::Executed::Changed(
+                        crate::storage::exec::WriteOutcome::default(),
+                    )),
+                ));
+            }
+            self.adopt_shard_key_from_ddl(&statement.sql)?;
+            return Ok(out);
+        }
+
+        // Ordinary writes are batched one request per owner node.
+        let mut out = Vec::with_capacity(self.shard_count() as usize);
         for (s, outcome) in self
             .fan_out_shards(&statement, true)
             .into_iter()
@@ -1150,11 +1314,8 @@ impl ShardManager {
         }
 
         let is_write = matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE");
-        match crate::query::route_statement(
-            &statement.sql,
-            &self.shard_keys(),
-            self.cfg.shard_count,
-        ) {
+        match crate::query::route_statement_with(&statement.sql, &self.shard_keys(), self.routing())
+        {
             Route::One(s) => {
                 if is_write {
                     self.execute_one(ShardId(s), statement)
