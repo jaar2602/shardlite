@@ -267,6 +267,12 @@ impl HttpGateway {
             (Method::Get, "/v1/cluster/catalog") => {
                 self.route(&req, role, Requirement::Read, || self.catalog_json())
             }
+            (Method::Get, "/v1/tables") => {
+                self.route(&req, role, Requirement::Read, || self.tables_json())
+            }
+            (Method::Get, "/v1/transactions") => {
+                self.route(&req, role, Requirement::Read, || self.transactions_json())
+            }
             (Method::Get, "/v1/schema/agreement") => self.schema_agreement_route(role),
             (Method::Get, p) if p.starts_with("/v1/schema/") => {
                 self.schema_route(role, p.trim_start_matches("/v1/schema/"))
@@ -364,6 +370,9 @@ impl HttpGateway {
             "epoch": self.shards.epoch(),
             "version": env!("CARGO_PKG_VERSION"),
             "forwarding": self.services.router.is_some(),
+            // Strict is a property of the database, fixed at creation: a client that does not know
+            // it will be surprised by refusals it cannot explain.
+            "strict": self.shards.is_strict(),
         })
     }
 
@@ -1477,6 +1486,50 @@ impl HttpGateway {
             .schema_version(crate::shard::ShardId(shard))
             .map_err(|e| error_to_http(&e))?;
         Ok(serde_json::json!({ "shard": shard, "schema_version": version }))
+    }
+
+    /// How each known table is distributed, and by which column.
+    ///
+    /// A table's class decides what its constraints mean — a `global` table keeps SQLite's
+    /// `UNIQUE` and `FOREIGN KEY` because all its rows are in one file, a `sharded` one cannot —
+    /// so it belongs next to the schema rather than being invisible.
+    fn tables_json(&self) -> serde_json::Value {
+        let classes = self.shards.table_classes();
+        let keys = self.shards.shard_keys();
+        let mut names: Vec<String> = classes.keys().chain(keys.keys()).cloned().collect();
+        names.sort();
+        names.dedup();
+        let tables: Vec<serde_json::Value> = names
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "table": name,
+                    "class": crate::shard::classes::class_of(&classes, &name).as_str(),
+                    "shard_key": keys.get(&name),
+                })
+            })
+            .collect();
+        serde_json::json!({ "api_version": 1, "tables": tables })
+    }
+
+    /// Cross-shard transactions this node has not finished resolving. Normally empty.
+    fn transactions_json(&self) -> serde_json::Value {
+        let pending: Vec<serde_json::Value> = self
+            .shards
+            .pending_transactions()
+            .into_iter()
+            .map(|record| {
+                serde_json::json!({
+                    "id": record.id,
+                    "shards": record.shards().into_iter().map(|s| s.0).collect::<Vec<_>>(),
+                    "ddl": record.ddl,
+                    // No decision means nothing committed: the decision is made durable before the
+                    // first participant commits, so recovery will roll it back.
+                    "decided": record.decision.is_some(),
+                })
+            })
+            .collect();
+        serde_json::json!({ "api_version": 1, "unresolved": pending })
     }
 
     /// Cluster-wide schema agreement across the shards this node leads: `agreed` at one version, or

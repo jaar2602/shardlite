@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../lib/api";
-import { Banner, Button, EmptyState, Page, PageHeader, Sparkline, Spinner, TextInput } from "../components/ui";
+import { Banner, Button, Card, EmptyState, Page, PageHeader, Sparkline, Spinner, TextInput } from "../components/ui";
+import ClusterTopologyPanel from "../components/ClusterTopologyPanel";
 
 // Flatten nested stats into dotted numeric leaves, e.g. { "writer.batches": 12, ... }.
 function flatten(obj: unknown, prefix = ""): Record<string, number> {
@@ -55,10 +56,38 @@ export default function Stats({ name }: { name: string }) {
     bySource.set(source, [...(bySource.get(source) ?? []), sample]);
   }
 
+  // The topology panel keys by node id; metric samples key by source address. Match on the node id
+  // appearing anywhere in the source string, which is how the console labels them.
+  const latestBySource = new Map<string, api.MetricSample>();
+  for (const [source, list] of bySource) {
+    const latest = list[list.length - 1];
+    latestBySource.set(source, latest);
+    const digits = source.match(/node\s*(\d+)|\b(\d+)\b/);
+    if (digits) latestBySource.set(digits[1] ?? digits[2], latest);
+  }
+
   return (
     <Page>
       <PageHeader eyebrow="Telemetry / sampled locally" title="Metrics" description={`Showing ${samples.length} samples, approximately ${Math.max(1, Math.round((samples.length * 5) / 60))} minutes. History is collected by the console, not stored by ShardLite.`} actions={<Button variant="secondary" onClick={() => void load()}>Refresh now</Button>} />
       {error && <Banner tone="error">Refresh failed; showing the last collected samples. {error}</Banner>}
+
+      {/* Metrics are per node, so show which nodes they came from — the numbers below mean
+          something different once you know one node holds a third of the shards. */}
+      <Card title="Cluster">
+        <ClusterTopologyPanel
+          name={name}
+          caption={(nodeId) => {
+            const latest = latestBySource.get(nodeId);
+            if (!latest) return null;
+            const flat = flatten(latest.stats);
+            const batches = flat["writer.batches"] ?? flat["writer_fleet.batches"];
+            const requests = flat["writer.requests"] ?? flat["writer_fleet.requests"];
+            if (batches === undefined && requests === undefined) return `${Object.keys(flat).length} metrics`;
+            return `${requests ?? 0} writes · ${batches ?? 0} batches`;
+          }}
+        />
+      </Card>
+
       <div className="flex flex-wrap items-end justify-between gap-3"><div className="w-full max-w-sm"><TextInput label="Find a metric" placeholder="writer, raft, cache…" value={filter} onChange={(event) => setFilter(event.target.value)} /></div><span className="font-mono text-xs text-carbon-text-3">updates every 5s</span></div>
       <div className="space-y-7">
         {Array.from(bySource).map(([source, sourceSamples]) => {

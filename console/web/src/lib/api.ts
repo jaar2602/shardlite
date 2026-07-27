@@ -363,6 +363,38 @@ export interface NodeInfo {
   epoch?: number | null;
   version?: string;
   forwarding?: boolean;
+  /// Strict databases refuse statements that would otherwise leave a choice to shardlite —
+  /// a LIMIT with no ORDER BY, a CREATE TABLE with no declared class. Fixed at creation.
+  strict?: boolean;
+}
+
+/// How a table is distributed. A `global` table lives on one shard and keeps SQLite's UNIQUE and
+/// FOREIGN KEY; a `sharded` one cannot, which is why those constraints are refused at CREATE TABLE.
+export type TableClass = "sharded" | "global";
+
+export interface TableDistribution {
+  table: string;
+  class: TableClass;
+  shard_key?: string | null;
+}
+
+export interface TableDistributions {
+  api_version: number;
+  tables: TableDistribution[];
+}
+
+/// A cross-shard transaction that has not finished resolving. Normally none: a record exists only
+/// between the durable decision and the last participant's commit.
+export interface UnresolvedTransaction {
+  id: number;
+  shards: number[];
+  ddl: boolean;
+  decided: boolean;
+}
+
+export interface UnresolvedTransactions {
+  api_version: number;
+  unresolved: UnresolvedTransaction[];
 }
 
 export type ReadConsistency = "linearizable" | "stale" | { at_least_lsn: number };
@@ -562,6 +594,8 @@ export function conn(name: string) {
       req<TablePlacement>("GET", `${b}/tables/${encodeURIComponent(table)}/placement`),
     verifyNode: (endpoint: string) => req<NodeVerification>("POST", `${b}/verify-node`, { endpoint }),
     shardInventory: () => req<ShardInventory>("GET", `${b}/shard-inventory`),
+    tableDistribution: () => req<TableDistributions>("GET", `${b}/tables`),
+    transactions: () => req<UnresolvedTransactions>("GET", `${b}/transactions`),
     meshUsers: {
       list: () => req<{ users: { name: string; role: string }[] }>("GET", `${b}/users`),
       create: (name: string, secret: string, role: string) =>

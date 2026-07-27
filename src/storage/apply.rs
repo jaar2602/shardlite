@@ -108,3 +108,99 @@ fn apply_atomic_group(
     sp.commit().map_err(|e| e.to_string())?;
     Ok(outcomes)
 }
+
+/// The table recording which cross-shard transactions this shard has applied.
+///
+/// Written **inside** the same transaction as the data, which is what makes "did shard 3 apply
+/// transaction 91?" answerable after any crash. Recovery needs that question answered, because
+/// SQLite has no `PREPARE TRANSACTION`: a transaction open when the process dies is rolled back,
+/// so recovery cannot commit a prepared transaction — it can only re-apply, and re-applying is
+/// only safe if it can tell what already landed.
+pub const TXN_TABLE: &str = "_shardlite_txn";
+
+/// What a prepare produced. The transaction is left **open** on `conn` when this is `Prepared`.
+pub enum Prepared {
+    /// Every statement applied. The transaction is open and awaiting a decision.
+    Prepared(Vec<Outcome>),
+    /// A statement was rejected; the transaction has already been rolled back.
+    Rejected(String),
+}
+
+/// Run `statements` inside a new transaction and leave it open, awaiting a decision.
+///
+/// Raw `BEGIN IMMEDIATE` rather than [`rusqlite::Transaction`] on purpose: a `Transaction` borrows
+/// the connection, so one could not be held across writer-thread batches without a self-referential
+/// borrow. Keeping the transaction state inside SQLite instead of inside a Rust lifetime is what
+/// makes a prepared shard parkable at all.
+///
+/// A rejection rolls back before returning, so the caller never has to abort a prepare that failed.
+pub fn prepare_group(
+    conn: &Connection,
+    txn_id: u64,
+    statements: &[Statement],
+    bump_schema_version: bool,
+) -> std::result::Result<Prepared, String> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| e.to_string())?;
+
+    let rollback = |msg: String| -> std::result::Result<Prepared, String> {
+        let _ = conn.execute_batch("ROLLBACK");
+        Ok(Prepared::Rejected(msg))
+    };
+
+    if let Err(e) = conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {TXN_TABLE} (id INTEGER PRIMARY KEY)"
+    )) {
+        return rollback(e.to_string());
+    }
+
+    let mut outcomes = Vec::with_capacity(statements.len());
+    for statement in statements {
+        match exec::run(conn, statement) {
+            Ok(executed) => outcomes.push(Outcome::Ok(executed)),
+            Err(SqlError::Logic(msg)) => return rollback(msg),
+            Err(SqlError::Fatal(e)) => return rollback(e.to_string()),
+        }
+    }
+
+    if bump_schema_version {
+        let next = match crate::storage::schema::version_of(conn) {
+            Ok(v) => v + 1,
+            Err(e) => return rollback(e.to_string()),
+        };
+        // Inside the transaction, so schema and version move together or not at all.
+        if let Err(e) = conn.execute_batch(&format!("PRAGMA user_version = {next}")) {
+            return rollback(e.to_string());
+        }
+    }
+
+    // The marker lands with the data, so a crash cannot separate them.
+    if let Err(e) = conn.execute(
+        &format!("INSERT OR IGNORE INTO {TXN_TABLE} (id) VALUES (?1)"),
+        [txn_id as i64],
+    ) {
+        return rollback(e.to_string());
+    }
+
+    Ok(Prepared::Prepared(outcomes))
+}
+
+/// Commit or roll back a transaction left open by [`prepare_group`].
+pub fn finish_prepared(conn: &Connection, commit: bool) -> std::result::Result<(), String> {
+    let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+    conn.execute_batch(sql).map_err(|e| e.to_string())
+}
+
+/// Whether this shard has already applied `txn_id` — the question recovery asks before re-applying.
+pub fn has_applied(conn: &Connection, txn_id: u64) -> std::result::Result<bool, String> {
+    let exists: std::result::Result<i64, _> = conn.query_row(
+        &format!("SELECT COUNT(*) FROM {TXN_TABLE} WHERE id = ?1"),
+        [txn_id as i64],
+        |row| row.get(0),
+    );
+    match exists {
+        Ok(n) => Ok(n > 0),
+        // No marker table means nothing was ever applied through the two-phase path.
+        Err(_) => Ok(false),
+    }
+}

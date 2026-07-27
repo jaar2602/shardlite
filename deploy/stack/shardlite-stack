@@ -8,6 +8,7 @@
 #   ./shardlite-stack restart     restart the running services
 #   ./shardlite-stack status      show container + health status
 #   ./shardlite-stack logs [svc]  follow logs (all services, or one: node1|node2|node3|console)
+#   ./shardlite-stack ingest      load a demo dataset into the running cluster (see ./ingest.sh)
 #   ./shardlite-stack register    (re)register the cluster as a console connection
 #   ./shardlite-stack destroy     stop AND delete all volumes + secrets (irreversible)
 #
@@ -77,7 +78,10 @@ wait_for_console() {
 register_connection() {
   load_env
   local jar; jar="$(mktemp)"
-  trap 'rm -f "$jar"' RETURN
+  # Expand $jar now, not when the trap fires: by then the local has left scope and `set -u`
+  # aborts with "jar: unbound variable" — after the work succeeded, so it reads like a failure.
+  # shellcheck disable=SC2064
+  trap "rm -f '$jar'" RETURN
 
   local login
   login="$(curl -fsS -c "$jar" -X POST "${CONSOLE_URL}/api/login" \
@@ -140,6 +144,11 @@ cmd_restart() { "${DC[@]}" restart; echo "==> restarted."; }
 cmd_status()  { "${DC[@]}" ps; }
 cmd_logs()    { "${DC[@]}" logs -f "${1:-}"; }
 
+cmd_ingest() {
+  [ -x ./ingest.sh ] || { echo "error: ./ingest.sh is missing or not executable" >&2; exit 1; }
+  ./ingest.sh "$@"
+}
+
 cmd_destroy() {
   echo "This deletes the cluster data, the console's users/connections/AI settings, AND ./.env."
   read -r -p "Type 'destroy' to confirm: " reply
@@ -156,6 +165,7 @@ case "${1:-}" in
   down)      cmd_down ;;
   restart)   cmd_restart ;;
   status|ps) cmd_status ;;
+  ingest)    shift; cmd_ingest "$@" ;;
   logs)      shift; cmd_logs "${1:-}" ;;
   register)  wait_for_console || true; register_connection ;;
   destroy)   cmd_destroy ;;

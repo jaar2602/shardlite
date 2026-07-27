@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
-import { LegendDot, ShardTopology, groupByOwner } from "../components/ShardTopology";
+import ClusterTopologyPanel, { LegendDot } from "../components/ClusterTopologyPanel";
 
 export default function ShardInventory({ name }: { name: string }) {
   const { me } = useAuth();
@@ -38,11 +38,7 @@ export default function ShardInventory({ name }: { name: string }) {
     !filter || String(row.id).includes(filter) || (row.owner ?? "").toLowerCase().includes(filter.toLowerCase()) || row.state.includes(filter.toLowerCase()),
   ), [filter, rows]);
   const selected = rows.find((row) => row.id === selectedId);
-  const topologyNodes = useMemo(() => groupByOwner(rows, (row) => ({
-    tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
-    label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
-    title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
-  })), [rows]);
+  const byShard = useMemo(() => new Map(rows.map((row) => [row.id, row])), [rows]);
   const unavailable = rows.filter((row) => row.state === "unavailable").length;
   const lagging = rows.filter((row) => (row.max_lag ?? 0) > 0).length;
   const rowHeight = 42;
@@ -84,11 +80,27 @@ export default function ShardInventory({ name }: { name: string }) {
       <section>
         <div className="mb-3 flex flex-wrap items-end justify-between gap-3"><div className="w-full max-w-sm"><TextInput label="Find a storage unit" placeholder="Unit ID, owner, or state" value={filter} onChange={(event) => { setFilter(event.target.value); setScrollTop(0); }} /></div><div className="flex items-center gap-3"><span className="font-mono text-xs text-carbon-text-3">showing {filtered.length} of {rows.length}</span><ViewToggle view={view} onChange={setView} /></div></div>
         {view === "topology" ? (
-          <ShardTopology
-            nodes={topologyNodes}
-            selected={selectedId}
-            onSelect={(shard) => { setSelectedId(shard); setWal(null); setMaintenance(null); }}
+          <ClusterTopologyPanel
+            name={name}
+            selectedShard={selectedId}
+            onSelectShard={(shard) => { setSelectedId(shard); setWal(null); setMaintenance(null); }}
             legend={<><LegendDot tone="green">healthy</LegendDot><LegendDot tone="yellow">lagging</LegendDot><LegendDot tone="red">unavailable/degraded</LegendDot></>}
+            caption={(_node, shards) => {
+              const owned = shards.map((s) => byShard.get(s)).filter((r): r is api.ShardInventoryRow => !!r);
+              if (owned.length === 0) return null;
+              const bad = owned.filter((r) => r.state !== "available").length;
+              const behind = owned.filter((r) => (r.max_lag ?? 0) > 0).length;
+              return bad || behind ? `${bad} unavailable · ${behind} lagging` : "all available";
+            }}
+            annotateShard={(shard) => {
+              const row = byShard.get(shard);
+              if (!row) return null;
+              return {
+                tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
+                label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
+                title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
+              };
+            }}
           />
         ) : (
         <div className="overflow-x-auto border border-carbon-border text-xs">

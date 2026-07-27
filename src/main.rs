@@ -769,11 +769,16 @@ fn has_flag(args: &[String], name: &str) -> bool {
 
 const INIT_USAGE: &str = "usage:
   shardlite init <data-dir> [--node-id N] [--listen ADDR]
-                 [--initial-shards N] [--capacity N]
+                 [--initial-shards N] [--capacity N] [--strict]
 
 Creates a dynamic cluster. It starts with one logical shard by default and can activate more
 through linear splits. --capacity reserves the local shard-id ceiling (default 256); it does not
-create or open that many SQLite files.";
+create or open that many SQLite files.
+
+--strict refuses any statement where shardlite would otherwise choose on your behalf: a LIMIT with
+no ORDER BY, a CREATE TABLE with no declared table class, or a query that would fall back to
+running on the coordinator. It never changes an answer, only which statements are accepted, and it
+is fixed for the life of the database.";
 
 fn init_cluster_cmd(args: &[String]) -> ExitCode {
     let pos = positionals(&args[1..]);
@@ -818,8 +823,12 @@ fn init_cluster_cmd(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let strict = has_flag(args, "--strict");
     let result = (|| -> shardlite::Result<shardlite::cluster::Catalog> {
         Manifest::open_or_create(&dir, capacity)?;
+        if strict {
+            shardlite::shard::mark_strict(&dir)?;
+        }
         let compatibility = shardlite::cluster::Compatibility::current(routing)?;
         let mut catalog = shardlite::cluster::Catalog::bootstrap(
             shardlite::cluster::ClusterId::generate(node),

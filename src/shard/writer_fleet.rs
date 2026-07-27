@@ -34,8 +34,36 @@ struct Pending {
     reply: SyncSender<Result<Vec<Outcome>>>,
 }
 
+/// What a prepare produced, as seen by the coordinator.
+pub enum PrepareReply {
+    /// Applied and awaiting a decision. The shard's transaction is open until [`Job::Decide`].
+    Prepared(Vec<Outcome>),
+    /// Refused; the shard's transaction is already rolled back and it is not parked.
+    Rejected(String),
+}
+
 enum Job {
     Write(Pending),
+    /// Phase one of a cross-shard write: apply `statements` and hold the transaction open.
+    ///
+    /// The shard is **parked** until a [`Job::Decide`] arrives — ordinary writes queued for it in
+    /// the meantime are held rather than run, because a second `BEGIN` on a connection that is
+    /// already in a transaction is an error, and joining them into the open transaction would let
+    /// an unrelated write be committed or rolled back by someone else's decision.
+    Prepare {
+        shard: ShardId,
+        txn: u64,
+        statements: Vec<Statement>,
+        /// Bump the shard's schema version inside the same transaction (a DDL statement).
+        ddl: bool,
+        reply: SyncSender<Result<PrepareReply>>,
+    },
+    /// Phase two: commit or roll back a parked shard, then release the writes held behind it.
+    Decide {
+        shard: ShardId,
+        commit: bool,
+        reply: SyncSender<Result<()>>,
+    },
     /// Ensure a shard's database file exists, so a reader may open it.
     ///
     /// Measured on 3.53.2, and not what was first assumed here:
@@ -324,6 +352,50 @@ impl WriterFleet {
         reply_rx.recv().map_err(|_| Error::WriterGone)?
     }
 
+    /// Phase one of a cross-shard write on one shard: apply and hold, without committing.
+    ///
+    /// Every prepare **must** be followed by [`Self::decide`], or the shard stays parked and its
+    /// queued writes never run. The coordinator in [`crate::shard::ShardManager`] guarantees that
+    /// pairing; nothing else should call this.
+    pub fn prepare(
+        &self,
+        shard: ShardId,
+        txn: u64,
+        statements: Vec<Statement>,
+        ddl: bool,
+    ) -> Result<PrepareReply> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .try_send(Job::Prepare {
+                shard,
+                txn,
+                statements,
+                ddl,
+                reply: reply_tx,
+            })
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Error::WriterBusy,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Error::WriterGone,
+            })?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
+    /// Phase two: commit or roll back a shard parked by [`Self::prepare`].
+    pub fn decide(&self, shard: ShardId, commit: bool) -> Result<()> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender(shard)?
+            .try_send(Job::Decide {
+                shard,
+                commit,
+                reply: reply_tx,
+            })
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Error::WriterBusy,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Error::WriterGone,
+            })?;
+        reply_rx.recv().map_err(|_| Error::WriterGone)?
+    }
+
     pub fn execute_one(&self, shard: ShardId, sql: impl Into<Statement>) -> Result<Outcome> {
         let mut out = self.execute(shard, vec![sql.into()])?;
         Ok(out.pop().expect("one request yields one outcome"))
@@ -543,6 +615,13 @@ struct ThreadCtx {
 
 fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
     let mut open: Lru<OpenShard> = Lru::new(ctx.capacity);
+    // Shards with a transaction open, awaiting a decision, and the ordinary writes queued behind
+    // them. A parked shard blocks only itself: this thread keeps serving its other shards, which
+    // is the whole reason the transaction is parked rather than the thread being blocked on the
+    // coordinator's decision.
+    let mut parked: std::collections::HashSet<ShardId> = std::collections::HashSet::new();
+    let mut held: std::collections::HashMap<ShardId, Vec<Pending>> =
+        std::collections::HashMap::new();
 
     loop {
         let first = match rx.recv() {
@@ -586,6 +665,28 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                 let _ = reply.send(closed);
                 continue;
             }
+            Job::Prepare {
+                shard,
+                txn,
+                statements,
+                ddl,
+                reply,
+            } => {
+                let outcome =
+                    prepare_shard(&mut open, &ctx, &mut parked, shard, txn, &statements, ddl);
+                let _ = reply.send(outcome);
+                continue;
+            }
+            Job::Decide {
+                shard,
+                commit,
+                reply,
+            } => {
+                let outcome = decide_shard(&mut open, &ctx, &mut parked, shard, commit);
+                let _ = reply.send(outcome);
+                release_held(&mut open, &ctx, &mut held, shard);
+                continue;
+            }
             Job::Shutdown => return,
         }
 
@@ -620,6 +721,26 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
                     let closed = open.remove(shard).is_some();
                     let _ = reply.send(closed);
                 }
+                Ok(Job::Prepare {
+                    shard,
+                    txn,
+                    statements,
+                    ddl,
+                    reply,
+                }) => {
+                    let outcome =
+                        prepare_shard(&mut open, &ctx, &mut parked, shard, txn, &statements, ddl);
+                    let _ = reply.send(outcome);
+                }
+                Ok(Job::Decide {
+                    shard,
+                    commit,
+                    reply,
+                }) => {
+                    let outcome = decide_shard(&mut open, &ctx, &mut parked, shard, commit);
+                    let _ = reply.send(outcome);
+                    release_held(&mut open, &ctx, &mut held, shard);
+                }
                 Ok(Job::Shutdown) => {
                     // Honour it only after the batch in hand commits — dropping it would
                     // lose writes callers are still blocked on.
@@ -650,12 +771,105 @@ fn writer_loop(rx: Receiver<Job>, ctx: ThreadCtx) {
         }
 
         for (shard, group) in by_shard {
+            // A parked shard is mid-transaction. Its work waits for the decision rather than
+            // joining a transaction someone else will commit or roll back.
+            if parked.contains(&shard) {
+                held.entry(shard).or_default().extend(group);
+                continue;
+            }
             apply_shard_batch(&mut open, &ctx, shard, group);
         }
 
         if stopping {
             return;
         }
+    }
+}
+
+/// Phase one on one shard: apply the statements and leave the transaction open.
+///
+/// The leadership gate is taken here, before the transaction opens, for the same reason the batch
+/// path takes it there — a writer that discovers it may not write only after committing has
+/// already written to a file another node may own. It is taken **again** at the decision, because
+/// a parked transaction reopens that window: leadership can be lost while the shard is waiting.
+fn prepare_shard(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    parked: &mut std::collections::HashSet<ShardId>,
+    shard: ShardId,
+    txn: u64,
+    statements: &[Statement],
+    ddl: bool,
+) -> Result<PrepareReply> {
+    if parked.contains(&shard) {
+        // Two cross-shard transactions overlapping on one shard would each be able to commit the
+        // other's work. The coordinator serialises them; this is the assertion that it did.
+        return Err(Error::Protocol(format!(
+            "shard {shard} is already prepared for another transaction"
+        )));
+    }
+
+    let entry = ensure_shard(open, ctx, shard)?;
+    if let Some(gate) = &ctx.gate {
+        gate.check_may_write(shard)?;
+    }
+
+    match crate::storage::apply::prepare_group(&entry.conn, txn, statements, ddl) {
+        Ok(crate::storage::apply::Prepared::Prepared(outcomes)) => {
+            parked.insert(shard);
+            Ok(PrepareReply::Prepared(outcomes))
+        }
+        // Already rolled back by `prepare_group`, so the shard was never parked.
+        Ok(crate::storage::apply::Prepared::Rejected(msg)) => Ok(PrepareReply::Rejected(msg)),
+        Err(msg) => Err(Error::Protocol(msg)),
+    }
+}
+
+/// Phase two on one shard: commit or roll back, then hand any frames to the replication sink.
+fn decide_shard(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    parked: &mut std::collections::HashSet<ShardId>,
+    shard: ShardId,
+    commit: bool,
+) -> Result<()> {
+    if !parked.remove(&shard) {
+        // Nothing to decide. Not an error: a prepare that was rejected rolled itself back, and the
+        // coordinator still tells every participant to abort so it never has to track which.
+        return Ok(());
+    }
+    let entry = ensure_shard(open, ctx, shard)?;
+
+    // A commit by a leader that has since been deposed writes to a file another node may own. The
+    // decision is the last moment this can be caught, so roll back instead.
+    let commit = if commit {
+        match &ctx.gate {
+            Some(gate) => gate.check_may_write(shard).is_ok(),
+            None => true,
+        }
+    } else {
+        false
+    };
+
+    crate::storage::apply::finish_prepared(&entry.conn, commit).map_err(Error::Protocol)?;
+    if commit {
+        // Same invariant the batch path holds: an acknowledged write has reached the stream.
+        drain_capture(entry, ctx, shard)?;
+    }
+    Ok(())
+}
+
+/// Run the writes that queued behind a parked shard, now that its transaction has finished.
+fn release_held(
+    open: &mut Lru<OpenShard>,
+    ctx: &ThreadCtx,
+    held: &mut std::collections::HashMap<ShardId, Vec<Pending>>,
+    shard: ShardId,
+) {
+    if let Some(group) = held.remove(&shard)
+        && !group.is_empty()
+    {
+        apply_shard_batch(open, ctx, shard, group);
     }
 }
 

@@ -1735,7 +1735,11 @@ fn proxy_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         | ("GET", ["replication" | "config"])
         | ("GET", ["cluster", "catalog"])
         | ("GET", ["s3", "status"])
-        | ("GET", ["schema", _]) => Some(Permission::Observe),
+        | ("GET", ["schema", _])
+        // How each table is distributed (sharded vs global) and any unresolved cross-shard
+        // transaction — both are read-only facts about the database's current state.
+        | ("GET", ["tables"])
+        | ("GET", ["transactions"]) => Some(Permission::Observe),
         ("POST", ["query" | "query_all" | "route" | "explain"]) => Some(Permission::Query),
         // /v1/run auto-routes and can write, so it needs write permission.
         ("POST", ["execute" | "tx" | "run"]) => Some(Permission::Write),

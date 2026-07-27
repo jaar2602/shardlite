@@ -226,6 +226,28 @@ pub struct PostProcess {
     pub offset: usize,
     /// Rows to keep after skipping.
     pub limit: Option<usize>,
+    /// How rows that tie on `order_by` are ordered, so the result does not depend on shard count.
+    pub tiebreak: Tiebreak,
+}
+
+/// The final ordering applied once the explicit `ORDER BY` keys compare equal.
+///
+/// Tied rows would otherwise keep concatenation order — which is shard order — so which rows a
+/// `LIMIT` returns would change with the shard count. Whichever variant is chosen, `shard_sql` is
+/// rewritten to ask each shard for the *same* order, so a per-shard `LIMIT` ships exactly the rows
+/// the coordinator needs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tiebreak {
+    /// None available: the projection is a wildcard and the table has no declared shard key, so
+    /// there is no column that can be named to both sides. Ties keep concatenation order.
+    None,
+    /// Compare whole rows. Pairs with a shard `ORDER BY` over every output column by ordinal,
+    /// which is the same order — available whenever the projection width is statically known.
+    WholeRow,
+    /// Compare this column, resolved against the result's column names at merge time, then whole
+    /// rows. Pairs with a shard `ORDER BY` on the same column. Used for a wildcard projection,
+    /// whose width is not known until the rows come back.
+    Column(String),
 }
 
 /// A set operation (`UNION` / `INTERSECT` / `EXCEPT`, in any mix), evaluated by fanning out each
@@ -457,6 +479,22 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
         }
     };
 
+    // A query with no FROM reads no shard data at all — `SELECT 1`, `SELECT date(…)`, or a
+    // projection left constant after subquery substitution. Every shard would compute the same
+    // rows, so a fan-out returns one identical copy per shard. It runs on a single shard and
+    // answers once, at any shard count.
+    if select.from.is_empty() {
+        return Ok(Plan::SingleShard);
+    }
+
+    // A window function is defined over a frame of *all* rows the query sees. Pushed to each shard
+    // it silently computes a per-shard frame instead — `row_number()` restarts from 1 on every
+    // shard and the results concatenate — which is a wrong answer rather than a slow one. Central
+    // execution materialises the sources and evaluates the window once, over the whole set.
+    if has_window_function(query) {
+        return plan_central(query);
+    }
+
     // If the FROM cannot be pushed to each shard — a derived table, or a join that is not
     // co-located — fall back to central execution: materialise each source on the coordinator and
     // run the whole query there. Otherwise the FROM is a single table or a co-located join and the
@@ -499,9 +537,23 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
     let (limit, offset) = limit_and_offset(query)?;
     let keys = resolve_sort_keys(&query.order_by, &select.projection)?;
 
-    // OFFSET is skipped on the coordinator; each shard ships its top (offset+limit) rows. Without
-    // an ORDER BY the rows skipped and returned are unspecified — exactly as for a bare LIMIT — but
-    // still a valid answer, so it is allowed rather than refused.
+    // Which rows a `LIMIT` returns, and how ties in an `ORDER BY` are broken, must not depend on
+    // how many shards answered. Both shard and coordinator are given the same total order — see
+    // `Tiebreak` for how the two are kept in step.
+    let tiebreak = choose_tiebreak(select, shard_keys);
+    if !matches!(tiebreak, Tiebreak::None) {
+        return Ok(Plan::PostProcess(Box::new(PostProcess {
+            shard_sql: shard_sql_ordered(query, limit.map(|n| n + offset), &tiebreak),
+            distinct: false,
+            order_by: keys,
+            offset,
+            limit,
+            tiebreak,
+        })));
+    }
+
+    // No column can be named to both sides. OFFSET is still skipped on the coordinator; each shard
+    // ships its top (offset+limit) rows.
     if offset > 0 {
         return Ok(Plan::PostProcess(Box::new(PostProcess {
             shard_sql: shard_sql_with_limit(query, limit.map(|n| n + offset)),
@@ -509,6 +561,7 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
             order_by: keys,
             offset,
             limit,
+            tiebreak: Tiebreak::None,
         })));
     }
 
@@ -516,6 +569,88 @@ fn plan_query(query: &Query, shard_keys: &ShardKeys) -> std::result::Result<Plan
         Ok(Plan::Concat { limit })
     } else {
         Ok(Plan::Merge { keys, limit })
+    }
+}
+
+/// Pick the tiebreak that can be expressed to both the shards and the coordinator.
+///
+/// A statically known projection width lets both sides order by every output column. A wildcard
+/// cannot, so it falls back to the table's declared shard key — a column `*` is guaranteed to
+/// include. With neither, there is nothing both sides can name.
+fn choose_tiebreak(select: &Select, shard_keys: &ShardKeys) -> Tiebreak {
+    if projection_width(&select.projection).is_some() {
+        return Tiebreak::WholeRow;
+    }
+    match single_table(select).and_then(|t| shard_keys.get(&t.to_ascii_lowercase()).cloned()) {
+        Some(key) => Tiebreak::Column(key),
+        None => Tiebreak::None,
+    }
+}
+
+/// The one table this `SELECT` reads, if it reads exactly one and joins nothing.
+fn single_table(select: &Select) -> Option<String> {
+    match select.from.as_slice() {
+        [only] if only.joins.is_empty() => match &only.relation {
+            TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The number of output columns, when the projection has a statically known width.
+///
+/// A wildcard expands at execution time against each shard's schema, so its width is not known
+/// until the rows come back — which is why a wildcard projection cannot be given the ordinal sort
+/// that [`shard_sql_ordered`] writes.
+fn projection_width(projection: &[SelectItem]) -> Option<usize> {
+    let has_wildcard = projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    });
+    (!has_wildcard).then_some(projection.len())
+}
+
+/// Render `query` for the shards with `tiebreak`'s order appended, and `limit` applied.
+///
+/// The appended terms are the same order the coordinator applies after the user's keys, so a
+/// per-shard `LIMIT` ships exactly the rows the coordinator needs. Without this each shard would
+/// pick its own arbitrary rows and the merged answer would depend on the shard count.
+///
+/// `LIMIT` is dropped before rendering and re-appended, so the added terms land inside the
+/// `ORDER BY` clause rather than after the limit.
+fn shard_sql_ordered(query: &Query, limit: Option<usize>, tiebreak: &Tiebreak) -> String {
+    let mut q = query.clone();
+    q.limit_clause = None;
+    let mut base = q.to_string();
+
+    let terms = match tiebreak {
+        Tiebreak::None => String::new(),
+        Tiebreak::Column(name) => name.clone(),
+        Tiebreak::WholeRow => {
+            let width = match q.body.as_ref() {
+                SetExpr::Select(s) => projection_width(&s.projection).unwrap_or(0),
+                _ => 0,
+            };
+            (1..=width)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    if !terms.is_empty() {
+        if q.order_by.is_some() {
+            base.push_str(&format!(", {terms}"));
+        } else {
+            base.push_str(&format!(" ORDER BY {terms}"));
+        }
+    }
+
+    match limit {
+        Some(n) => format!("{base} LIMIT {n}"),
+        None => base,
     }
 }
 
@@ -603,12 +738,17 @@ fn plan_distinct(
     } else {
         limit.map(|n| n + offset)
     };
+    let tiebreak = choose_tiebreak(select, shard_keys);
     Ok(Plan::PostProcess(Box::new(PostProcess {
-        shard_sql: shard_sql_with_limit(query, push),
+        shard_sql: match tiebreak {
+            Tiebreak::None => shard_sql_with_limit(query, push),
+            _ => shard_sql_ordered(query, push, &tiebreak),
+        },
         distinct: true,
         order_by: keys,
         offset,
         limit,
+        tiebreak,
     })))
 }
 
@@ -1310,6 +1450,19 @@ fn plan_central_grouped(query: &Query, select: &Select) -> std::result::Result<P
     })))
 }
 
+/// Whether any expression in the query carries an `OVER` clause.
+///
+/// Checked over the whole query rather than just the projection: SQLite also allows a window
+/// function in `ORDER BY`, and a windowed call can be nested inside another expression
+/// (`abs(row_number() OVER ())`).
+fn has_window_function(query: &Query) -> bool {
+    visit_expressions(query, |e| match e {
+        Expr::Function(f) if f.over.is_some() => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
 /// Every column identifier referenced anywhere in the query, quoted and de-duplicated in first-seen
 /// order — used to project a central source down to just the columns the coordinator query reads.
 fn referenced_columns(query: &Query) -> Vec<String> {
@@ -1765,6 +1918,9 @@ fn classify_aggregate(
     f: &sqlparser::ast::Function,
 ) -> std::result::Result<Option<AggChoice>, Unsupported> {
     let name = f.name.to_string().to_ascii_uppercase();
+    if !is_aggregate_call(&name, f) {
+        return Ok(None);
+    }
     match name.as_str() {
         "COUNT" | "SUM" | "TOTAL" => Ok(Some(AggChoice::Simple(Combine::Sum))),
         "MIN" => Ok(Some(AggChoice::Simple(Combine::Min))),
@@ -1774,11 +1930,10 @@ fn classify_aggregate(
             what: "GROUP_CONCAT",
             why: "the order of concatenation across shards is not defined",
         }),
-        _ if is_aggregate_shaped(f) => Err(Unsupported {
+        _ => Err(Unsupported {
             what: "this aggregate",
             why: "only COUNT, SUM, MIN, MAX and AVG combine correctly from partial results",
         }),
-        _ => Ok(None),
     }
 }
 
@@ -1832,6 +1987,9 @@ fn aggregate_of(item: &SelectItem) -> std::result::Result<Option<Combine>, Unsup
     };
 
     let name = f.name.to_string().to_ascii_uppercase();
+    if !is_aggregate_call(&name, f) {
+        return Ok(None);
+    }
     match name.as_str() {
         // Associative: a combination of partial results is the global result.
         "COUNT" | "SUM" | "TOTAL" => Ok(Some(Combine::Sum)),
@@ -1846,28 +2004,48 @@ fn aggregate_of(item: &SelectItem) -> std::result::Result<Option<Combine>, Unsup
             what: "GROUP_CONCAT",
             why: "the order of concatenation across shards is not defined",
         }),
-        _ if is_aggregate_shaped(f) => Err(Unsupported {
+        _ => Err(Unsupported {
             what: "this aggregate",
             why: "only COUNT, SUM, MIN and MAX combine correctly from partial results",
         }),
-        _ => Ok(None),
     }
 }
 
-/// A crude check for "looks like an aggregate call", used only to decide whether an unknown
-/// function should be refused rather than treated as a scalar.
-fn is_aggregate_shaped(f: &sqlparser::ast::Function) -> bool {
-    matches!(&f.args, FunctionArguments::List(list) if list.args.len() <= 1)
-        && f.over.is_none()
-        && matches!(
-            &f.args,
-            FunctionArguments::List(list)
-                if list.args.iter().any(|a| matches!(
-                    a,
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                        | FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(_)))
-                ))
-        )
+/// SQLite's aggregate functions, by name.
+///
+/// This is an explicit list rather than a shape heuristic on purpose. The previous version guessed
+/// "one argument, and that argument is a bare column" — which refused `lower(name)` as an unknown
+/// aggregate while admitting `substr(name,1,2)` and `lower('X')`, because arity and argument form
+/// have nothing to do with whether a function aggregates.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "COUNT"
+            | "SUM"
+            | "TOTAL"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "GROUP_CONCAT"
+            | "STRING_AGG"
+            | "JSON_GROUP_ARRAY"
+            | "JSON_GROUP_OBJECT"
+    )
+}
+
+/// `min` and `max` are aggregates with exactly one argument and *scalar* functions with two or
+/// more: `min(a, b)` is per-row, and combining it across shards collapses rows that should have
+/// been returned individually.
+fn is_scalar_min_max(name: &str, f: &sqlparser::ast::Function) -> bool {
+    matches!(name, "MIN" | "MAX")
+        && matches!(&f.args, FunctionArguments::List(list) if list.args.len() >= 2)
+}
+
+/// A call that aggregates across rows, as opposed to a scalar function or a window function.
+/// A windowed call (`… OVER (…)`) never aggregates in the fan-out sense: it is handled by central
+/// execution, because per-shard window frames are not the global frame.
+fn is_aggregate_call(name: &str, f: &sqlparser::ast::Function) -> bool {
+    f.over.is_none() && is_aggregate_name(name) && !is_scalar_min_max(name, f)
 }
 
 /// Which output column an `ORDER BY` term refers to.

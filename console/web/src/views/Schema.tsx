@@ -3,6 +3,7 @@ import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, Tag, TextInput } from "../components/ui";
 
 export default function Schema({ name }: { name: string }) {
+  const [distribution, setDistribution] = useState<Map<string, api.TableDistribution>>(new Map());
   const [catalog, setCatalog] = useState<api.SchemaCatalog | null>(null);
   const [agreement, setAgreement] = useState<api.SchemaAgreement | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -18,12 +19,15 @@ export default function Schema({ name }: { name: string }) {
     setBusy(true);
     setError(null);
     try {
-      const [next, agree] = await Promise.all([
+      const [next, agree, dist] = await Promise.all([
         api.conn(name).schemaCatalog(),
         api.conn(name).schemaAgreement().catch(() => null),
+        // Older servers have no /v1/tables; the schema is still worth showing without it.
+        api.conn(name).tableDistribution().catch(() => null),
       ]);
       setCatalog(next);
       setAgreement(agree);
+      setDistribution(new Map((dist?.tables ?? []).map((entry) => [entry.table.toLowerCase(), entry])));
       setSelected((current) => current && next.tables.some((table) => table.name === current)
         ? current
         : next.tables[0]?.name ?? null);
@@ -108,7 +112,20 @@ export default function Schema({ name }: { name: string }) {
             <SchemaTab active={tab === "data"} onClick={() => void openData()}>Data</SchemaTab>
           </div>
           {tab === "structure" ? <>
-            <Card title={<span>{table.name} <Tag tone="green">table</Tag></span>}><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-2">{table.sql ?? tableObject?.sql ?? "No CREATE statement reported"}</pre></Card>
+            <Card
+              title={<span>
+                {table.name} <Tag tone="green">table</Tag>{" "}
+                {(() => {
+                  const spread = distribution.get(table.name.toLowerCase());
+                  if (!spread) return null;
+                  // The class decides what this table's constraints mean, so it belongs beside its
+                  // name rather than being something you have to know from elsewhere.
+                  return spread.class === "global"
+                    ? <Tag tone="blue">global · one shard, full SQLite constraints</Tag>
+                    : <Tag tone="gray">sharded{spread.shard_key ? ` by ${spread.shard_key}` : ""}</Tag>;
+                })()}
+              </span>}
+            ><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-2">{table.sql ?? tableObject?.sql ?? "No CREATE statement reported"}</pre></Card>
             <Card title="Columns"><DataTable columns={["CID", "Name", "Type", "Not null", "Default", "PK", "Hidden"]} empty="No columns" rows={table.columns.map((row) => row.map(cell))} /></Card>
             <Card title="Indexes"><DataTable columns={["Seq", "Name", "Unique", "Origin", "Partial"]} empty="No indexes" rows={table.indexes.map((row) => row.map(cell))} /></Card>
             <Card title="Foreign keys"><DataTable columns={["ID", "Seq", "Target table", "From", "To", "On update", "On delete", "Match"]} empty="No foreign keys" rows={table.foreign_keys.map((row) => row.map(cell))} /></Card>

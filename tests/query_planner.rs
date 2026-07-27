@@ -5,7 +5,9 @@
 //! the only way to catch a merge that is plausible but wrong — which is the whole failure
 //! mode this planner exists to avoid.
 
-use shardlite::query::{Combine, OutputCol, Plan, SetKind, SetTree, ShardKeys, plan, plan_with};
+use shardlite::query::{
+    Combine, OutputCol, Plan, SetKind, SetTree, ShardKeys, Tiebreak, plan, plan_with,
+};
 use shardlite::shard::{ShardConfig, ShardId, ShardManager};
 use shardlite::storage::Value;
 use shardlite::storage::exec::{Executed, Outcome, QueryResult, Statement};
@@ -987,26 +989,61 @@ fn plans_are_what_they_claim_to_be() {
             combine: Combine::Min
         }
     );
-    assert_eq!(
-        plan("SELECT k FROM t").unwrap(),
-        Plan::Concat { limit: None }
-    );
-    assert_eq!(
-        plan("SELECT k FROM t LIMIT 5").unwrap(),
-        Plan::Concat { limit: Some(5) }
-    );
-
-    match plan("SELECT k, n FROM t ORDER BY n DESC LIMIT 3").unwrap() {
-        Plan::Merge { keys, limit } => {
-            assert_eq!(limit, Some(3));
-            assert_eq!(keys.len(), 1);
-            assert_eq!(keys[0].column, 1);
-            assert!(keys[0].descending);
-            // SQLite puts NULLs last when descending.
-            assert!(!keys[0].nulls_first);
+    // A plain projection is not concatenated in shard order: the shards are asked for a total
+    // order (every output column, by ordinal) and the coordinator breaks ties the same way, so the
+    // rows a LIMIT returns do not depend on how many shards answered.
+    match plan("SELECT k FROM t").unwrap() {
+        Plan::PostProcess(p) => {
+            assert_eq!(p.shard_sql, "SELECT k FROM t ORDER BY 1");
+            assert_eq!(p.tiebreak, Tiebreak::WholeRow);
+            assert_eq!(p.limit, None);
+            assert!(p.order_by.is_empty());
         }
-        other => panic!("expected a merge plan, got {other:?}"),
+        other => panic!("expected a totally ordered post-process plan, got {other:?}"),
     }
+    match plan("SELECT k FROM t LIMIT 5").unwrap() {
+        Plan::PostProcess(p) => {
+            assert_eq!(p.shard_sql, "SELECT k FROM t ORDER BY 1 LIMIT 5");
+            assert_eq!(p.tiebreak, Tiebreak::WholeRow);
+            assert_eq!(p.limit, Some(5));
+        }
+        other => panic!("expected a totally ordered post-process plan, got {other:?}"),
+    }
+
+    // An explicit ORDER BY keeps its keys, with the ordinals appended after them as the tiebreak.
+    match plan("SELECT k, n FROM t ORDER BY n DESC LIMIT 3").unwrap() {
+        Plan::PostProcess(p) => {
+            assert_eq!(
+                p.shard_sql,
+                "SELECT k, n FROM t ORDER BY n DESC, 1, 2 LIMIT 3"
+            );
+            assert_eq!(p.tiebreak, Tiebreak::WholeRow);
+            assert_eq!(p.limit, Some(3));
+            assert_eq!(p.order_by.len(), 1);
+            assert_eq!(p.order_by[0].column, 1);
+            assert!(p.order_by[0].descending);
+            // SQLite puts NULLs last when descending.
+            assert!(!p.order_by[0].nulls_first);
+        }
+        other => panic!("expected a totally ordered post-process plan, got {other:?}"),
+    }
+
+    // A wildcard projection has no statically known width, so the ordinals cannot be written. With
+    // a declared shard key it sorts by that instead — a column `*` always includes.
+    let mut wildcard_keys = ShardKeys::new();
+    wildcard_keys.insert("t".to_string(), "k".to_string());
+    match plan_with("SELECT * FROM t LIMIT 3", &wildcard_keys).unwrap() {
+        Plan::PostProcess(p) => {
+            assert_eq!(p.shard_sql, "SELECT * FROM t ORDER BY k LIMIT 3");
+            assert_eq!(p.tiebreak, Tiebreak::Column("k".to_string()));
+        }
+        other => panic!("expected a shard-key-ordered plan, got {other:?}"),
+    }
+    // Without one, there is no column both sides can name, and it stays a plain concatenation.
+    assert_eq!(
+        plan("SELECT * FROM t LIMIT 3").unwrap(),
+        Plan::Concat { limit: Some(3) }
+    );
 
     // A grouped query decomposes into a per-shard partial query plus a fold recipe.
     match plan("SELECT n % 10 AS b, count(*), avg(n) FROM t GROUP BY n % 10 LIMIT 4").unwrap() {
@@ -1116,9 +1153,16 @@ fn plans_are_what_they_claim_to_be() {
     // But with the table declared co-partitioned on the join key, the join is pushed down.
     let mut keys = ShardKeys::new();
     keys.insert("t".to_string(), "k".to_string());
+    // The join itself travels in the shard SQL; the plan wraps it only to impose a total order.
     match plan_with("SELECT x.k FROM t x JOIN t y ON x.k = y.k", &keys).unwrap() {
-        Plan::Concat { .. } => {}
-        other => panic!("expected a pushed-down join (Concat), got {other:?}"),
+        Plan::PostProcess(p) => {
+            assert!(
+                p.shard_sql.contains("JOIN t y ON x.k = y.k"),
+                "the join must be pushed to the shards, got {}",
+                p.shard_sql
+            );
+        }
+        other => panic!("expected a pushed-down join, got {other:?}"),
     }
 
     // A DISTINCT aggregate cannot be summed from per-shard partials — it must go to central

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import { Banner, Button, Card, DataTable, Page, PageHeader, Spinner, StatCard, Tag, TextInput } from "../components/ui";
-import { LegendDot, ShardTopology, groupByOwner } from "../components/ShardTopology";
+import ClusterTopologyPanel, { LegendDot } from "../components/ClusterTopologyPanel";
 
 function field(record: Record<string, unknown>, key: string): string {
   const value = record[key];
@@ -19,6 +19,7 @@ export default function Replication({ name }: { name: string }) {
   const [replication, setReplication] = useState<api.ReplicationStatus | null>(null);
   const [s3, setS3] = useState<api.S3Status | null>(null);
   const [inventory, setInventory] = useState<api.ShardInventory | null>(null);
+  const [unresolved, setUnresolved] = useState<api.UnresolvedTransaction[]>([]);
   const [view, setView] = useState<"table" | "topology">("table");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -27,10 +28,18 @@ export default function Replication({ name }: { name: string }) {
   const load = useCallback(async () => {
     try {
       const c = api.conn(name);
-      const [rep, status, inv] = await Promise.all([c.replication(), c.s3.status(), c.shardInventory().catch(() => null)]);
+      const [rep, status, inv, txns] = await Promise.all([
+        c.replication(),
+        c.s3.status(),
+        c.shardInventory().catch(() => null),
+        // Older servers have no /v1/transactions; absence is not the same as "none pending", but
+        // it is the best that can be said, so it shows nothing rather than a false all-clear.
+        c.transactions().catch(() => null),
+      ]);
       setReplication(rep);
       setS3(status);
       setInventory(inv);
+      setUnresolved(txns?.unresolved ?? []);
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Replication status could not be loaded.");
@@ -66,11 +75,11 @@ export default function Replication({ name }: { name: string }) {
   const columns = ["shard", ...shardKeys.filter((key) => key !== "shard")];
   const acks = replication?.acks;
   const s3Shards = s3?.shards ?? [];
-  const topologyNodes = groupByOwner(inventory?.rows ?? [], (row) => ({
-    tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
-    label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
-    title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
-  }));
+  // Replication state per shard, keyed so the topology panel can tint each chip.
+  const byShard = useMemo(
+    () => new Map((inventory?.rows ?? []).map((row) => [row.id, row])),
+    [inventory],
+  );
 
   return (
     <Page>
@@ -82,6 +91,15 @@ export default function Replication({ name }: { name: string }) {
       />
       {error && <Banner tone="error">{error}</Banner>}
       {notice && <Banner tone="success">{notice}</Banner>}
+      {unresolved.length > 0 && (
+        <Banner tone="error">
+          {unresolved.length} cross-shard transaction{unresolved.length === 1 ? "" : "s"} unresolved
+          {" — "}
+          {unresolved.map((t) => `#${t.id} (shards ${t.shards.join(", ")}${t.decided ? ", committing" : ", rolling back"})`).join("; ")}.
+          {" "}A decided transaction is completed by recovery; an undecided one committed nothing.
+          Until they clear, a multi-shard write may be visible on some shards and not others.
+        </Banner>
+      )}
 
       <div className="grid grid-cols-2 gap-px bg-carbon-border md:grid-cols-4">
         <StatCard label="Replicated" value={replication ? (replication.replicated ? "yes" : "no") : "—"} tone={replication?.replicated ? "green" : "yellow"} />
@@ -92,9 +110,25 @@ export default function Replication({ name }: { name: string }) {
 
       <Card title="Per-shard replication" actions={<ViewToggle view={view} onChange={setView} />}>
         {view === "topology" ? (
-          <ShardTopology
-            nodes={topologyNodes}
+          <ClusterTopologyPanel
+            name={name}
             legend={<><LegendDot tone="green">healthy</LegendDot><LegendDot tone="yellow">lagging</LegendDot><LegendDot tone="red">unavailable/degraded</LegendDot></>}
+            caption={(_node, shards) => {
+              const rows = shards.map((s) => byShard.get(s)).filter((r): r is api.ShardInventoryRow => !!r);
+              if (rows.length === 0) return null;
+              const lag = rows.reduce((worst, r) => Math.max(worst, r.max_lag ?? 0), 0);
+              const degraded = rows.filter((r) => r.state !== "available").length;
+              return `max lag ${lag}${degraded ? ` · ${degraded} degraded` : ""}`;
+            }}
+            annotateShard={(shard) => {
+              const row = byShard.get(shard);
+              if (!row) return null;
+              return {
+                tone: row.state !== "available" ? "red" : (row.max_lag ?? 0) > 0 ? "yellow" : "green",
+                label: (row.max_lag ?? 0) > 0 ? `lag ${row.max_lag}` : undefined,
+                title: `shard ${row.id} · ${row.state} · owner ${row.owner ?? "?"} · ${row.replicas.length} replica(s) · lsn ${row.primary_lsn}`,
+              };
+            }}
           />
         ) : (
           <DataTable

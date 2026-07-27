@@ -6,7 +6,7 @@ use crate::storage::exec::{QueryResult, Value};
 
 use super::plan::{
     Combine, CompareOp, Grouped, HavingExpr, HavingValue, OutputCol, Plan, PostProcess, SetKind,
-    SetTree, SortKey,
+    SetTree, SortKey, Tiebreak,
 };
 
 /// Combine per-shard results according to `plan`.
@@ -90,7 +90,27 @@ fn merge_post_process(
     if p.distinct {
         dedup_rows(&mut rows);
     }
-    finalize_rows(&mut rows, &p.order_by, p.offset, p.limit);
+    // `Tiebreak::Column` names a column the shards sorted by; resolve it against the columns that
+    // actually came back, since a wildcard projection's width is not known until now.
+    let mut keys = p.order_by.clone();
+    if let Tiebreak::Column(name) = &p.tiebreak
+        && let Some(idx) = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name.trim_matches('"')))
+    {
+        keys.push(SortKey {
+            column: idx,
+            descending: false,
+            nulls_first: true,
+        });
+    }
+    finalize_rows_with(
+        &mut rows,
+        &keys,
+        p.offset,
+        p.limit,
+        !matches!(p.tiebreak, Tiebreak::None),
+    );
     QueryResult { columns, rows }
 }
 
@@ -102,8 +122,31 @@ pub fn finalize_rows(
     offset: usize,
     limit: Option<usize>,
 ) {
-    if !order_by.is_empty() {
-        rows.sort_by(|a, b| compare_rows(a, b, order_by));
+    finalize_rows_with(rows, order_by, offset, limit, false);
+}
+
+/// [`finalize_rows`], with the option of a total order.
+///
+/// `tiebreak` compares whole rows once the explicit keys are equal. Without it, rows that tie keep
+/// the order they were concatenated in — which is shard order, so which row of a tied pair a
+/// `LIMIT` keeps depends on the shard count. Comparing whole rows is deterministic and identical
+/// at every shard count, and the shards are asked for the same order (see `shard_sql_ordered`) so
+/// a per-shard `LIMIT` ships the rows the coordinator actually needs.
+pub fn finalize_rows_with(
+    rows: &mut Vec<Vec<Value>>,
+    order_by: &[SortKey],
+    offset: usize,
+    limit: Option<usize>,
+    tiebreak: bool,
+) {
+    if !order_by.is_empty() || tiebreak {
+        rows.sort_by(|a, b| {
+            let ord = compare_rows(a, b, order_by);
+            if ord != std::cmp::Ordering::Equal || !tiebreak {
+                return ord;
+            }
+            compare_whole_rows(a, b)
+        });
     }
     if offset > 0 {
         *rows = if offset < rows.len() {
@@ -402,6 +445,18 @@ fn compare_rows(a: &[Value], b: &[Value], keys: &[SortKey]) -> std::cmp::Orderin
         }
     }
     Ordering::Equal
+}
+
+/// Compare two rows column by column, left to right — the tiebreak that makes a merge's output
+/// independent of how many shards produced it.
+fn compare_whole_rows(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = compare_values(x, y);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// SQLite's storage-class ordering: NULL < numbers < text < blob.

@@ -27,6 +27,7 @@ use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
 use crate::query::ShardKeys;
+use crate::shard::classes::{TableClass, TableClasses, class_of};
 use crate::shard::{ModuloV1, Routing};
 use crate::storage::exec::Value;
 
@@ -92,14 +93,19 @@ pub fn route_statement(sql: &str, keys: &ShardKeys, shard_count: u32) -> Route {
     let routing = Routing::ModuloV1(
         ModuloV1::new(shard_count).expect("route_statement requires at least one shard"),
     );
-    route_statement_with(sql, keys, routing)
+    route_statement_with(sql, keys, &TableClasses::new(), routing)
 }
 
 /// Decide where a statement should run using the committed routing scheme.
 ///
 /// Kept separate from [`route_statement`] so existing modulo callers retain their API while a
 /// dynamic cluster can advance `LinearV1` without teaching clients about shard IDs.
-pub fn route_statement_with(sql: &str, keys: &ShardKeys, routing: Routing) -> Route {
+pub fn route_statement_with(
+    sql: &str,
+    keys: &ShardKeys,
+    classes: &TableClasses,
+    routing: Routing,
+) -> Route {
     let mut stmts = match Parser::parse_sql(&SQLiteDialect {}, sql) {
         Ok(s) => s,
         // Not our job to report parse errors — let the normal execution path surface them.
@@ -108,7 +114,18 @@ pub fn route_statement_with(sql: &str, keys: &ShardKeys, routing: Routing) -> Ro
     if stmts.len() != 1 {
         return Route::Passthrough;
     }
-    match stmts.pop().unwrap() {
+    let statement = stmts.pop().unwrap();
+
+    // Every row of a global table lives on shard 0, so both its reads and its writes go there —
+    // which is what lets it keep the SQLite guarantees a sharded table has to give up. No shard
+    // key is needed or consulted, so a DB-assigned key works here as it does on plain SQLite.
+    if let Some(table) = statement_table(&statement)
+        && class_of(classes, &table) == TableClass::Global
+    {
+        return Route::One(0);
+    }
+
+    match statement {
         SqlStatement::Insert(insert) => route_insert(insert, keys, routing),
         SqlStatement::Update(u) => {
             // An UPDATE ... FROM joins other tables; the target's key no longer proves all matched
@@ -138,6 +155,20 @@ pub fn route_statement_with(sql: &str, keys: &ShardKeys, routing: Routing) -> Ro
             route_point(table, selection, keys, routing, Route::Passthrough)
         }
         _ => Route::Passthrough,
+    }
+}
+
+/// The single table a statement reads or writes, if it names exactly one.
+fn statement_table(statement: &SqlStatement) -> Option<String> {
+    match statement {
+        SqlStatement::Insert(insert) => match &insert.table {
+            TableObject::TableName(name) => Some(last_ident(name)),
+            _ => None,
+        },
+        SqlStatement::Update(u) => table_of(&u.table),
+        SqlStatement::Delete(d) => delete_table(d),
+        SqlStatement::Query(q) => select_target(q).0,
+        _ => None,
     }
 }
 

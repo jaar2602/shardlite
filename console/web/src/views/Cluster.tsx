@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../auth";
 import * as api from "../lib/api";
 import TopologyMap, { STATUS_STYLES, TopologyNode } from "../components/TopologyMap";
+import { asId, topologyNodes as buildTopologyNodes } from "../lib/topology";
 import { Banner, Button, Spinner, Tag } from "../components/ui";
 
 interface Snapshot {
@@ -14,54 +15,14 @@ interface Snapshot {
   catalog: api.ClusterCatalog | null;
 }
 
-function asId(value: string | number | null | undefined): string | null {
-  return value === null || value === undefined ? null : String(value);
-}
-
 function topologyNodes(snapshot: Snapshot): TopologyNode[] {
-  const { cluster, connection, info, observation } = snapshot;
-  // The topology below is one node's view of its peers, which can report a peer as "unknown" even
-  // when it is fine. But the console polls every seed directly, so a node whose own poll just
-  // succeeded is provably up — trust that over a peer's second-hand status.
-  const reachedIds = new Set(
-    observation.nodes
-      .filter((node) => !node.error && node.topology)
-      .map((node) => asId(node.topology?.node))
-      .filter((id): id is string => id !== null),
-  );
-  const currentId = asId(cluster.node) ?? (cluster.clustered ? "this node" : connection?.name ?? "local");
-  const leaderId = asId(cluster.leader);
-  const assignments = { ...(cluster.placement?.assignments ?? {}) };
-  if (!cluster.clustered && Object.keys(assignments).length === 0) {
-    for (let shard = 0; shard < info.shard_count; shard += 1) assignments[String(shard)] = currentId;
-  }
-  const ids = new Set<string>();
-
-  ids.add(currentId);
-  if (leaderId) ids.add(leaderId);
-  for (const owner of Object.values(assignments)) ids.add(String(owner));
-  for (const member of cluster.members ?? []) ids.add(String(member.node));
-
-  const explicit = new Map((cluster.members ?? []).map((member) => [String(member.node), member]));
-  const totalAssignments = Object.keys(assignments).length;
-  return Array.from(ids)
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((id) => {
-      const member = explicit.get(id);
-      const isCurrent = member?.this_node ?? id === currentId;
-      const isLeader = id === leaderId || (!cluster.clustered && isCurrent);
-      return {
-        id,
-        address: member?.address ?? (isCurrent ? connection?.url : null),
-        status: reachedIds.has(id) ? "up" : member?.status ?? (isCurrent ? "up" : "unknown"),
-        role: isLeader ? "leader" : isCurrent ? cluster.role ?? "member" : "member",
-        isLeader,
-        isCurrent,
-        dataShare: totalAssignments === 0 ? 0 : Math.round(Object.entries(assignments)
-          .filter(([, owner]) => String(owner) === id)
-          .length / totalAssignments * 100),
-      } satisfies TopologyNode;
-    });
+  return buildTopologyNodes({
+    cluster: snapshot.cluster,
+    observation: snapshot.observation,
+    shardCount: snapshot.info.shard_count,
+    connectionName: snapshot.connection?.name,
+    connectionUrl: snapshot.connection?.url,
+  });
 }
 
 function StatusPill({ status }: { status: api.MemberStatus }) {
@@ -237,6 +198,7 @@ export default function Cluster({ name }: { name: string }) {
   }
 
   const { info, cluster, stats, connection, sampledAt, observation, catalog } = snapshot;
+  const scalingPolicy = catalog?.scaling_policy;
   const placementTerm = cluster.placement?.term;
   const primaryTotal = Object.keys(cluster.placement?.assignments ?? {}).length;
   const currentNode = nodes.find((node) => node.isCurrent);
@@ -331,6 +293,9 @@ export default function Cluster({ name }: { name: string }) {
               <Fact label="Voters" value={valueOrDash(cluster.voters ?? nodes.length)} mono />
               <Fact label="Distribution term" value={valueOrDash(placementTerm)} mono />
               <Fact label="This role" value={cluster.role ?? (cluster.clustered ? "unknown" : "standalone")} />
+              {/* Fixed at creation. A client that does not know the database is strict cannot
+                  explain the refusals it gets. */}
+              <Fact label="Statement mode" value={info.strict ? "strict" : "default"} />
             </div>
 
             <div className="px-4 pb-2 pt-1 text-[10px] uppercase tracking-[0.08em] text-carbon-text-3">
@@ -404,15 +369,15 @@ export default function Cluster({ name }: { name: string }) {
                     Joint consensus: [{catalog.voter_transition.old.join(", ")}] → [{catalog.voter_transition.new.join(", ")}]
                   </p>
                 )}
-                {catalog.scaling_policy && (
+                {scalingPolicy && (
                   <div className="border border-carbon-border bg-carbon-bg px-3 py-2 text-xs">
                     <div className="mb-2 font-semibold text-carbon-text">Safety budgets</div>
                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-carbon-text-3 sm:grid-cols-3">
-                      <span>capture rows <b className="font-mono text-carbon-text">{catalog.scaling_policy.split_log_max_rows.toLocaleString()}</b></span>
-                      <span>backfill batch <b className="font-mono text-carbon-text">{catalog.scaling_policy.split_backfill_batch_rows.toLocaleString()}</b></span>
-                      <span>split max <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_split_source_bytes ? `${catalog.scaling_policy.max_split_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
-                      <span>transfer max <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_transfer_source_bytes ? `${catalog.scaling_policy.max_transfer_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
-                      <span>concurrency <b className="font-mono text-carbon-text">{catalog.scaling_policy.max_concurrent_topology_operations}</b></span>
+                      <span>capture rows <b className="font-mono text-carbon-text">{scalingPolicy.split_log_max_rows.toLocaleString()}</b></span>
+                      <span>backfill batch <b className="font-mono text-carbon-text">{scalingPolicy.split_backfill_batch_rows.toLocaleString()}</b></span>
+                      <span>split max <b className="font-mono text-carbon-text">{scalingPolicy.max_split_source_bytes ? `${scalingPolicy.max_split_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
+                      <span>transfer max <b className="font-mono text-carbon-text">{scalingPolicy.max_transfer_source_bytes ? `${scalingPolicy.max_transfer_source_bytes.toLocaleString()} B` : "unlimited"}</b></span>
+                      <span>concurrency <b className="font-mono text-carbon-text">{scalingPolicy.max_concurrent_topology_operations}</b></span>
                     </div>
                     {canOperate && (
                       <Button
@@ -420,11 +385,10 @@ export default function Cluster({ name }: { name: string }) {
                         variant="secondary"
                         disabled={catalogBusy}
                         onClick={() => {
-                          const policy = catalog.scaling_policy;
-                          const maxSplit = Number(prompt("Maximum split source bytes (0 = unlimited)", String(policy.max_split_source_bytes)));
-                          const maxTransfer = Number(prompt("Maximum transfer source bytes (0 = unlimited)", String(policy.max_transfer_source_bytes)));
+                          const maxSplit = Number(prompt("Maximum split source bytes (0 = unlimited)", String(scalingPolicy.max_split_source_bytes)));
+                          const maxTransfer = Number(prompt("Maximum transfer source bytes (0 = unlimited)", String(scalingPolicy.max_transfer_source_bytes)));
                           if (!Number.isSafeInteger(maxSplit) || maxSplit < 0 || !Number.isSafeInteger(maxTransfer) || maxTransfer < 0) return;
-                          void catalogAction("Apply dynamic scaling resource budgets?", (client) => client.scalingPolicy({ ...policy, max_split_source_bytes: maxSplit, max_transfer_source_bytes: maxTransfer }));
+                          void catalogAction("Apply dynamic scaling resource budgets?", (client) => client.scalingPolicy({ ...scalingPolicy, max_split_source_bytes: maxSplit, max_transfer_source_bytes: maxTransfer }));
                         }}
                       >
                         Edit safety budgets

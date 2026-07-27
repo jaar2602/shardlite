@@ -25,11 +25,13 @@
 //! connections would be 128 MB — the whole container budget. Sharded profiles therefore use
 //! much smaller per-connection caches; see [`crate::config::PragmaProfile::writer_shard`].
 
+pub mod classes;
 pub mod lru;
 pub mod manifest;
 pub mod mode;
 pub mod reader_fleet;
 pub mod routing;
+pub mod txn;
 pub mod writer_fleet;
 
 use std::path::{Path, PathBuf};
@@ -162,6 +164,30 @@ fn combine_writes(
     }))
 }
 
+/// Marker file recording that this database was created in strict mode.
+///
+/// Kept on disk rather than in [`ShardConfig`] so the setting belongs to the *database*, not to
+/// whoever opened it. Acceptance may differ between databases; it must never differ between two
+/// connections to the same one.
+fn strict_path(dir: &Path) -> PathBuf {
+    dir.join("strict")
+}
+
+fn load_strict(dir: &Path) -> bool {
+    strict_path(dir).exists()
+}
+
+/// Record that `dir` is a strict database, before any shard is opened.
+///
+/// Used by `shardlite init --strict`, so the setting is in place for the first `CREATE TABLE`
+/// rather than being applied to a schema already written without it.
+pub fn mark_strict(dir: &Path) -> crate::Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| crate::Error::Protocol(format!("creating {}: {e}", dir.display())))?;
+    std::fs::write(strict_path(dir), b"strict\n")
+        .map_err(|e| crate::Error::Protocol(format!("recording strict mode: {e}")))
+}
+
 fn shard_keys_path(dir: &Path) -> PathBuf {
     dir.join("shard_keys.txt")
 }
@@ -214,6 +240,11 @@ pub struct ShardConfig {
     /// Local shard-ID allocation ceiling, immutable in the manifest. It is also the active count
     /// for legacy modulo directories; dynamic catalog mode may activate any prefix up to it.
     pub shard_count: u32,
+
+    /// Create the database in strict mode: refuse statements where shardlite would otherwise
+    /// choose on the user's behalf. Recorded on disk at creation and sticky thereafter, so it
+    /// belongs to the database rather than to whoever opened it.
+    pub strict: bool,
 
     /// Writer threads. Shards are assigned to threads by `id % writer_threads`, so each
     /// shard still has exactly one writer and single-writer-per-file is preserved while the
@@ -287,6 +318,7 @@ impl ShardConfig {
     pub fn floor() -> Self {
         Self {
             shard_count: 64,
+            strict: false,
             writer_threads: 2,
             open_writers_per_thread: 8,
             reader_threads: 2,
@@ -414,6 +446,22 @@ pub struct ShardManager {
     /// Declared co-partitioning: table → shard-key column. Loaded from `shard_keys.json` and used
     /// to allow co-located joins in cross-shard reads.
     shard_keys: std::sync::RwLock<crate::query::ShardKeys>,
+    /// Declared table classes: table → sharded / global. Loaded from `table_classes.txt`. A class
+    /// is fixed at CREATE TABLE and means the same thing at every shard count, which is what stops
+    /// a split from changing what a constraint does.
+    table_classes: std::sync::RwLock<classes::TableClasses>,
+    /// Refuse statements where shardlite would otherwise choose on the user's behalf. Fixed for
+    /// the life of the database — see [`strict_path`].
+    strict: bool,
+    /// Next cross-shard transaction id, chosen above anything left on disk by a previous run.
+    next_txn: std::sync::atomic::AtomicU64,
+    /// Serialises cross-shard transactions.
+    ///
+    /// Two overlapping ones could each hold a shard the other needs to prepare, and neither would
+    /// ever finish. Ordering prepares by shard id removes the cycle *between* participants; this
+    /// removes it between transactions. The cost is that multi-shard writes do not overlap each
+    /// other — single-shard writes, which is nearly all of them, are untouched.
+    txn_lock: std::sync::Mutex<()>,
     /// Set once by the networking layer to forward work for shards owned by other nodes. Absent on
     /// a standalone node or the embedded CLI, where every shard is local.
     peer: std::sync::OnceLock<std::sync::Arc<dyn PeerRouter>>,
@@ -522,9 +570,17 @@ impl ShardManager {
             std::sync::Arc::clone(&modes),
         )?;
         let shard_keys = std::sync::RwLock::new(load_shard_keys(dir));
+        let table_classes = std::sync::RwLock::new(classes::load(dir));
+        // Strict is sticky: once a database is strict it stays strict, so a later open cannot
+        // quietly relax what the schema was written against.
+        let strict = load_strict(dir) || cfg.strict;
+        if strict && !load_strict(dir) {
+            std::fs::write(strict_path(dir), b"strict\n")
+                .map_err(|e| crate::Error::Protocol(format!("recording strict mode: {e}")))?;
+        }
         let routing =
             Routing::ModuloV1(ModuloV1::new(cfg.shard_count).expect("validated shard count"));
-        Ok(Self {
+        let manager = Self {
             writers,
             readers,
             cfg,
@@ -533,8 +589,28 @@ impl ShardManager {
             routing: std::sync::RwLock::new(ActiveRouting { routing, epoch: 0 }),
             modes,
             shard_keys,
+            table_classes,
+            strict,
+            next_txn: std::sync::atomic::AtomicU64::new(txn::next_id_after_recovery(dir)),
+            txn_lock: std::sync::Mutex::new(()),
             peer: std::sync::OnceLock::new(),
-        })
+        };
+
+        // Before serving anything. A cross-shard transaction interrupted by an unclean exit is
+        // finished or dropped here, so no read can observe a half-applied one.
+        match manager.recover_transactions() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                resolved = n,
+                "recovered interrupted cross-shard transactions"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "recovering cross-shard transactions failed");
+                return Err(e);
+            }
+        }
+
+        Ok(manager)
     }
 
     /// Install the peer router so fan-outs and routed statements reach shards owned by other nodes.
@@ -879,11 +955,17 @@ impl ShardManager {
         // not a slower answer, they are a wrong one. Refusing is the only honest response.
         self.schema_agreement()?.check()?;
 
+        self.check_strict(sql)?;
+
         // Declared co-partitioning is consulted so a co-located join is allowed.
         let plan = {
             let shard_keys = self.shard_keys.read().unwrap();
             plan_with(sql, &shard_keys).map_err(|u| crate::Error::Unsupported(u.to_string()))?
         };
+
+        if self.strict {
+            crate::query::strict::check_plan(&plan).map_err(crate::Error::Unsupported)?;
+        }
 
         // A scalar / IN / EXISTS subquery is evaluated globally on its own, its result substituted
         // in, and the rewritten (subquery-free) query re-run. Nested subqueries substitute
@@ -1074,6 +1156,322 @@ impl ShardManager {
         persist_shard_keys(&self.dir, &keys)
     }
 
+    /// Declare how a table is distributed. Fixed once, at `CREATE TABLE` time, and honoured
+    /// identically at every shard count — which is what stops a split from changing what the
+    /// table's constraints mean. Persisted to `table_classes.txt`.
+    ///
+    /// Declare this **before** creating the table: the constraint gate consults it, and a `global`
+    /// table is exempt because all its rows live in one SQLite file.
+    pub fn declare_table_class(
+        &self,
+        table: &str,
+        class: classes::TableClass,
+    ) -> crate::Result<()> {
+        let mut declared = self.table_classes.write().unwrap();
+        declared.insert(table.to_ascii_lowercase(), class);
+        classes::persist(&self.dir, &declared)
+    }
+
+    /// Apply a write that touches several shards as one transaction: all commit, or none do.
+    ///
+    /// Every shard prepares — applying its statements but holding the transaction open — before
+    /// any shard commits. A rejection anywhere is therefore discovered while everything is still
+    /// undoable, which is the case that matters: a constraint violation used to leave the earlier
+    /// shards written and still report failure, so a retrying client double-inserted.
+    ///
+    /// **The decision is fsynced before the first commit.** That single ordering is what lets
+    /// recovery tell "nothing committed" from "some may have", and it is why the durable record is
+    /// written between the two phases rather than before or after them.
+    ///
+    /// One participant needs none of this: SQLite's own transaction is already all-or-nothing, so
+    /// the coordinator log would buy nothing and cost an fsync. Uniform semantics, not uniform
+    /// mechanism.
+    fn run_atomic(
+        &self,
+        participants: Vec<(ShardId, Vec<crate::storage::exec::Statement>)>,
+        ddl: bool,
+    ) -> crate::Result<crate::storage::exec::Outcome> {
+        use crate::shard::writer_fleet::PrepareReply;
+        use crate::storage::exec::Outcome;
+
+        let mut participants = participants;
+        // Ascending shard order, so two coordinators cannot each hold what the other wants.
+        participants.sort_by_key(|(shard, _)| shard.0);
+        participants.retain(|(_, statements)| !statements.is_empty());
+
+        match participants.len() {
+            0 => {
+                return Ok(Outcome::Ok(crate::storage::exec::Executed::Changed(
+                    crate::storage::exec::WriteOutcome::default(),
+                )));
+            }
+            1 => {
+                let (shard, statements) = participants.pop().expect("one participant");
+                let outcomes = if ddl {
+                    self.apply_ddl_to(
+                        shard,
+                        statements.into_iter().next().expect("one statement"),
+                    )?;
+                    vec![Outcome::Ok(crate::storage::exec::Executed::Changed(
+                        crate::storage::exec::WriteOutcome::default(),
+                    ))]
+                } else {
+                    self.writers.execute_atomic(shard, statements)?
+                };
+                return Ok(combine_writes(outcomes.into_iter()));
+            }
+            _ => {}
+        }
+
+        // Prepare parks a transaction on *this* node's writer fleet. A shard owned by another node
+        // cannot be parked without a Prepare/Commit RPC, which is the protocol work this plan
+        // defers (see docs/cross-shard-atomicity-plan.md, Phase 3). Until that lands, a fan-out
+        // that leaves this node keeps the per-shard path it has always had — non-atomic, and the
+        // one place the one-behaviour rule is not yet satisfied.
+        if !self.all_participants_local(&participants) {
+            tracing::debug!(
+                "cross-shard write spans nodes; applying per shard without two-phase commit"
+            );
+            return self.run_per_shard(participants, ddl);
+        }
+
+        let _serialised = self.txn_lock.lock().expect("transaction lock");
+        let id = self
+            .next_txn
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Phase one. A prepare that is rejected has already rolled itself back, so only the shards
+        // that reported Prepared need aborting — but every participant is told, because a shard
+        // that was never parked ignores the decision and that is cheaper than tracking which.
+        let mut outcomes = Vec::new();
+        let mut refusal = None;
+        for (shard, statements) in &participants {
+            match self.writers.prepare(*shard, id, statements.clone(), ddl) {
+                Ok(PrepareReply::Prepared(shard_outcomes)) => outcomes.extend(shard_outcomes),
+                Ok(PrepareReply::Rejected(message)) => {
+                    refusal = Some(message);
+                    break;
+                }
+                Err(e) => {
+                    self.abort_all(&participants);
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(message) = refusal {
+            self.abort_all(&participants);
+            return Ok(Outcome::Rejected(message));
+        }
+
+        // The ordering invariant: durable decision, then commits, never the other way round.
+        let record = txn::TxnRecord {
+            id,
+            participants: participants
+                .iter()
+                .map(|(shard, statements)| {
+                    (
+                        shard.0,
+                        statements.iter().map(|s| s.sql.clone()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+            ddl,
+            decision: Some(txn::Decision::Commit),
+        };
+        txn::put(&self.dir, &record)?;
+
+        // A commit that fails here is recoverable, not lost: the decision is on disk, so recovery
+        // re-applies wherever the marker is missing.
+        let mut commit_error = None;
+        for (shard, _) in &participants {
+            if let Err(e) = self.writers.decide(*shard, true) {
+                tracing::error!(%shard, txn = id, error = %e, "commit of a prepared shard failed");
+                commit_error = Some(e);
+            }
+        }
+        if let Some(e) = commit_error {
+            return Err(e);
+        }
+
+        txn::remove(&self.dir, id)?;
+        // "Rows affected" is meaningless for DDL, and summing it over participants would make the
+        // reported number depend on the shard count — a divergence in the answer, not just in the
+        // work done. One shard or fifty, a schema change reports the same thing.
+        if ddl {
+            return Ok(Outcome::Ok(crate::storage::exec::Executed::Changed(
+                crate::storage::exec::WriteOutcome::default(),
+            )));
+        }
+        Ok(combine_writes(outcomes.into_iter()))
+    }
+
+    /// Whether every participating shard's files are on this node.
+    fn all_participants_local(
+        &self,
+        participants: &[(ShardId, Vec<crate::storage::exec::Statement>)],
+    ) -> bool {
+        match self.peer.get() {
+            None => true,
+            Some(peer) => participants.iter().all(|(shard, _)| peer.is_local(*shard)),
+        }
+    }
+
+    /// The pre-two-phase path: apply to each participant in turn. Kept only for fan-outs that
+    /// span nodes, and deliberately unchanged so multi-node behaviour is exactly what it was.
+    fn run_per_shard(
+        &self,
+        participants: Vec<(ShardId, Vec<crate::storage::exec::Statement>)>,
+        ddl: bool,
+    ) -> crate::Result<crate::storage::exec::Outcome> {
+        let mut outcomes = Vec::new();
+        for (shard, statements) in participants {
+            for statement in statements {
+                if ddl {
+                    self.apply_ddl_to_any(shard, statement)?;
+                    outcomes.push(crate::storage::exec::Outcome::Ok(
+                        crate::storage::exec::Executed::Changed(
+                            crate::storage::exec::WriteOutcome::default(),
+                        ),
+                    ));
+                } else {
+                    outcomes.push(self.execute_one(shard, statement)?);
+                }
+            }
+        }
+        if ddl {
+            return Ok(crate::storage::exec::Outcome::Ok(
+                crate::storage::exec::Executed::Changed(
+                    crate::storage::exec::WriteOutcome::default(),
+                ),
+            ));
+        }
+        Ok(combine_writes(outcomes.into_iter()))
+    }
+
+    /// Apply DDL to a shard wherever it lives.
+    fn apply_ddl_to_any(
+        &self,
+        shard: ShardId,
+        statement: crate::storage::exec::Statement,
+    ) -> crate::Result<()> {
+        if let Some(peer) = self.peer.get()
+            && !peer.is_local(shard)
+        {
+            peer.apply_ddl_remote(shard, statement)?;
+            return Ok(());
+        }
+        self.apply_ddl_to(shard, statement)?;
+        Ok(())
+    }
+
+    fn abort_all(&self, participants: &[(ShardId, Vec<crate::storage::exec::Statement>)]) {
+        for (shard, _) in participants {
+            if let Err(e) = self.writers.decide(*shard, false) {
+                tracing::error!(%shard, error = %e, "rolling back a prepared shard failed");
+            }
+        }
+    }
+
+    /// Finish cross-shard transactions interrupted by an unclean exit.
+    ///
+    /// A record with no durable decision means no shard committed, because the decision is fsynced
+    /// first — so it is dropped. A decided record may have committed anywhere, and SQLite has
+    /// already rolled back whatever was merely prepared, so it is **re-applied** wherever the
+    /// marker table says it did not land. That is why the record carries the statements.
+    pub fn recover_transactions(&self) -> crate::Result<usize> {
+        let mut resolved = 0;
+        for record in txn::pending(&self.dir) {
+            match record.decision {
+                None => {
+                    tracing::info!(
+                        txn = record.id,
+                        "undecided transaction dropped; nothing had committed"
+                    );
+                }
+                Some(txn::Decision::Commit) => {
+                    for shard in record.shards() {
+                        if self.has_applied(shard, record.id)? {
+                            continue;
+                        }
+                        let Some(statements) = record.statements_for(shard) else {
+                            continue;
+                        };
+                        tracing::warn!(%shard, txn = record.id, "re-applying a committed transaction");
+                        self.run_atomic(vec![(shard, statements)], record.ddl)?;
+                        // The single-participant path does not write the marker, so record it now:
+                        // a second recovery must not re-apply this shard again.
+                        self.writers.execute_one(
+                            shard,
+                            crate::storage::exec::Statement::new(format!(
+                                "INSERT OR IGNORE INTO {} (id) VALUES ({})",
+                                crate::storage::apply::TXN_TABLE,
+                                record.id
+                            )),
+                        )?;
+                    }
+                }
+            }
+            txn::remove(&self.dir, record.id)?;
+            resolved += 1;
+        }
+        Ok(resolved)
+    }
+
+    /// Whether `shard` already carries the marker for `txn`. A shard with no marker table has
+    /// applied nothing through the two-phase path.
+    fn has_applied(&self, shard: ShardId, txn: u64) -> crate::Result<bool> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE id = {txn}",
+            crate::storage::apply::TXN_TABLE
+        );
+        match self
+            .readers
+            .query(shard, crate::storage::exec::Statement::new(&sql))
+        {
+            Ok(crate::storage::exec::Outcome::Ok(crate::storage::exec::Executed::Rows(rows))) => {
+                Ok(matches!(
+                    rows.rows.first().and_then(|r| r.first()),
+                    Some(crate::storage::Value::Integer(n)) if *n > 0
+                ))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether this database refuses statements that would leave a choice to shardlite.
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Cross-shard transactions that have not been resolved.
+    ///
+    /// Normally empty: a record exists only between the durable decision and the last participant's
+    /// commit. One that persists means recovery has not finished, and until it does a multi-shard
+    /// write may be visible on some shards and not others — which is worth an operator seeing
+    /// rather than having to infer from row counts.
+    pub fn pending_transactions(&self) -> Vec<txn::TxnRecord> {
+        txn::pending(&self.dir)
+    }
+
+    /// Apply the strict rules, if this database is strict. A no-op otherwise.
+    fn check_strict(&self, sql: &str) -> crate::Result<()> {
+        if !self.strict {
+            return Ok(());
+        }
+        crate::query::strict::check(sql, &self.shard_keys(), &self.table_classes())
+            .map_err(crate::Error::Unsupported)
+    }
+
+    /// Every declared table class.
+    pub fn table_classes(&self) -> classes::TableClasses {
+        self.table_classes.read().unwrap().clone()
+    }
+
+    /// How `table` is distributed, defaulting to sharded.
+    pub fn table_class(&self, table: &str) -> classes::TableClass {
+        classes::class_of(&self.table_classes.read().unwrap(), table)
+    }
+
     /// The declared shard key for a table, if any.
     pub fn shard_key(&self, table: &str) -> Option<String> {
         self.shard_keys
@@ -1136,7 +1534,25 @@ impl ShardManager {
     }
 
     /// A shard's schema version.
+    ///
+    /// A shard this node only *follows* has no readable connection — the replication path owns the
+    /// file — so the answer has to come from its owner. Without that forward, this reports a shard
+    /// as broken on every node but one, which breaks the promise the whole design rests on: that a
+    /// client may ask any node anything. [`Self::execute_one`] and [`Self::query`] already forward
+    /// through the same seam.
     pub fn schema_version(&self, shard: ShardId) -> crate::Result<i64> {
+        if let Some(peer) = self.peer.get()
+            && !peer.is_local(shard)
+        {
+            return peer
+                .schema_versions(std::slice::from_ref(&shard))
+                .pop()
+                .unwrap_or_else(|| {
+                    Err(crate::Error::Unsupported(format!(
+                        "no schema version returned for {shard}"
+                    )))
+                });
+        }
         self.writers.schema(shard, None)
     }
 
@@ -1225,6 +1641,13 @@ impl ShardManager {
     ) -> crate::Result<Vec<(ShardId, crate::storage::exec::Outcome)>> {
         let statement = sql.into();
         if crate::db::Db::is_ddl(&statement.sql) {
+            // Judged against the rules for *many* shards, whatever the current count, so the
+            // schema means the same thing before and after a split. See `crate::query::ddl`.
+            if let Err(why) =
+                crate::query::ddl::check_create_table(&statement.sql, &self.table_classes())
+            {
+                return Err(crate::Error::Unsupported(why));
+            }
             // Do not send DDL through the ordinary write fan-out: schema_op is what advances
             // each shard's durable version and makes an interrupted roll observable. This is
             // one request per shard today; schema changes are infrequent and correctness is more
@@ -1305,17 +1728,33 @@ impl ShardManager {
 
         let statement = statement.into();
         crate::db::reject_unsupported(&statement.sql)?;
+        self.check_strict(&statement.sql)?;
         let kw = crate::db::first_keyword(&statement.sql);
 
-        // DDL reaches every shard (execute_all_shards also adopts a new table's primary key).
+        // DDL reaches every shard, atomically: a broadcast that failed partway used to leave the
+        // earlier shards carrying the new schema and the later ones without it, detected by
+        // `schema_agreement` but repairable only by hand.
         if matches!(kw.as_str(), "CREATE" | "DROP" | "ALTER") {
-            let results = self.execute_all_shards(statement)?;
-            return Ok(combine_writes(results.into_iter().map(|(_, o)| o)));
+            if let Err(why) =
+                crate::query::ddl::check_create_table(&statement.sql, &self.table_classes())
+            {
+                return Err(crate::Error::Unsupported(why));
+            }
+            let participants = (0..self.shard_count())
+                .map(|s| (ShardId(s), vec![statement.clone()]))
+                .collect();
+            let outcome = self.run_atomic(participants, true)?;
+            self.adopt_shard_key_from_ddl(&statement.sql)?;
+            return Ok(outcome);
         }
 
         let is_write = matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE");
-        match crate::query::route_statement_with(&statement.sql, &self.shard_keys(), self.routing())
-        {
+        match crate::query::route_statement_with(
+            &statement.sql,
+            &self.shard_keys(),
+            &self.table_classes(),
+            self.routing(),
+        ) {
             Route::One(s) => {
                 if is_write {
                     self.execute_one(ShardId(s), statement)
@@ -1323,17 +1762,23 @@ impl ShardManager {
                     self.query(ShardId(s), statement)
                 }
             }
-            Route::Split(parts) => {
-                let mut outs = Vec::with_capacity(parts.len());
-                for (s, sub) in parts {
-                    outs.push(self.execute_one(ShardId(s), sub)?);
-                }
-                Ok(combine_writes(outs.into_iter()))
-            }
-            Route::All => {
-                let results = self.execute_all_shards(statement)?;
-                Ok(combine_writes(results.into_iter().map(|(_, o)| o)))
-            }
+            // A multi-row INSERT split across shards is one transaction, not a loop of
+            // independent writes. See `run_atomic`.
+            Route::Split(parts) => self.run_atomic(
+                parts
+                    .into_iter()
+                    .map(|(s, sub)| (ShardId(s), vec![crate::storage::exec::Statement::new(&sub)]))
+                    .collect(),
+                false,
+            ),
+            // A keyless UPDATE or DELETE touches every shard and has the identical
+            // partial-application problem, so it takes the identical path.
+            Route::All => self.run_atomic(
+                (0..self.shard_count())
+                    .map(|s| (ShardId(s), vec![statement.clone()]))
+                    .collect(),
+                false,
+            ),
             Route::Passthrough => {
                 if is_write {
                     // A write to a table with no shard key goes to one shard deterministically

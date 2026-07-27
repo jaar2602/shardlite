@@ -4,14 +4,16 @@
 //! and combining, which only works for shapes where combining partial results reproduces
 //! the global answer. Everything else is refused — see [`plan`].
 
+pub mod ddl;
 pub mod merge;
 pub mod plan;
 pub mod route;
+pub mod strict;
 
 pub use merge::{evaluate_set_tree, finalize_rows, merge_results};
 pub use plan::{
     Central, CentralSource, Combine, CompareOp, Grouped, HavingExpr, HavingValue, OutputCol, Plan,
-    PostProcess, SetKind, SetOp, SetTree, ShardKeys, SortKey, Unsupported, plan, plan_with,
-    substitute_subqueries,
+    PostProcess, SetKind, SetOp, SetTree, ShardKeys, SortKey, Tiebreak, Unsupported, plan,
+    plan_with, substitute_subqueries,
 };
 pub use route::{Route, route_statement, route_statement_with};
