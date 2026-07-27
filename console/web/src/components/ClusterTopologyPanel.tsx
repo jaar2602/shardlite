@@ -34,6 +34,7 @@ export default function ClusterTopologyPanel({
   onSelectShard,
   selectedShard,
   legend,
+  details,
 }: {
   name: string;
   /// A short line under each node, from the calling page's own data (lag, ops, bytes, writes/s).
@@ -42,6 +43,9 @@ export default function ClusterTopologyPanel({
   onSelectShard?: (shard: number) => void;
   selectedShard?: number | null;
   legend?: React.ReactNode;
+  /// Module-specific facts for the selected node. The map answers "where"; this answers "what is
+  /// this node doing for *this* page", which is the part each view has that the map cannot know.
+  details?: (nodeId: string, shards: number[]) => React.ReactNode;
 }) {
   const [info, setInfo] = useState<api.NodeInfo | null>(null);
   const [cluster, setCluster] = useState<api.ClusterInfo | null>(null);
@@ -100,6 +104,18 @@ export default function ClusterTopologyPanel({
   return (
     <div className="space-y-4">
       <TopologyMap nodes={nodes} selectedId={active} onSelect={setSelectedNode} />
+
+      {details && (
+        <div className="border border-carbon-border bg-carbon-layer">
+          <div className="flex items-center justify-between gap-2 border-b border-carbon-border bg-carbon-field px-3 py-1.5">
+            <span className="font-mono text-xs font-semibold text-carbon-text">
+              {/^\d+$/.test(active) ? `node ${active}` : active}
+            </span>
+            <span className="text-[10px] uppercase tracking-wider text-carbon-text-3">selected node</span>
+          </div>
+          <div className="px-3 py-2 text-xs">{details(active, owned.get(active) ?? [])}</div>
+        </div>
+      )}
 
       {legend && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-carbon-text-3">{legend}</div>

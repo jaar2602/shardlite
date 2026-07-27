@@ -92,6 +92,29 @@ export default function ShardInventory({ name }: { name: string }) {
               const behind = owned.filter((r) => (r.max_lag ?? 0) > 0).length;
               return bad || behind ? `${bad} unavailable · ${behind} lagging` : "all available";
             }}
+            details={(_node, shards) => {
+              const owned = shards.map((s) => byShard.get(s)).filter((r): r is api.ShardInventoryRow => !!r);
+              if (owned.length === 0) return <span className="text-carbon-text-3">No storage units reported for this node.</span>;
+              const worstLag = owned.reduce((worst, r) => Math.max(worst, r.max_lag ?? 0), 0);
+              const replicas = owned.reduce((sum, r) => sum + r.replicas.length, 0);
+              const lsnLow = Math.min(...owned.map((r) => r.primary_lsn));
+              const lsnHigh = Math.max(...owned.map((r) => r.primary_lsn));
+              const epochs = Array.from(new Set(owned.map((r) => r.epoch))).sort((a, b) => a - b);
+              const degraded = owned.filter((r) => r.state !== "available");
+              return (
+                <dl className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1">
+                  <dt className="text-carbon-text-3">Units</dt><dd className="font-mono">{owned.map((r) => r.id).join(", ")}</dd>
+                  <dt className="text-carbon-text-3">Primary LSN</dt><dd className="font-mono">{lsnLow === lsnHigh ? lsnLow : `${lsnLow} – ${lsnHigh}`}</dd>
+                  <dt className="text-carbon-text-3">Epoch</dt><dd className="font-mono">{epochs.join(", ")}</dd>
+                  <dt className="text-carbon-text-3">Replicas</dt><dd className="font-mono">{replicas}</dd>
+                  <dt className="text-carbon-text-3">Worst lag</dt><dd className={`font-mono ${worstLag > 0 ? "text-carbon-yellow" : ""}`}>{worstLag}</dd>
+                  {degraded.length > 0 && <>
+                    <dt className="text-carbon-text-3">Degraded</dt>
+                    <dd className="font-mono text-carbon-red">{degraded.map((r) => `${r.id} (${r.state})`).join(", ")}</dd>
+                  </>}
+                </dl>
+              );
+            }}
             annotateShard={(shard) => {
               const row = byShard.get(shard);
               if (!row) return null;

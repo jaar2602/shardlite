@@ -68,6 +68,14 @@ export default function Replication({ name }: { name: string }) {
     }
   };
 
+  // Every hook must run on every render, so this sits above the loading early-return below.
+  // Putting it after produced React #310 ("rendered more hooks than during the previous render")
+  // the moment the first poll landed and the early return stopped firing.
+  const byShard = useMemo(
+    () => new Map((inventory?.rows ?? []).map((row) => [row.id, row])),
+    [inventory],
+  );
+
   if (!replication && !s3) return <div className="p-6">{error ? <Banner tone="error">{error}</Banner> : <Spinner label="Loading replication status…" />}</div>;
 
   const shards = replication?.shards ?? [];
@@ -75,11 +83,6 @@ export default function Replication({ name }: { name: string }) {
   const columns = ["shard", ...shardKeys.filter((key) => key !== "shard")];
   const acks = replication?.acks;
   const s3Shards = s3?.shards ?? [];
-  // Replication state per shard, keyed so the topology panel can tint each chip.
-  const byShard = useMemo(
-    () => new Map((inventory?.rows ?? []).map((row) => [row.id, row])),
-    [inventory],
-  );
 
   return (
     <Page>
@@ -119,6 +122,26 @@ export default function Replication({ name }: { name: string }) {
               const lag = rows.reduce((worst, r) => Math.max(worst, r.max_lag ?? 0), 0);
               const degraded = rows.filter((r) => r.state !== "available").length;
               return `max lag ${lag}${degraded ? ` · ${degraded} degraded` : ""}`;
+            }}
+            details={(_node, shards) => {
+              const owned = shards.map((s) => byShard.get(s)).filter((r): r is api.ShardInventoryRow => !!r);
+              if (owned.length === 0) return <span className="text-carbon-text-3">No replication evidence for this node.</span>;
+              const lagging = owned.filter((r) => (r.max_lag ?? 0) > 0);
+              const replicas = owned.reduce((sum, r) => sum + r.replicas.length, 0);
+              const archived = s3Shards.filter((row) => shards.includes(Number(field(row, "shard")))).length;
+              return (
+                <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1">
+                  <dt className="text-carbon-text-3">Shards</dt><dd className="font-mono">{owned.map((r) => r.id).join(", ")}</dd>
+                  <dt className="text-carbon-text-3">Replicas</dt><dd className="font-mono">{replicas}</dd>
+                  <dt className="text-carbon-text-3">Lagging</dt>
+                  <dd className={`font-mono ${lagging.length ? "text-carbon-yellow" : ""}`}>
+                    {lagging.length ? lagging.map((r) => `${r.id} (+${r.max_lag})`).join(", ") : "none"}
+                  </dd>
+                  {s3Shards.length > 0 && <>
+                    <dt className="text-carbon-text-3">S3 archived</dt><dd className="font-mono">{archived}/{owned.length}</dd>
+                  </>}
+                </dl>
+              );
             }}
             annotateShard={(shard) => {
               const row = byShard.get(shard);

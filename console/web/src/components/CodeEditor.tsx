@@ -23,7 +23,9 @@ const sqlHighlighting = HighlightStyle.define([
 export const CodeEditor = forwardRef<CodeEditorHandle, {
   value: string;
   onChange: (value: string) => void;
-  onRun: (selection: EditorRange) => void;
+  /// `target` says what the keystroke asked for: Ctrl/Cmd+Enter runs the selection when there is
+  /// one and the statement under the cursor otherwise; Ctrl/Cmd+Shift+Enter runs the whole editor.
+  onRun: (selection: EditorRange, target: "current" | "selection" | "all") => void;
   onSelectionChange?: (selection: EditorRange) => void;
 }>(function CodeEditor({
   value,
@@ -71,7 +73,22 @@ export const CodeEditor = forwardRef<CodeEditorHandle, {
           bracketMatching(),
           indentOnInput(),
           keymap.of([
-            { key: "Mod-Enter", run: (editor) => { const main = editor.state.selection.main; run.current({ from: main.from, to: main.to }); return true; } },
+            {
+              key: "Mod-Enter",
+              run: (editor) => {
+                const main = editor.state.selection.main;
+                run.current({ from: main.from, to: main.to }, main.from === main.to ? "current" : "selection");
+                return true;
+              },
+            },
+            {
+              key: "Mod-Shift-Enter",
+              run: (editor) => {
+                const main = editor.state.selection.main;
+                run.current({ from: main.from, to: main.to }, "all");
+                return true;
+              },
+            },
             indentWithTab,
             ...defaultKeymap,
             ...historyKeymap,

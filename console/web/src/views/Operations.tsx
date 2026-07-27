@@ -109,6 +109,31 @@ function OperationDetail({ operation, showInternals, onCancel }: { operation: ap
             const applied = mine.filter((shard) => outcomeByShard.get(shard)?.ok).length;
             return `${applied}/${mine.length} applied`;
           }}
+          details={(_node, shards) => {
+            const mine = shards.filter((shard) => involved.has(shard));
+            if (mine.length === 0) return <span className="text-carbon-text-3">This node holds no unit touched by this operation.</span>;
+            const applied = mine.filter((shard) => outcomeByShard.get(shard)?.ok);
+            const rejected = mine.filter((shard) => outcomeByShard.get(shard) && !outcomeByShard.get(shard)!.ok);
+            const pending = mine.filter((shard) => !outcomeByShard.get(shard));
+            return (
+              <dl className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1">
+                <dt className="text-carbon-text-3">Units involved</dt><dd className="font-mono">{mine.join(", ")}</dd>
+                <dt className="text-carbon-text-3">Applied</dt><dd className="font-mono text-carbon-green">{applied.length}</dd>
+                <dt className="text-carbon-text-3">Rejected</dt><dd className="font-mono text-carbon-red">{rejected.length}</dd>
+                <dt className="text-carbon-text-3">Pending</dt><dd className="font-mono">{pending.length}</dd>
+                {rejected.length > 0 && <>
+                  <dt className="text-carbon-text-3">Errors</dt>
+                  <dd className="space-y-0.5">
+                    {rejected.map((shard) => (
+                      <div key={shard} className="font-mono text-[11px] text-carbon-red">
+                        unit {shard}: {outcomeByShard.get(shard)?.error ?? "rejected"}
+                      </div>
+                    ))}
+                  </dd>
+                </>}
+              </dl>
+            );
+          }}
           annotateShard={(shard) => {
             if (!involved.has(shard)) return { tone: "blue", title: `unit ${shard} · not part of this operation` };
             const outcome = outcomeByShard.get(shard);

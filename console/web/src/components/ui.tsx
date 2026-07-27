@@ -103,21 +103,25 @@ export function Card({
   actions,
   children,
   className = "",
+  bodyClassName = "",
 }: {
   title?: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
   className?: string;
+  /// For a card that has to fill a fixed height and scroll inside itself, rather than growing the
+  /// page. The header stays put; only this scrolls.
+  bodyClassName?: string;
 }) {
   return (
     <div className={`border border-carbon-border bg-carbon-layer ${className}`}>
       {(title || actions) && (
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-carbon-border px-3 py-2.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-carbon-border px-3 py-2.5">
           <h3 className="text-sm font-semibold text-carbon-text">{title}</h3>
           <div className="flex gap-2">{actions}</div>
         </div>
       )}
-      <div className="p-3">{children}</div>
+      <div className={`p-3 ${bodyClassName}`}>{children}</div>
     </div>
   );
 }
@@ -155,18 +159,24 @@ export function DataTable({
   columns,
   rows,
   empty = "No data",
+  scrollClassName = "",
 }: {
   columns: string[];
   rows: ReactNode[][];
   empty?: string;
+  /// Height for the table's own scroll box, e.g. "max-h-[60vh]". Set it when the table can be long:
+  /// the header then stays pinned while the rows move, because `sticky` resolves against the
+  /// nearest scrolling ancestor and this makes that ancestor the table's own wrapper rather than
+  /// the page.
+  scrollClassName?: string;
 }) {
   return (
-    <div className="overflow-x-auto border border-carbon-border bg-carbon-layer/30">
+    <div className={`overflow-auto border border-carbon-border bg-carbon-layer/30 ${scrollClassName}`}>
       <table className="w-full border-collapse text-sm">
-        <thead>
+        <thead className="sticky top-0 z-10">
           <tr className="bg-carbon-layer2 text-left">
             {columns.map((c) => (
-              <th key={c} className="whitespace-nowrap px-3 py-2 font-mono text-[10px] font-normal uppercase tracking-wider text-carbon-text-2">
+              <th key={c} className="whitespace-nowrap bg-carbon-layer2 px-3 py-2 font-mono text-[10px] font-normal uppercase tracking-wider text-carbon-text-2">
                 {c}
               </th>
             ))}

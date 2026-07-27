@@ -15,6 +15,20 @@ import { HistoryItem, normalizeHistory, normalizeSaved, removeLegacyPlacementSet
 
 type ParamType = "null" | "integer" | "real" | "text" | "boolean" | "blob";
 type ParamDraft = { id: number; type: ParamType; value: string };
+
+/// One editor tab. The active tab's values live in component state; this is what the others hold
+/// while they wait.
+interface TabSnapshot {
+  id: number;
+  title: string;
+  sql: string;
+  scratch: string;
+  selection: EditorRange;
+  activeSavedId: number | null;
+  results: ResultSet[];
+  activeResult: number | null;
+  params: ParamDraft[];
+}
 type ResultSet = { id: number; title: string; result: api.QueryResult };
 type Message = { tone: "info" | "success"; text: string; operation?: string };
 type SchemaReview = {
@@ -55,6 +69,9 @@ export default function SqlEditor({ name }: { name: string }) {
   const [atLeastLsn, setAtLeastLsn] = useState(0);
   const [showParameters, setShowParameters] = useState(false);
   const [showOptions, setShowOptions] = useState(false);
+  // When on, a run adds to this tab's result sets instead of replacing them, so you can compare
+  // two answers side by side without re-running the first.
+  const [keepResults, setKeepResults] = useState(() => readBoolean(storageKey + ".keepResults", false));
   const [busy, setBusy] = useState(false);
   const [cancellable, setCancellable] = useState(false);
   const [busyLabel, setBusyLabel] = useState("Running…");
@@ -77,6 +94,79 @@ export default function SqlEditor({ name }: { name: string }) {
   const [columnsBusy, setColumnsBusy] = useState<string[]>([]);
   const [desktopLibrary, setDesktopLibrary] = useState(() => readBoolean(storageKey + ".library", true));
   const [mobileLibrary, setMobileLibrary] = useState(false);
+  // --- editor tabs -------------------------------------------------------------------------
+  // The active tab's state stays in the hooks above, so nothing below has to change. Inactive
+  // tabs keep a snapshot here, swapped in and out on switch. Storing every tab's state in one
+  // array instead would mean rewriting every `sql`/`results`/`params` reference in this file.
+  const [tabs, setTabs] = useState<TabSnapshot[]>(() => [
+    { id: 1, title: "Query 1", sql: initialDraft, scratch: initialDraft, selection: { from: 0, to: 0 }, activeSavedId: null, results: [], activeResult: null, params: [] },
+  ]);
+  const [activeTab, setActiveTab] = useState(1);
+
+  const snapshotActive = (): TabSnapshot[] =>
+    tabs.map((tab) => (tab.id === activeTab ? { ...tab, sql, scratch, selection, activeSavedId, results, activeResult, params } : tab));
+
+  const switchTab = (target: number) => {
+    if (target === activeTab) return;
+    const snapshots = snapshotActive();
+    const next = snapshots.find((tab) => tab.id === target);
+    if (!next) return;
+    setTabs(snapshots);
+    setActiveTab(target);
+    setSql(next.sql);
+    setScratch(next.scratch);
+    setSelection(next.selection);
+    setActiveSavedId(next.activeSavedId);
+    setResults(next.results);
+    setActiveResult(next.activeResult);
+    setParams(next.params);
+    setError(null);
+    setMessage(null);
+    setSchemaReview(null);
+    setQueryPlan(null);
+  };
+
+  const addTab = () => {
+    const nextId = Math.max(0, ...tabs.map((tab) => tab.id)) + 1;
+    const blank: TabSnapshot = { id: nextId, title: `Query ${nextId}`, sql: "", scratch: "", selection: { from: 0, to: 0 }, activeSavedId: null, results: [], activeResult: null, params: [] };
+    setTabs([...snapshotActive(), blank]);
+    setActiveTab(nextId);
+    setSql("");
+    setScratch("");
+    setSelection({ from: 0, to: 0 });
+    setActiveSavedId(null);
+    setResults([]);
+    setActiveResult(null);
+    setParams([]);
+    setError(null);
+    setMessage(null);
+    setSchemaReview(null);
+    setQueryPlan(null);
+  };
+
+  const closeTab = (target: number) => {
+    if (tabs.length === 1) return;                       // always leave one to type in
+    const remaining = snapshotActive().filter((tab) => tab.id !== target);
+    if (target !== activeTab) {
+      setTabs(remaining);
+      return;
+    }
+    const fallback = remaining[remaining.length - 1];
+    setTabs(remaining);
+    setActiveTab(fallback.id);
+    setSql(fallback.sql);
+    setScratch(fallback.scratch);
+    setSelection(fallback.selection);
+    setActiveSavedId(fallback.activeSavedId);
+    setResults(fallback.results);
+    setActiveResult(fallback.activeResult);
+    setParams(fallback.params);
+    setError(null);
+    setMessage(null);
+    setSchemaReview(null);
+    setQueryPlan(null);
+  };
+
   const [showSave, setShowSave] = useState(false);
   const [saveName, setSaveName] = useState("");
   const [renamingId, setRenamingId] = useState<number | null>(null);
@@ -135,9 +225,11 @@ export default function SqlEditor({ name }: { name: string }) {
   const clearOutput = () => {
     setError(null);
     setMessage(null);
-    setResults([]);
-    setActiveResult(null);
     setSchemaReview(null);
+    if (!keepResults) {
+      setResults([]);
+      setActiveResult(null);
+    }
   };
 
   const resolveTarget = async (): Promise<number> => {
@@ -172,12 +264,15 @@ export default function SqlEditor({ name }: { name: string }) {
     });
   };
 
-  const run = async (editorSelection?: EditorRange) => {
+  /// `targetOverride` lets a keystroke ask for something other than the dropdown's setting:
+  /// Ctrl+Enter runs the selection or the statement at the cursor, Ctrl+Shift+Enter runs all.
+  const run = async (editorSelection?: EditorRange, targetOverride?: RunTarget) => {
     const effectiveSelection = editorSelection ?? selection;
+    const target = targetOverride ?? runTarget;
     let statements: SqlStatement[];
     let plan: ExecutionPlan;
     try {
-      statements = statementsForTarget(sql, runTarget, effectiveSelection);
+      statements = statementsForTarget(sql, target, effectiveSelection);
       plan = buildExecutionPlan(statements);
       if (plan.kind !== "reads" && !mayWrite) throw new Error("Your console role does not permit data or schema changes.");
     } catch (caught) {
@@ -302,7 +397,7 @@ export default function SqlEditor({ name }: { name: string }) {
         signal: controller.signal,
       });
       const resultSet = { id: id(), title: "Query plan", result: value };
-      setResults([resultSet]);
+      setResults((current) => (keepResults ? [...current, resultSet] : [resultSet]));
       setActiveResult(resultSet.id);
     } catch (caught) {
       setError(databaseError(caught, "Explain failed."));
@@ -562,12 +657,51 @@ export default function SqlEditor({ name }: { name: string }) {
       </>}
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex shrink-0 items-stretch overflow-x-auto whitespace-nowrap border-b border-carbon-border bg-carbon-layer2">
+          {tabs.map((tab) => {
+            const isActive = tab.id === activeTab;
+            const label = isActive
+              ? (activeSavedId !== null ? saved.find((entry) => entry.id === activeSavedId)?.name : null) ?? tab.title
+              : (tab.activeSavedId !== null ? saved.find((entry) => entry.id === tab.activeSavedId)?.name : null) ?? tab.title;
+            const count = isActive ? results.length : tab.results.length;
+            return (
+              <div
+                key={tab.id}
+                className={`group flex items-center gap-2 border-r border-carbon-border px-3 py-2 text-xs ${isActive ? "bg-carbon-layer text-carbon-text" : "text-carbon-text-3 hover:bg-carbon-layer/60"}`}
+              >
+                <button type="button" className="max-w-40 truncate" title={label} onClick={() => switchTab(tab.id)}>
+                  {label}
+                </button>
+                {count > 0 && <span className="rounded-sm bg-carbon-border px-1 text-[10px]">{count}</span>}
+                {tabs.length > 1 && (
+                  <button
+                    type="button"
+                    aria-label={`Close ${label}`}
+                    className="opacity-0 transition-opacity hover:text-carbon-red group-hover:opacity-100"
+                    onClick={() => closeTab(tab.id)}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          <button
+            type="button"
+            aria-label="New query tab"
+            title="New query tab"
+            className="px-3 py-2 text-xs text-carbon-text-3 hover:text-carbon-text"
+            onClick={addTab}
+          >
+            +
+          </button>
+        </div>
         <div className="flex h-12 shrink-0 items-center gap-2 overflow-x-auto whitespace-nowrap border-b border-carbon-border bg-carbon-layer px-3">
           <Button className="px-3" variant="ghost" onClick={toggleLibrary}>☰ <span className="ml-1 hidden sm:inline">Queries &amp; tables</span></Button>
           <Button disabled={busy || !analysis.plan || (analysis.plan.kind !== "reads" && !mayWrite)} onClick={() => void run()}>{busy ? "Running…" : "Run"}</Button>
           {busy && cancellable && <Button variant="secondary" onClick={() => abort.current?.abort()}>Cancel</Button>}
           <div className="w-44">
-            <Select aria-label="Run target" value={runTarget} onChange={(event) => setRunTarget(event.target.value as RunTarget)}>
+            <Select aria-label="Run target" value={runTarget} onChange={(event) => setRunTarget(event.target.value as RunTarget)} title="Ctrl/Cmd+Enter runs the selection or the statement at the cursor · Ctrl/Cmd+Shift+Enter runs all">
               <option value="current">Current statement</option>
               <option value="selection">Selection</option>
               <option value="all">All SQL</option>
@@ -591,6 +725,21 @@ export default function SqlEditor({ name }: { name: string }) {
             {(parameterCount > 0 || params.length > 0) && <Button variant="ghost" onClick={() => setShowParameters((value) => !value)}>Parameters {parameterCount ? `(${parameterCount})` : ""}</Button>}
             <Button variant="ghost" onClick={() => saveCurrent()}>{activeSavedId === null ? "Save" : dirty ? "Save changes" : "Saved"}</Button>
             {activeSavedId !== null && <Button variant="ghost" onClick={() => saveCurrent(true)}>Save as</Button>}
+            <label
+              className="flex cursor-pointer select-none items-center gap-1.5 px-2 text-xs text-carbon-text-3"
+              title="Keep this tab's previous results when you run again, instead of replacing them."
+            >
+              <input
+                type="checkbox"
+                className="accent-carbon-blue"
+                checked={keepResults}
+                onChange={(event) => {
+                  setKeepResults(event.target.checked);
+                  try { localStorage.setItem(storageKey + ".keepResults", JSON.stringify(event.target.checked)); } catch { /* storage can be unavailable */ }
+                }}
+              />
+              Keep results
+            </label>
             <Button variant="ghost" onClick={() => setShowOptions((value) => !value)}>Options</Button>
           </div>
         </div>
@@ -627,7 +776,7 @@ export default function SqlEditor({ name }: { name: string }) {
               ref={editor}
               value={sql}
               onChange={setDocument}
-              onRun={(currentSelection) => void run(currentSelection)}
+              onRun={(currentSelection, target) => void run(currentSelection, target)}
               onSelectionChange={setSelection}
             />
           </section>

@@ -69,7 +69,7 @@ export default function Schema({ name }: { name: string }) {
     }
   };
 
-  return <Page>
+  return <Page className="flex h-[calc(100vh-3.5rem)] flex-col">
     <PageHeader
       eyebrow="Database / schema"
       title="Schema explorer"
@@ -88,9 +88,16 @@ export default function Schema({ name }: { name: string }) {
     {error && <Banner tone="error">{error}</Banner>}
     {catalog && <Banner tone={catalog.consistency.status === "consistent" ? "success" : catalog.consistency.status === "drifted" ? "error" : "info"}>{catalog.consistency.summary}</Banner>}
 
-    <div className="grid gap-3 xl:grid-cols-[20rem_minmax(0,1fr)]">
-      <Card title={`${visible.length} schema object${visible.length === 1 ? "" : "s"}`}>
-        <div className="max-h-[680px] space-y-1 overflow-auto">
+    {/* Fill the remaining viewport rather than growing the page: each column scrolls on its own,
+        so the object list and the structure/data panel stay visible together instead of the whole
+        page scrolling and the list disappearing off the top. */}
+    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[20rem_minmax(0,1fr)] xl:overflow-hidden">
+      <Card
+        title={`${visible.length} schema object${visible.length === 1 ? "" : "s"}`}
+        className="flex min-h-0 flex-col xl:overflow-hidden"
+        bodyClassName="min-h-0 flex-1 overflow-hidden"
+      >
+        <div className="h-full min-h-0 space-y-1 overflow-auto">
           {visible.length === 0 && <p className="py-6 text-center text-sm text-carbon-text-3">No matching objects</p>}
           {visible.map((object) => <button
             key={`${object.type}:${object.name}`}
@@ -105,9 +112,9 @@ export default function Schema({ name }: { name: string }) {
         </div>
       </Card>
 
-      <div className="space-y-3">
+      <div className="flex min-h-0 flex-col space-y-3 xl:overflow-y-auto">
         {table ? <>
-          <div className="flex gap-1 border-b border-carbon-border">
+          <div className="flex shrink-0 gap-1 border-b border-carbon-border">
             <SchemaTab active={tab === "structure"} onClick={() => setTab("structure")}>Structure</SchemaTab>
             <SchemaTab active={tab === "data"} onClick={() => void openData()}>Data</SchemaTab>
           </div>
@@ -130,12 +137,21 @@ export default function Schema({ name }: { name: string }) {
             <Card title="Indexes"><DataTable columns={["Seq", "Name", "Unique", "Origin", "Partial"]} empty="No indexes" rows={table.indexes.map((row) => row.map(cell))} /></Card>
             <Card title="Foreign keys"><DataTable columns={["ID", "Seq", "Target table", "From", "To", "On update", "On delete", "Match"]} empty="No foreign keys" rows={table.foreign_keys.map((row) => row.map(cell))} /></Card>
             <Card title="Related definitions"><div className="space-y-3">{(catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).length === 0 ? <p className="text-sm text-carbon-text-3">No indexes or triggers with stored definitions.</p> : (catalog?.objects ?? []).filter((object) => object.table === table.name && object.name !== table.name).map((object) => <div key={`${object.type}:${object.name}`} className="border-t border-carbon-border pt-3"><div className="mb-2 flex items-center gap-2"><Tag tone={objectTone(object.type)}>{object.type}</Tag><span className="text-sm">{object.name}</span></div><pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs text-carbon-text-3">{object.sql ?? "Implicit definition"}</pre></div>)}</div></Card>
-          </> : <Card title={<span>{table.name} <Tag tone="blue">data</Tag></span>}>
+          </> : <Card
+            title={<span>{table.name} <Tag tone="blue">data</Tag></span>}
+            className="flex min-h-0 flex-1 flex-col"
+            bodyClassName="flex min-h-0 flex-1 flex-col"
+          >
             {dataBusy && <Spinner label="Reading table data…" />}
             {dataError && <Banner tone="error">{dataError}</Banner>}
-            {data && !dataBusy && !dataError && <div className="space-y-2">
-              <p className="text-xs text-carbon-text-3">first 100 rows</p>
-              <DataTable columns={data.columns} empty="No rows" rows={data.rows.map((row) => row.map(dataCell))} />
+            {data && !dataBusy && !dataError && <div className="flex min-h-0 flex-1 flex-col space-y-2">
+              <p className="shrink-0 text-xs text-carbon-text-3">first 100 rows</p>
+              <DataTable
+                columns={data.columns}
+                empty="No rows"
+                rows={data.rows.map((row) => row.map(dataCell))}
+                scrollClassName="min-h-0 flex-1"
+              />
             </div>}
           </Card>}
         </> : <Card><p className="py-12 text-center text-sm text-carbon-text-3">Select a table to inspect its columns, indexes, foreign keys, triggers, and SQL definition.</p></Card>}

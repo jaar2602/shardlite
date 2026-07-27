@@ -12,7 +12,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import * as api from "../lib/api";
 import { Banner, Button, Card, Spinner, Tag } from "../components/ui";
-import { LegendDot, ShardTopology, type ShardCell, type TopologyNode } from "../components/ShardTopology";
+import ClusterTopologyPanel, { LegendDot } from "../components/ClusterTopologyPanel";
 
 // The view has three layers over the same set of tables:
 //   erd      — the logical schema: tables + foreign-key relationships.
@@ -204,6 +204,7 @@ export default function Erd({ name }: { name: string }) {
         </div>
       ) : (
         <ShardLayer
+          name={name}
           layer={layer}
           tables={tables.map((t) => t.name)}
           selected={selected}
@@ -258,6 +259,7 @@ function Segmented({
 }
 
 function ShardLayer({
+  name,
   layer,
   tables,
   selected,
@@ -267,6 +269,8 @@ function ShardLayer({
   inventory,
   s3,
 }: {
+  /// The connection, so the shard view can draw the same cluster map as the Topology page.
+  name: string;
   layer: Layer;
   tables: string[];
   selected: string | null;
@@ -293,25 +297,10 @@ function ShardLayer({
 
   // Group the selected table's placement rows by their owning node. Placement rows don't carry an
   // owner, so it's resolved through ownerByShard rather than groupByOwner.
-  const topologyNodes = useMemo<TopologyNode[]>(() => {
-    const byOwner = new Map<string, ShardCell[]>();
-    for (const sh of placement?.shards ?? []) {
-      const owner = ownerByShard.get(sh.shard) ?? "unassigned";
-      const archived = withS3 ? s3ByShard.get(sh.shard) : undefined;
-      const list = byOwner.get(owner) ?? [];
-      list.push({
-        shard: sh.shard,
-        tone: sh.rows == null ? "gray" : archived ? "green" : "blue",
-        label: sh.rows == null ? "—" : sh.rows.toLocaleString(),
-        title: `shard ${sh.shard} · ${sh.rows ?? "?"} rows${withS3 ? (archived ? ` · S3 lsn ${archived.last_snapshot_lsn}` : " · not archived") : ""}`,
-      });
-      byOwner.set(owner, list);
-    }
-    return Array.from(byOwner, ([id, shards]) => ({
-      id,
-      shards: shards.sort((a, b) => a.shard - b.shard),
-    })).sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
-  }, [placement, ownerByShard, s3ByShard, withS3]);
+  const shardRows = useMemo(
+    () => new Map((placement?.shards ?? []).map((sh) => [sh.shard, sh])),
+    [placement],
+  );
 
   return (
     <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">
@@ -350,9 +339,45 @@ function ShardLayer({
         <Spinner label="Counting rows per shard…" />
       ) : placement ? (
         view === "topology" ? (
-          <ShardTopology
-            nodes={topologyNodes}
+          <ClusterTopologyPanel
+            name={name}
             legend={<><LegendDot tone="blue">has rows</LegendDot>{withS3 && <LegendDot tone="green">archived</LegendDot>}<LegendDot tone="gray">empty</LegendDot></>}
+            caption={(_node, shards) => {
+              const mine = shards.map((s) => shardRows.get(s)).filter((r): r is NonNullable<typeof r> => !!r);
+              if (mine.length === 0) return null;
+              const rows = mine.reduce((sum, r) => sum + (r.rows ?? 0), 0);
+              const archived = withS3 ? mine.filter((r) => s3ByShard.get(r.shard)).length : 0;
+              return `${rows.toLocaleString()} rows${withS3 ? ` · ${archived}/${mine.length} archived` : ""}`;
+            }}
+            details={(_node, shards) => {
+              const mine = shards.map((s) => shardRows.get(s)).filter((r): r is NonNullable<typeof r> => !!r);
+              if (mine.length === 0) return <span className="text-carbon-text-3">This node holds no rows for {selected}.</span>;
+              const rows = mine.reduce((sum, r) => sum + (r.rows ?? 0), 0);
+              const empty = mine.filter((r) => !r.rows).length;
+              const biggest = mine.reduce((top, r) => ((r.rows ?? 0) > (top.rows ?? 0) ? r : top), mine[0]);
+              return (
+                <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1">
+                  <dt className="text-carbon-text-3">Table</dt><dd className="font-mono">{selected}</dd>
+                  <dt className="text-carbon-text-3">Rows here</dt><dd className="font-mono">{rows.toLocaleString()}</dd>
+                  <dt className="text-carbon-text-3">Busiest shard</dt><dd className="font-mono">{biggest.shard} ({(biggest.rows ?? 0).toLocaleString()})</dd>
+                  <dt className="text-carbon-text-3">Empty shards</dt><dd className="font-mono">{empty}</dd>
+                  {withS3 && <>
+                    <dt className="text-carbon-text-3">Archived</dt>
+                    <dd className="font-mono">{mine.filter((r) => s3ByShard.get(r.shard)).length}/{mine.length}</dd>
+                  </>}
+                </dl>
+              );
+            }}
+            annotateShard={(shard) => {
+              const sh = shardRows.get(shard);
+              if (!sh) return { tone: "gray", title: `shard ${shard} · no rows for this table` };
+              const archived = withS3 ? s3ByShard.get(shard) : undefined;
+              return {
+                tone: sh.rows == null || sh.rows === 0 ? "gray" : archived ? "green" : "blue",
+                label: sh.rows == null ? "—" : sh.rows.toLocaleString(),
+                title: `shard ${shard} · ${sh.rows ?? "?"} rows${withS3 ? (archived ? ` · S3 lsn ${archived.last_snapshot_lsn}` : " · not archived") : ""}`,
+              };
+            }}
           />
         ) : (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
